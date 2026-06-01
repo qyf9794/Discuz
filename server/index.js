@@ -442,8 +442,78 @@ async function extractPptx(filePath) {
   return { text: cleanText(slides.join("\n\n")), html: "" };
 }
 
-async function extractContentAtPath(filePath, kind) {
-  if (["image", "audio", "video"].includes(kind)) return { text: "", html: "" };
+function responseOutputText(payload) {
+  if (typeof payload?.output_text === "string") return cleanText(payload.output_text);
+  const parts = [];
+  const visit = (value) => {
+    if (!value) return;
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    if (typeof value !== "object") return;
+    if ((value.type === "output_text" || value.type === "text") && typeof value.text === "string") {
+      parts.push(value.text);
+      return;
+    }
+    if (Array.isArray(value.content)) visit(value.content);
+    if (Array.isArray(value.output)) visit(value.output);
+  };
+  visit(payload?.output);
+  return cleanText(parts.join("\n"));
+}
+
+async function analyzeImageAtPath(filePath, mimeType, originalName) {
+  const openAiApiKey = getOpenAiApiKey();
+  if (!openAiApiKey) return "";
+  const mime = cleanText(mimeType || "").toLowerCase();
+  if (!["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"].includes(mime)) {
+    return "";
+  }
+  const stats = fs.statSync(filePath);
+  if (stats.size > 35 * 1024 * 1024) {
+    return "图片已上传，但尺寸较大，未自动生成视觉摘要。";
+  }
+  const imageBase64 = fs.readFileSync(filePath).toString("base64");
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${openAiApiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "gpt-4.1-mini",
+      max_output_tokens: 700,
+      input: [{
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: [
+              `请用中文为图片《${originalName}》生成可供后续讨论和检索使用的视觉摘要。`,
+              "请客观描述：主要对象、场景、文字/标签、地名/路线/表格信息、可能与用户讨论相关的细节。",
+              "如果是地图、海报、截图或文档照片，请尽量提取可辨识文字；不确定的内容请说明不确定，不要编造。"
+            ].join("\n")
+          },
+          {
+            type: "input_image",
+            image_url: `data:${mime};base64,${imageBase64}`,
+            detail: "high"
+          }
+        ]
+      }]
+    })
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload?.error?.message || `OpenAI image analysis failed: ${response.status}`);
+  }
+  return responseOutputText(payload);
+}
+
+async function extractContentAtPath(filePath, kind, metadata = {}) {
+  if (kind === "image") return { text: await analyzeImageAtPath(filePath, metadata.mimeType, metadata.originalName), html: "" };
+  if (["audio", "video"].includes(kind)) return { text: "", html: "" };
   if (kind === "pdf") return extractPdf(filePath);
   if (kind === "doc") return extractDoc(filePath);
   if (kind === "docx") return extractDocx(filePath);
@@ -455,7 +525,10 @@ async function extractContentAtPath(filePath, kind) {
 }
 
 async function extractContentFromFile(file, kind) {
-  return extractContentAtPath(file.path, kind);
+  return extractContentAtPath(file.path, kind, {
+    mimeType: file.mimetype,
+    originalName: file.originalname
+  });
 }
 
 async function persistUploadedFile(file, role) {
@@ -617,7 +690,10 @@ async function refreshStoredFiles() {
       (kind !== row.kind || !cleanText(extractedText) || (["doc", "docx"].includes(kind) && !cleanHtml(renderedHtml)))
     ) {
       try {
-        const content = await extractContentAtPath(filePath, kind);
+        const content = await extractContentAtPath(filePath, kind, {
+          mimeType: row.mime_type,
+          originalName
+        });
         extractedText = content.text;
         renderedHtml = content.html;
       } catch (error) {
