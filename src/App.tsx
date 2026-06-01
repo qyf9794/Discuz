@@ -1572,18 +1572,7 @@ export function App() {
     await finalizeDiscussionRecord();
     const response = await fetch("/api/discussion/reset", { method: "POST" });
     if (!response.ok) throw new Error(await response.text());
-    const payload = await response.json();
-    setState((current) => ({ ...current, ...payload }));
-    setSelectedId(null);
-    setPreviewFileId(null);
-    setPreviewRecordId(null);
-    setGeneratedEditorId(null);
-    setTopicProposal(null);
-    setDirectionProposal(null);
-    setDiscussionText("");
-    setContextHits([]);
-    setWebHits([]);
-    setError("");
+    resetLocalDiscussionView(await response.json());
   };
 
   const resetLocalDiscussionView = (payload: Partial<AppState>) => {
@@ -1600,6 +1589,14 @@ export function App() {
     setContextHits([]);
     setWebHits([]);
     setError("");
+    setTranscript("");
+    setPendingTasks([]);
+    setStatusText("Ready");
+    setStatusLog([{ id: crypto.randomUUID(), kind: "status", text: "Ready", createdAt: new Date().toISOString() }]);
+    lastStatusLogRef.current = "Ready";
+    lastErrorLogRef.current = "";
+    assistantTranscriptRef.current = "";
+    userTranscriptRef.current = "";
   };
 
   const createNewTopic = async () => {

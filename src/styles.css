@@ -1166,6 +1166,8 @@ button {
   min-height: 0;
   flex-direction: column;
   overflow: hidden;
+  padding-left: 12px;
+  border-left: 1px dashed rgba(8, 125, 140, 0.38);
 }
 
 .record-current header,
