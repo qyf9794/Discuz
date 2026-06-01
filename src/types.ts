@@ -1,5 +1,6 @@
 export type DiscuzFile = {
   id: string;
+  topicId?: string;
   role: "primary" | "context" | "generated";
   originalName: string;
   storedName: string;
@@ -13,6 +14,17 @@ export type DiscuzFile = {
   createdAt: string;
   updatedAt: string;
   previewUrl: string;
+};
+
+export type DiscussionTopic = {
+  id: string;
+  title: string;
+  folderName: string;
+  createdAt: string;
+  updatedAt: string;
+  fileCount: number;
+  recordCount: number;
+  active: boolean;
 };
 
 export type Note = {
@@ -53,6 +65,8 @@ export type AppState = {
   records: DiscussionRecord[];
   discussionInputs: DiscussionInput[];
   discussionTopic: string;
+  activeTopicId: string;
+  topics: DiscussionTopic[];
   activities: Activity[];
   settings?: {
     openaiApiKeyConfigured: boolean;

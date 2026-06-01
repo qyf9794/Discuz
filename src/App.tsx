@@ -22,8 +22,8 @@ import {
   X
 } from "lucide-react";
 import { ChangeEvent, DragEvent, forwardRef, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, Dispatch, PointerEvent as ReactPointerEvent, ReactNode, RefObject, SetStateAction } from "react";
-import type { AppState, DiscussionRecord, DiscuzFile, Note } from "./types";
+import type { CSSProperties, Dispatch, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, ReactNode, RefObject, SetStateAction } from "react";
+import type { AppState, DiscussionRecord, DiscussionTopic, DiscuzFile, Note } from "./types";
 
 const emptyState: AppState = {
   files: [],
@@ -31,6 +31,8 @@ const emptyState: AppState = {
   records: [],
   discussionInputs: [],
   discussionTopic: "",
+  activeTopicId: "",
+  topics: [],
   activities: [],
   settings: { openaiApiKeyConfigured: false, openaiApiKeySource: "none", wallpaperUrl: "" }
 };
@@ -130,28 +132,12 @@ async function uploadFiles(endpoint: string, field: string, files: File[]) {
   return response.json();
 }
 
-function setCardDragImage(event: DragEvent<HTMLElement>, mark: "promote" | "demote") {
-  const source = event.currentTarget;
-  const rect = source.getBoundingClientRect();
-  const clone = source.cloneNode(true) as HTMLElement;
-  clone.classList.add("drag-ghost");
-  clone.classList.remove("selected", "dragging-card");
-  clone.querySelector(".card-actions")?.remove();
-  clone.querySelector(".card-delete")?.remove();
-  clone.querySelector(".transfer-badge")?.remove();
-  const badge = document.createElement("span");
-  badge.className = `transfer-badge ${mark} drag-image-badge`;
-  badge.textContent = mark === "promote" ? "+" : "-";
-  clone.appendChild(badge);
-  clone.style.width = `${rect.width}px`;
-  clone.style.height = `${rect.height}px`;
-  clone.style.position = "fixed";
-  clone.style.left = "-10000px";
-  clone.style.top = "-10000px";
-  clone.style.margin = "0";
-  document.body.appendChild(clone);
-  event.dataTransfer.setDragImage(clone, rect.width / 2, Math.min(rect.height / 2, 120));
-  window.setTimeout(() => clone.remove(), 0);
+function setCardDragImage(event: DragEvent<HTMLElement>) {
+  const ghost = document.createElement("span");
+  ghost.className = "drag-ghost";
+  document.body.appendChild(ghost);
+  event.dataTransfer.setDragImage(ghost, 0, 0);
+  window.setTimeout(() => ghost.remove(), 0);
 }
 
 export function App() {
@@ -167,8 +153,11 @@ export function App() {
   const [settingsPopoverStyle, setSettingsPopoverStyle] = useState<CSSProperties>({});
   const [micPermissionOpen, setMicPermissionOpen] = useState(false);
   const [micPermissionDenied, setMicPermissionDenied] = useState(false);
+  const [audioInputDevices, setAudioInputDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedAudioInputId, setSelectedAudioInputId] = useState(() => localStorage.getItem("discuz-audio-input-id") || "");
   const [leftWidth, setLeftWidth] = useState(63);
   const [topHeight, setTopHeight] = useState(75);
+  const [layoutScale, setLayoutScale] = useState(1);
   const [fullscreenPanel, setFullscreenPanel] = useState<PanelId | null>(null);
   const [activeTool, setActiveTool] = useState<ToolId | null>(null);
   const [previewFileId, setPreviewFileId] = useState<string | null>(null);
@@ -234,6 +223,8 @@ export function App() {
     [state.files, generatedEditorId]
   );
   const currentNotes = useMemo(() => [...state.notes].reverse(), [state.notes]);
+  const compactViewport = layoutScale < 0.95;
+  const effectiveTopHeight = compactViewport ? Math.min(topHeight, 62) : topHeight;
 
   const loadState = useCallback(async () => {
     const response = await fetch("/api/state");
@@ -252,6 +243,22 @@ export function App() {
   useEffect(() => {
     localStorage.setItem("discuz-draft", draftText);
   }, [draftText]);
+
+  useEffect(() => {
+    const updateLayoutScale = () => {
+      const widthScale = window.innerWidth / 1440;
+      const heightScale = window.innerHeight / 900;
+      const nextScale = Math.min(1, Math.max(0.68, Math.min(widthScale, heightScale)));
+      setLayoutScale(Number(nextScale.toFixed(3)));
+    };
+    updateLayoutScale();
+    window.addEventListener("resize", updateLayoutScale);
+    return () => window.removeEventListener("resize", updateLayoutScale);
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem("discuz-audio-input-id", selectedAudioInputId);
+  }, [selectedAudioInputId]);
 
   useEffect(() => {
     localStorage.setItem("discuz-board-items", JSON.stringify(boardItems));
@@ -274,18 +281,20 @@ export function App() {
     return () => document.removeEventListener("pointerdown", closeOnOutsidePointer);
   }, [settingsOpen]);
 
-  const positionSettingsPopover = () => {
+  const positionSettingsPopover = useCallback(() => {
     const button = settingsButtonRef.current;
     if (!button) return;
+    const scale = Math.max(layoutScale, 0.01);
     const rect = button.getBoundingClientRect();
-    const width = Math.min(360, window.innerWidth - 24);
-    const left = Math.min(Math.max(12, rect.right - width), window.innerWidth - width - 12);
+    const physicalWidth = Math.min(360 * scale, window.innerWidth - 24);
+    const left = Math.min(Math.max(12, rect.right - physicalWidth), window.innerWidth - physicalWidth - 12);
+    const top = Math.min(rect.bottom + 8 * scale, window.innerHeight - 24);
     setSettingsPopoverStyle({
-      left,
+      left: left / scale,
       right: "auto",
-      top: Math.min(rect.bottom + 8, window.innerHeight - 24)
+      top: top / scale
     });
-  };
+  }, [layoutScale]);
 
   const toggleSettingsPopover = () => {
     if (!settingsOpen) positionSettingsPopover();
@@ -293,10 +302,34 @@ export function App() {
   };
 
   useEffect(() => {
+    if (settingsOpen) positionSettingsPopover();
+  }, [layoutScale, positionSettingsPopover, settingsOpen]);
+
+  useEffect(() => {
     if (recordStreamRef.current) {
       recordStreamRef.current.scrollTop = recordStreamRef.current.scrollHeight;
     }
   }, [state.notes.length]);
+
+  const refreshAudioInputDevices = useCallback(async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) {
+      setAudioInputDevices([]);
+      return;
+    }
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const inputs = devices.filter((device) => device.kind === "audioinput");
+    setAudioInputDevices(inputs);
+    if (selectedAudioInputId && !inputs.some((device) => device.deviceId === selectedAudioInputId)) {
+      setSelectedAudioInputId("");
+    }
+  }, [selectedAudioInputId]);
+
+  useEffect(() => {
+    refreshAudioInputDevices().catch(() => undefined);
+    if (!navigator.mediaDevices?.addEventListener) return;
+    navigator.mediaDevices.addEventListener("devicechange", refreshAudioInputDevices);
+    return () => navigator.mediaDevices.removeEventListener("devicechange", refreshAudioInputDevices);
+  }, [refreshAudioInputDevices]);
 
   useEffect(() => {
     if (statusLogRef.current) {
@@ -935,7 +968,7 @@ export function App() {
     meter.outputSource = outputSource;
   }, []);
 
-  const stopVoice = useCallback(() => {
+  const disconnectVoice = useCallback(() => {
     voiceSessionRef.current += 1;
     dataChannelRef.current = null;
     peerRef.current?.close();
@@ -945,8 +978,33 @@ export function App() {
     stopVoiceMeter();
     setVoiceState("idle");
     setStatusText("Ready");
+  }, [stopVoiceMeter]);
+
+  const stopVoice = useCallback(() => {
+    disconnectVoice();
     finalizeDiscussionRecord().catch((err) => setError(err instanceof Error ? err.message : "Unable to archive discussion record"));
-  }, [finalizeDiscussionRecord, stopVoiceMeter]);
+  }, [disconnectVoice, finalizeDiscussionRecord]);
+
+  useEffect(() => {
+    const saveAndDisconnect = () => {
+      voiceSessionRef.current += 1;
+      dataChannelRef.current = null;
+      peerRef.current?.close();
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      const startedAt = voiceSessionStartedAtRef.current;
+      if (startedAt) {
+        navigator.sendBeacon?.("/api/records/finish", new Blob([JSON.stringify({ startedAt })], { type: "application/json" }));
+        voiceSessionStartedAtRef.current = null;
+      }
+      navigator.sendBeacon?.("/api/topics/current/save", new Blob([], { type: "application/json" }));
+    };
+    window.addEventListener("pagehide", saveAndDisconnect);
+    window.addEventListener("beforeunload", saveAndDisconnect);
+    return () => {
+      window.removeEventListener("pagehide", saveAndDisconnect);
+      window.removeEventListener("beforeunload", saveAndDisconnect);
+    };
+  }, []);
 
   const startVoice = async () => {
     setError("");
@@ -959,13 +1017,19 @@ export function App() {
       if (!navigator.mediaDevices?.getUserMedia) {
         throw new Error("当前浏览器不支持麦克风访问。请使用支持麦克风权限的浏览器，并通过 localhost 或 HTTPS 打开应用。");
       }
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const audioConstraint = selectedAudioInputId
+        ? { deviceId: { exact: selectedAudioInputId } }
+        : true;
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraint });
       if (sessionId !== voiceSessionRef.current) {
         stream.getTracks().forEach((track) => track.stop());
         return;
       }
       setMicPermissionOpen(false);
       setMicPermissionDenied(false);
+      refreshAudioInputDevices().catch(() => undefined);
+      const inputLabel = stream.getAudioTracks()[0]?.label;
+      if (inputLabel) setStatusText(`使用输入设备：${inputLabel}`);
       streamRef.current = stream;
       startVoiceMeter(stream);
       const peer = new RTCPeerConnection();
@@ -1144,7 +1208,7 @@ export function App() {
     const response = await fetch(`/api/files/${encodeURIComponent(file.id)}`, { method: "DELETE" });
     if (!response.ok) throw new Error(await response.text());
     const payload = await response.json();
-    setState((current) => ({ ...current, files: payload.files, activities: payload.activities }));
+    setState((current) => ({ ...current, files: payload.files, activities: payload.activities, topics: payload.topics ?? current.topics }));
     if (selectedId === file.id) setSelectedId(payload.files[0]?.id ?? null);
     if (previewFileId === file.id) setPreviewFileId(null);
     if (generatedEditorId === file.id) setGeneratedEditorId(null);
@@ -1154,14 +1218,7 @@ export function App() {
 
   const clearDiscussion = async () => {
     if (!window.confirm("清空当前讨论？主题文件、资源库、当前生成记录和文字输入都会清空，历史记录卡片会保留。")) return;
-    voiceSessionRef.current += 1;
-    dataChannelRef.current = null;
-    peerRef.current?.close();
-    peerRef.current = null;
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    streamRef.current = null;
-    setVoiceState("idle");
-    setStatusText("Ready");
+    disconnectVoice();
     await finalizeDiscussionRecord();
     const response = await fetch("/api/discussion/reset", { method: "POST" });
     if (!response.ok) throw new Error(await response.text());
@@ -1178,12 +1235,68 @@ export function App() {
     setError("");
   };
 
+  const resetLocalDiscussionView = (payload: Partial<AppState>) => {
+    setState((current) => ({ ...current, ...payload }));
+    const nextFiles = payload.files ?? [];
+    setSelectedId(nextFiles.find((file) => file.role === "primary")?.id ?? nextFiles[0]?.id ?? null);
+    setPreviewFileId(null);
+    setPreviewRecordId(null);
+    setGeneratedEditorId(null);
+    setActiveTool(null);
+    setTopicProposal(null);
+    setDiscussionText("");
+    setContextHits([]);
+    setWebHits([]);
+    setError("");
+  };
+
+  const createNewTopic = async () => {
+    if (!window.confirm("新建一个空白讨论主题？当前话题会保存，并切换到新的空白话题。")) return;
+    disconnectVoice();
+    await finalizeDiscussionRecord();
+    const response = await fetch("/api/topics", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({})
+    });
+    if (!response.ok) throw new Error(await response.text());
+    resetLocalDiscussionView(await response.json());
+    setSettingsOpen(false);
+  };
+
+  const importTopic = async (topicId: string) => {
+    if (!topicId || topicId === state.activeTopicId) return;
+    disconnectVoice();
+    await finalizeDiscussionRecord();
+    const response = await fetch(`/api/topics/${encodeURIComponent(topicId)}/switch`, { method: "POST" });
+    if (!response.ok) throw new Error(await response.text());
+    resetLocalDiscussionView(await response.json());
+    setSettingsOpen(false);
+  };
+
+  const deleteTopic = async (topicId: string) => {
+    const topic = state.topics.find((item) => item.id === topicId);
+    if (!topic) return;
+    if (!window.confirm(`删除历史话题“${topic.title}”？所有主题文件、资源、临时文件和历史记录都会删除。`)) return;
+    if (topicId === state.activeTopicId) {
+      disconnectVoice();
+      await finalizeDiscussionRecord();
+    }
+    const response = await fetch(`/api/topics/${encodeURIComponent(topicId)}`, { method: "DELETE" });
+    if (!response.ok) throw new Error(await response.text());
+    resetLocalDiscussionView(await response.json());
+  };
+
   return (
     <main
       className="app-shell"
       style={{
         gridTemplateColumns: `${leftWidth}% 10px minmax(280px, 1fr)`,
-        "--wallpaper-url": `url("${state.settings?.wallpaperUrl || "/assets/cyberpunk-future-bg.png"}")`
+        width: `${100 / layoutScale}vw`,
+        height: `${100 / layoutScale}vh`,
+        minHeight: `${100 / layoutScale}vh`,
+        transform: `scale(${layoutScale})`,
+        "--wallpaper-url": `url("${state.settings?.wallpaperUrl || "/assets/default-wallpaper.png"}")`
       } as CSSProperties}
     >
       <input ref={primaryInputRef} hidden type="file" multiple onChange={onPrimaryChange} />
@@ -1241,6 +1354,7 @@ export function App() {
               <button className="icon-button" title={fullscreenPanel === "topic" ? "Exit fullscreen topic" : "Fullscreen topic"} onClick={() => setFullscreenPanel(fullscreenPanel === "topic" ? null : "topic")}>
                 {fullscreenPanel === "topic" ? <Minimize2 size={17} /> : <Maximize2 size={17} />}
               </button>
+              <button className="icon-button" title="新建主题" onClick={() => createNewTopic().catch((err) => setError(err.message))}><Plus size={17} /></button>
               <button className="icon-button danger" title="Clear discussion" onClick={() => clearDiscussion().catch((err) => setError(err.message))}><Trash2 size={17} /></button>
               <button className="icon-button" title="Choose file" onClick={() => primaryInputRef.current?.click()}><FilePlus2 size={18} /></button>
               <button ref={settingsButtonRef} className="icon-button" title="Settings" onClick={toggleSettingsPopover}><Settings2 size={18} /></button>
@@ -1261,7 +1375,7 @@ export function App() {
                     setDraggingFile({ id: file.id, role: file.role });
                     event.dataTransfer.setData(fileDragType, file.id);
                     event.dataTransfer.effectAllowed = "move";
-                    setCardDragImage(event, "demote");
+                    setCardDragImage(event);
                   }}
                   onDragOver={(event) => {
                     event.preventDefault();
@@ -1318,7 +1432,7 @@ export function App() {
 
       <div className="column-resizer" onPointerDown={startColumnResize} />
 
-      <section className="right-stack" style={{ gridTemplateRows: `${topHeight}% 10px minmax(220px, 1fr)` }}>
+      <section className="right-stack" style={{ gridTemplateRows: `${effectiveTopHeight}% 10px minmax(220px, 1fr)` }}>
         <section
           className={`panel resource-panel ${dragTarget === "context" ? "dragging" : ""} ${fullscreenPanel === "resources" ? "fullscreen-panel" : ""}`}
           onDragEnter={(event) => {
@@ -1376,7 +1490,7 @@ export function App() {
                       setDraggingFile({ id: file.id, role: file.role });
                       event.dataTransfer.setData(fileDragType, file.id);
                       event.dataTransfer.effectAllowed = "move";
-                      setCardDragImage(event, "promote");
+                      setCardDragImage(event);
                     }}
                     onDragEnd={() => setDraggingFile(null)}
                     dragMark={draggingFile?.id === file.id ? "add" : null}
@@ -1412,7 +1526,7 @@ export function App() {
                         setDraggingFile({ id: file.id, role: file.role });
                         event.dataTransfer.setData(fileDragType, file.id);
                         event.dataTransfer.effectAllowed = "move";
-                        setCardDragImage(event, "promote");
+                        setCardDragImage(event);
                       }}
                       onDragEnd={() => setDraggingFile(null)}
                       dragMark={draggingFile?.id === file.id ? "add" : null}
@@ -1525,6 +1639,14 @@ export function App() {
           settings={state.settings ?? emptyState.settings!}
           webEnabled={webEnabled}
           setWebEnabled={setWebEnabled}
+          audioInputDevices={audioInputDevices}
+          selectedAudioInputId={selectedAudioInputId}
+          setSelectedAudioInputId={setSelectedAudioInputId}
+          onRefreshAudioInputs={() => refreshAudioInputDevices().catch((err) => setError(err instanceof Error ? err.message : "无法刷新输入设备"))}
+          topics={state.topics}
+          activeTopicId={state.activeTopicId}
+          onImportTopic={(topicId) => importTopic(topicId).catch((err) => setError(err.message))}
+          onDeleteTopic={(topicId) => deleteTopic(topicId).catch((err) => setError(err.message))}
           onSettingsSaved={(settings) => setState((current) => ({ ...current, settings }))}
           style={settingsPopoverStyle}
         />
@@ -1551,6 +1673,7 @@ export function App() {
           boardRef={boardRef}
           drawing={drawing}
           setDrawing={setDrawing}
+          layoutScale={layoutScale}
           onSave={() => saveToolToGenerated(activeTool).catch((err) => setError(err.message))}
           onClear={() => clearToolContent(activeTool)}
           onClose={() => setActiveTool(null)}
@@ -1854,6 +1977,7 @@ function ToolWindow({
   boardRef,
   drawing,
   setDrawing,
+  layoutScale,
   onSave,
   onClear,
   onClose
@@ -1869,6 +1993,7 @@ function ToolWindow({
   boardRef: RefObject<HTMLDivElement | null>;
   drawing: boolean;
   setDrawing: Dispatch<SetStateAction<boolean>>;
+  layoutScale: number;
   onSave: () => void;
   onClear: () => void;
   onClose: () => void;
@@ -1880,6 +2005,15 @@ function ToolWindow({
     video: "视频查看",
     audio: "录音播放"
   }[tool];
+
+  const getBoardPoint = (event: ReactPointerEvent<HTMLDivElement> | ReactMouseEvent<HTMLDivElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const scale = Math.max(layoutScale, 0.01);
+    return {
+      x: (event.clientX - rect.left) / scale + event.currentTarget.scrollLeft,
+      y: (event.clientY - rect.top) / scale + event.currentTarget.scrollTop
+    };
+  };
 
   const addBoardText = () => {
     setBoardItems((items) => [...items, { id: crypto.randomUUID(), kind: "text", value: "新的观点", x: 80 + items.length * 24, y: 80 + items.length * 18 }]);
@@ -1929,16 +2063,16 @@ function ToolWindow({
           className={`infinite-board ${drawing ? "drawing" : ""}`}
           onPointerMove={(event) => {
             if (!drawing || event.buttons !== 1) return;
-            const rect = event.currentTarget.getBoundingClientRect();
+            const point = getBoardPoint(event);
             setDrawPoints((points) => [...points, {
               id: crypto.randomUUID(),
-              x: event.clientX - rect.left + event.currentTarget.scrollLeft,
-              y: event.clientY - rect.top + event.currentTarget.scrollTop
+              x: point.x,
+              y: point.y
             }].slice(-2200));
           }}
           onDoubleClick={(event) => {
-            const rect = event.currentTarget.getBoundingClientRect();
-            setBoardItems((items) => [...items, { id: crypto.randomUUID(), kind: "text", value: "双击添加", x: event.clientX - rect.left + event.currentTarget.scrollLeft, y: event.clientY - rect.top + event.currentTarget.scrollTop }]);
+            const point = getBoardPoint(event);
+            setBoardItems((items) => [...items, { id: crypto.randomUUID(), kind: "text", value: "双击添加", x: point.x, y: point.y }]);
           }}
         >
           <div className="board-canvas">
@@ -2047,12 +2181,28 @@ const SettingsPopover = forwardRef<HTMLElement, {
   settings: SettingsState;
   webEnabled: boolean;
   setWebEnabled: (_next: boolean) => void;
+  audioInputDevices: MediaDeviceInfo[];
+  selectedAudioInputId: string;
+  setSelectedAudioInputId: (_next: string) => void;
+  onRefreshAudioInputs: () => void;
+  topics: DiscussionTopic[];
+  activeTopicId: string;
+  onImportTopic: (_topicId: string) => void;
+  onDeleteTopic: (_topicId: string) => void;
   onSettingsSaved: (_settings: SettingsState) => void;
   style?: CSSProperties;
 }>(function SettingsPopover({
   settings,
   webEnabled,
   setWebEnabled,
+  audioInputDevices,
+  selectedAudioInputId,
+  setSelectedAudioInputId,
+  onRefreshAudioInputs,
+  topics,
+  activeTopicId,
+  onImportTopic,
+  onDeleteTopic,
   onSettingsSaved,
   style
 }, ref) {
@@ -2151,6 +2301,26 @@ const SettingsPopover = forwardRef<HTMLElement, {
         </div>
       </section>
 
+      <section className="settings-section">
+        <label htmlFor="audio-input-device">输入设备</label>
+        <div className="device-row">
+          <select
+            id="audio-input-device"
+            value={selectedAudioInputId}
+            onChange={(event) => setSelectedAudioInputId(event.target.value)}
+          >
+            <option value="">系统默认麦克风</option>
+            {audioInputDevices.map((device, index) => (
+              <option key={device.deviceId || index} value={device.deviceId}>
+                {device.label || `麦克风 ${index + 1}`}
+              </option>
+            ))}
+          </select>
+          <button type="button" onClick={onRefreshAudioInputs}>刷新</button>
+        </div>
+        <p>{audioInputDevices.length ? "语音讨论会使用这里选择的输入设备。" : "授权麦克风后可显示完整设备名称。"}</p>
+      </section>
+
       <section className="settings-section compact">
         <div>
           <strong>Web</strong>
@@ -2159,6 +2329,29 @@ const SettingsPopover = forwardRef<HTMLElement, {
           </button>
         </div>
         <p>AI 可按需查阅互联网，但回答必须回到当前主题。</p>
+      </section>
+
+      <section className="settings-section">
+        <details className="topic-import">
+          <summary>导入历史讨论话题</summary>
+          <div className="topic-import-list">
+            {topics.length ? (
+              topics.map((topic) => (
+                <div key={topic.id} className={topic.id === activeTopicId ? "topic-import-row active" : "topic-import-row"}>
+                  <button type="button" onClick={() => onImportTopic(topic.id)} disabled={topic.id === activeTopicId}>
+                    <strong>{topic.title}</strong>
+                    <span>{topic.fileCount} 文件 · {topic.recordCount} 记录</span>
+                  </button>
+                  <button type="button" className="topic-delete-button" onClick={() => onDeleteTopic(topic.id)}>
+                    <Trash2 size={13} />
+                  </button>
+                </div>
+              ))
+            ) : (
+              <p>暂无历史话题。</p>
+            )}
+          </div>
+        </details>
       </section>
 
       <section className="settings-section">

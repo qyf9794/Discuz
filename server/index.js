@@ -17,16 +17,19 @@ const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
 const dataDir = path.join(rootDir, "data");
-const uploadDir = path.join(dataDir, "uploads");
+const legacyUploadDir = path.join(dataDir, "uploads");
+const topicsDir = path.join(dataDir, "topics");
 const dbPath = path.join(dataDir, "discuz.sqlite");
 const port = Number(process.env.PORT || 8787);
 
-fs.mkdirSync(uploadDir, { recursive: true });
+fs.mkdirSync(legacyUploadDir, { recursive: true });
+fs.mkdirSync(topicsDir, { recursive: true });
 
 const db = new DatabaseSync(dbPath);
 db.exec(`
   CREATE TABLE IF NOT EXISTS files (
     id TEXT PRIMARY KEY,
+    topic_id TEXT NOT NULL DEFAULT '',
     role TEXT NOT NULL,
     original_name TEXT NOT NULL,
     stored_name TEXT NOT NULL,
@@ -43,6 +46,7 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS notes (
     id TEXT PRIMARY KEY,
+    topic_id TEXT NOT NULL DEFAULT '',
     kind TEXT NOT NULL,
     text TEXT NOT NULL,
     source TEXT NOT NULL DEFAULT '',
@@ -51,6 +55,7 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS discussion_records (
     id TEXT PRIMARY KEY,
+    topic_id TEXT NOT NULL DEFAULT '',
     title TEXT NOT NULL,
     content TEXT NOT NULL,
     note_count INTEGER NOT NULL DEFAULT 0,
@@ -61,6 +66,7 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS discussion_inputs (
     id TEXT PRIMARY KEY,
+    topic_id TEXT NOT NULL DEFAULT '',
     text TEXT NOT NULL,
     source TEXT NOT NULL DEFAULT 'user',
     created_at TEXT NOT NULL
@@ -68,6 +74,7 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS activities (
     id TEXT PRIMARY KEY,
+    topic_id TEXT NOT NULL DEFAULT '',
     label TEXT NOT NULL,
     detail TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
@@ -78,19 +85,69 @@ db.exec(`
     value TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS topics (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    folder_name TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
 `);
 
+function addColumnIfMissing(table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all().map((item) => item.name);
+  if (!columns.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+
 const fileColumns = db.prepare("PRAGMA table_info(files)").all().map((column) => column.name);
+if (!fileColumns.includes("topic_id")) {
+  db.exec("ALTER TABLE files ADD COLUMN topic_id TEXT NOT NULL DEFAULT ''");
+}
 if (!fileColumns.includes("rendered_html")) {
   db.exec("ALTER TABLE files ADD COLUMN rendered_html TEXT NOT NULL DEFAULT ''");
 }
 if (!fileColumns.includes("sort_order")) {
   db.exec("ALTER TABLE files ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0");
 }
+addColumnIfMissing("notes", "topic_id", "TEXT NOT NULL DEFAULT ''");
+addColumnIfMissing("discussion_records", "topic_id", "TEXT NOT NULL DEFAULT ''");
+addColumnIfMissing("discussion_inputs", "topic_id", "TEXT NOT NULL DEFAULT ''");
+addColumnIfMissing("activities", "topic_id", "TEXT NOT NULL DEFAULT ''");
+
+function createTopicRecord(title = "") {
+  const id = crypto.randomUUID();
+  const createdAt = now();
+  const safeTitle = cleanText(title) || `新讨论 ${shortLocalTime(createdAt)}`;
+  db.prepare("INSERT INTO topics (id, title, folder_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
+    .run(id, safeTitle, id, createdAt, createdAt);
+  fs.mkdirSync(topicUploadDir(id), { recursive: true });
+  return db.prepare("SELECT * FROM topics WHERE id = ?").get(id);
+}
+
+function ensureActiveTopic() {
+  let activeId = cleanText(getSetting("active_topic_id"));
+  let activeTopic = activeId ? db.prepare("SELECT * FROM topics WHERE id = ?").get(activeId) : null;
+  if (!activeTopic) {
+    activeTopic = db.prepare("SELECT * FROM topics ORDER BY updated_at DESC, created_at DESC LIMIT 1").get();
+  }
+  if (!activeTopic) {
+    const title = cleanText(getSetting("discussion_topic")) || "默认讨论";
+    activeTopic = createTopicRecord(title);
+  }
+  setSetting("active_topic_id", activeTopic.id);
+  db.prepare("UPDATE files SET topic_id = ? WHERE topic_id = ''").run(activeTopic.id);
+  db.prepare("UPDATE notes SET topic_id = ? WHERE topic_id = ''").run(activeTopic.id);
+  db.prepare("UPDATE discussion_records SET topic_id = ? WHERE topic_id = ''").run(activeTopic.id);
+  db.prepare("UPDATE discussion_inputs SET topic_id = ? WHERE topic_id = ''").run(activeTopic.id);
+  db.prepare("UPDATE activities SET topic_id = ? WHERE topic_id = ''").run(activeTopic.id);
+  migrateLegacyFilesToTopic(activeTopic.id);
+  return activeTopic.id;
+}
 
 const upload = multer({
   storage: multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, uploadDir),
+    destination: (_req, _file, cb) => cb(null, currentTopicUploadDir()),
     filename: (_req, file, cb) => {
       file.originalname = normalizeUploadedFilename(file.originalname);
       const ext = path.extname(file.originalname).toLowerCase();
@@ -104,27 +161,37 @@ const app = express();
 app.use(cors());
 app.use("/api/realtime/session", express.text({ type: ["application/sdp", "text/plain"], limit: "2mb" }));
 app.use(express.json({ limit: "2mb" }));
-app.use("/api/raw", express.static(uploadDir));
+app.get("/api/raw/:topicId/:storedName", (req, res) => {
+  const topicId = cleanText(req.params.topicId);
+  const storedName = path.basename(cleanText(req.params.storedName));
+  const filePath = path.join(topicUploadDir(topicId), storedName);
+  if (fs.existsSync(filePath)) return res.sendFile(filePath);
+  const legacyPath = path.join(legacyUploadDir, storedName);
+  if (fs.existsSync(legacyPath)) return res.sendFile(legacyPath);
+  res.status(404).json({ error: "File not found" });
+});
+app.use("/api/raw", express.static(legacyUploadDir));
 
 function now() {
   return new Date().toISOString();
 }
 
-function nextFileSortOrder(role) {
-  const row = db.prepare("SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order FROM files WHERE role = ?").get(role);
+function nextFileSortOrder(role, topicId = getActiveTopicId()) {
+  const row = db.prepare("SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order FROM files WHERE role = ? AND topic_id = ?").get(role, topicId);
   return Number(row?.next_order ?? 0);
 }
 
-function normalizePrimarySortOrder() {
+function normalizePrimarySortOrder(topicId = getActiveTopicId()) {
   const rows = db.prepare(`
     SELECT id FROM files
-    WHERE role = 'primary'
+    WHERE role = 'primary' AND topic_id = ?
     ORDER BY sort_order ASC, created_at DESC
-  `).all();
+  `).all(topicId);
   const update = db.prepare("UPDATE files SET sort_order = ? WHERE id = ?");
   rows.forEach((row, index) => update.run(index, row.id));
 }
 
+ensureActiveTopic();
 normalizePrimarySortOrder();
 
 function decodeMojibakeFilename(value) {
@@ -145,8 +212,10 @@ function normalizeUploadedFilename(value) {
 
 function rowToFile(row) {
   if (!row) return null;
+  const topicId = cleanText(row.topic_id) || getActiveTopicId();
   return {
     id: row.id,
+    topicId,
     role: row.role,
     originalName: row.original_name,
     storedName: row.stored_name,
@@ -159,7 +228,7 @@ function rowToFile(row) {
     sortOrder: row.sort_order,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-    previewUrl: `/api/raw/${encodeURIComponent(row.stored_name)}`
+    previewUrl: `/api/raw/${encodeURIComponent(topicId)}/${encodeURIComponent(row.stored_name)}`
   };
 }
 
@@ -194,6 +263,99 @@ function cleanHtml(value) {
   return String(value || "")
     .replace(/\u0000/g, "")
     .trim();
+}
+
+function topicUploadDir(topicId) {
+  const safeId = path.basename(cleanText(topicId) || "default");
+  return path.join(topicsDir, safeId, "uploads");
+}
+
+function currentTopicUploadDir() {
+  const dir = topicUploadDir(getActiveTopicId());
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function filePathForRow(row) {
+  const topicPath = path.join(topicUploadDir(cleanText(row?.topic_id) || getActiveTopicId()), path.basename(row.stored_name));
+  if (fs.existsSync(topicPath)) return topicPath;
+  return path.join(legacyUploadDir, path.basename(row.stored_name));
+}
+
+function rowToTopic(row) {
+  if (!row) return null;
+  const fileCount = db.prepare("SELECT COUNT(*) AS count FROM files WHERE topic_id = ?").get(row.id)?.count ?? 0;
+  const recordCount = db.prepare("SELECT COUNT(*) AS count FROM discussion_records WHERE topic_id = ?").get(row.id)?.count ?? 0;
+  return {
+    id: row.id,
+    title: row.title,
+    folderName: row.folder_name,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    fileCount,
+    recordCount,
+    active: row.id === getActiveTopicId()
+  };
+}
+
+function getActiveTopicId() {
+  const activeId = cleanText(getSetting("active_topic_id"));
+  const activeTopic = activeId ? db.prepare("SELECT id FROM topics WHERE id = ?").get(activeId) : null;
+  if (activeTopic) return activeTopic.id;
+  return ensureActiveTopic();
+}
+
+function getActiveTopic() {
+  return db.prepare("SELECT * FROM topics WHERE id = ?").get(getActiveTopicId());
+}
+
+function getTopics() {
+  return db.prepare("SELECT * FROM topics ORDER BY updated_at DESC, created_at DESC").all().map(rowToTopic);
+}
+
+function touchActiveTopic() {
+  db.prepare("UPDATE topics SET updated_at = ? WHERE id = ?").run(now(), getActiveTopicId());
+}
+
+function migrateLegacyFilesToTopic(topicId) {
+  const rows = db.prepare("SELECT * FROM files WHERE topic_id = ?").all(topicId);
+  const dir = topicUploadDir(topicId);
+  fs.mkdirSync(dir, { recursive: true });
+  for (const row of rows) {
+    const legacyPath = path.join(legacyUploadDir, row.stored_name);
+    const targetPath = path.join(dir, row.stored_name);
+    if (fs.existsSync(legacyPath) && !fs.existsSync(targetPath)) {
+      try {
+        fs.renameSync(legacyPath, targetPath);
+      } catch {
+        try {
+          fs.copyFileSync(legacyPath, targetPath);
+        } catch {
+          // Keep compatibility through the legacy raw route if migration fails.
+        }
+      }
+    }
+  }
+}
+
+function topicSnapshot(topicId = getActiveTopicId()) {
+  const topic = db.prepare("SELECT * FROM topics WHERE id = ?").get(topicId);
+  return {
+    topic: rowToTopic(topic),
+    files: db.prepare("SELECT * FROM files WHERE topic_id = ? ORDER BY created_at DESC").all(topicId).map(rowToFile),
+    notes: db.prepare("SELECT * FROM notes WHERE topic_id = ? ORDER BY created_at DESC").all(topicId),
+    records: db.prepare("SELECT * FROM discussion_records WHERE topic_id = ? ORDER BY created_at DESC").all(topicId),
+    discussionInputs: db.prepare("SELECT * FROM discussion_inputs WHERE topic_id = ? ORDER BY created_at DESC").all(topicId),
+    activities: db.prepare("SELECT * FROM activities WHERE topic_id = ? ORDER BY created_at DESC").all(topicId)
+  };
+}
+
+function writeTopicSnapshot(topicId = getActiveTopicId()) {
+  const topic = db.prepare("SELECT * FROM topics WHERE id = ?").get(topicId);
+  if (!topic) return;
+  const topicDir = path.join(topicsDir, topic.folder_name);
+  fs.mkdirSync(topicDir, { recursive: true });
+  fs.writeFileSync(path.join(topicDir, "topic.json"), JSON.stringify(topicSnapshot(topicId), null, 2), "utf8");
 }
 
 function summarizeText(text, fallbackName) {
@@ -280,7 +442,7 @@ async function extractContentAtPath(filePath, kind) {
 }
 
 async function extractContentFromFile(file, kind) {
-  return extractContentAtPath(path.join(uploadDir, file.filename), kind);
+  return extractContentAtPath(file.path, kind);
 }
 
 async function persistUploadedFile(file, role) {
@@ -303,11 +465,12 @@ async function persistUploadedFile(file, role) {
 
   db.prepare(`
     INSERT INTO files (
-      id, role, original_name, stored_name, mime_type, size, kind,
+      id, topic_id, role, original_name, stored_name, mime_type, size, kind,
       extracted_text, rendered_html, summary, sort_order, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
+    getActiveTopicId(),
     role,
     originalName,
     file.filename,
@@ -322,8 +485,7 @@ async function persistUploadedFile(file, role) {
     createdAt
   );
 
-  db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
-    .run(crypto.randomUUID(), role === "primary" ? "Primary file" : "Context file", originalName, createdAt);
+  addActivity(role === "primary" ? "Primary file" : "Context file", originalName, createdAt);
 
   return rowToFile(db.prepare("SELECT * FROM files WHERE id = ?").get(id));
 }
@@ -334,7 +496,7 @@ function persistGeneratedFile(title, text) {
   const nameWithExt = path.extname(originalName) ? originalName : `${originalName}.md`;
   const storedName = `${id}.md`;
   const content = cleanText(text);
-  const filePath = path.join(uploadDir, storedName);
+  const filePath = path.join(currentTopicUploadDir(), storedName);
   fs.writeFileSync(filePath, content, "utf8");
   const createdAt = now();
   const summary = summarizeText(content, nameWithExt);
@@ -342,11 +504,12 @@ function persistGeneratedFile(title, text) {
 
   db.prepare(`
     INSERT INTO files (
-      id, role, original_name, stored_name, mime_type, size, kind,
+      id, topic_id, role, original_name, stored_name, mime_type, size, kind,
       extracted_text, rendered_html, summary, sort_order, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
+    getActiveTopicId(),
     "generated",
     nameWithExt,
     storedName,
@@ -361,8 +524,7 @@ function persistGeneratedFile(title, text) {
     createdAt
   );
 
-  db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
-    .run(crypto.randomUUID(), "AI draft", nameWithExt, createdAt);
+  addActivity("AI draft", nameWithExt, createdAt);
 
   return rowToFile(db.prepare("SELECT * FROM files WHERE id = ?").get(id));
 }
@@ -385,19 +547,20 @@ function copyStoredFileAsGenerated(row) {
   const id = crypto.randomUUID();
   const ext = path.extname(row.stored_name) || path.extname(row.original_name);
   const storedName = `${id}${ext}`;
-  const sourcePath = path.join(uploadDir, row.stored_name);
-  const targetPath = path.join(uploadDir, storedName);
+  const sourcePath = filePathForRow(row);
+  const targetPath = path.join(currentTopicUploadDir(), storedName);
   fs.copyFileSync(sourcePath, targetPath);
   const createdAt = now();
   const sortOrder = nextFileSortOrder("generated");
 
   db.prepare(`
     INSERT INTO files (
-      id, role, original_name, stored_name, mime_type, size, kind,
+      id, topic_id, role, original_name, stored_name, mime_type, size, kind,
       extracted_text, rendered_html, summary, sort_order, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
+    getActiveTopicId(),
     "generated",
     row.original_name,
     storedName,
@@ -412,15 +575,14 @@ function copyStoredFileAsGenerated(row) {
     createdAt
   );
 
-  db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
-    .run(crypto.randomUUID(), "AI draft", row.original_name, createdAt);
+  addActivity("AI draft", row.original_name, createdAt);
 
   return rowToFile(db.prepare("SELECT * FROM files WHERE id = ?").get(id));
 }
 
 function removeStoredFile(row) {
   if (!row) return;
-  const filePath = path.join(uploadDir, row.stored_name);
+  const filePath = filePathForRow(row);
   try {
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
   } catch {
@@ -433,7 +595,7 @@ async function refreshStoredFiles() {
   for (const row of rows) {
     const originalName = normalizeUploadedFilename(row.original_name);
     const kind = detectKindFromMetadata(originalName, row.mime_type, row.stored_name);
-    const filePath = path.join(uploadDir, row.stored_name);
+    const filePath = filePathForRow(row);
     let extractedText = row.extracted_text || "";
     let renderedHtml = row.rendered_html || "";
 
@@ -471,15 +633,16 @@ async function refreshStoredFiles() {
 function getFiles() {
   return db.prepare(`
     SELECT * FROM files
+    WHERE topic_id = ?
     ORDER BY
       role = 'primary' DESC,
       CASE WHEN role = 'primary' THEN sort_order ELSE NULL END ASC,
       created_at DESC
-  `).all().map(rowToFile);
+  `).all(getActiveTopicId()).map(rowToFile);
 }
 
 function getNotes() {
-  return db.prepare("SELECT * FROM notes ORDER BY created_at DESC").all().map((row) => ({
+  return db.prepare("SELECT * FROM notes WHERE topic_id = ? ORDER BY created_at DESC").all(getActiveTopicId()).map((row) => ({
     id: row.id,
     kind: row.kind,
     text: row.text,
@@ -489,7 +652,7 @@ function getNotes() {
 }
 
 function getActivities() {
-  return db.prepare("SELECT * FROM activities ORDER BY created_at DESC LIMIT 12").all().map((row) => ({
+  return db.prepare("SELECT * FROM activities WHERE topic_id = ? ORDER BY created_at DESC LIMIT 12").all(getActiveTopicId()).map((row) => ({
     id: row.id,
     label: row.label,
     detail: row.detail,
@@ -498,7 +661,7 @@ function getActivities() {
 }
 
 function getRecords() {
-  return db.prepare("SELECT * FROM discussion_records ORDER BY created_at DESC").all().map((row) => ({
+  return db.prepare("SELECT * FROM discussion_records WHERE topic_id = ? ORDER BY created_at DESC").all(getActiveTopicId()).map((row) => ({
     id: row.id,
     title: row.title,
     content: row.content,
@@ -510,7 +673,7 @@ function getRecords() {
 }
 
 function getDiscussionInputs(limit = 24) {
-  return db.prepare("SELECT * FROM discussion_inputs ORDER BY created_at DESC LIMIT ?").all(limit).map((row) => ({
+  return db.prepare("SELECT * FROM discussion_inputs WHERE topic_id = ? ORDER BY created_at DESC LIMIT ?").all(getActiveTopicId(), limit).map((row) => ({
     id: row.id,
     text: row.text,
     source: row.source,
@@ -538,6 +701,12 @@ function deleteSetting(key) {
   db.prepare("DELETE FROM settings WHERE key = ?").run(key);
 }
 
+function addActivity(label, detail = "", createdAt = now(), topicId = getActiveTopicId()) {
+  db.prepare("INSERT INTO activities (id, topic_id, label, detail, created_at) VALUES (?, ?, ?, ?, ?)")
+    .run(crypto.randomUUID(), topicId, label, cleanText(detail), createdAt);
+  touchActiveTopic();
+}
+
 function getOpenAiApiKey() {
   return cleanText(getSetting("openai_api_key")) || cleanText(process.env.OPENAI_API_KEY || "");
 }
@@ -553,7 +722,7 @@ function getSettingsState() {
 }
 
 function getDiscussionTopic() {
-  return cleanText(getSetting("discussion_topic"));
+  return cleanText(getActiveTopic()?.title || "");
 }
 
 refreshStoredFiles().catch((error) => {
@@ -561,8 +730,9 @@ refreshStoredFiles().catch((error) => {
 });
 
 function buildDiscussionContext() {
-  const primaryFiles = db.prepare("SELECT * FROM files WHERE role = 'primary' ORDER BY created_at DESC LIMIT 8").all().map(rowToFile);
-  const contextFiles = db.prepare("SELECT * FROM files WHERE role = 'context' ORDER BY created_at DESC LIMIT 12").all().map(rowToFile);
+  const topicId = getActiveTopicId();
+  const primaryFiles = db.prepare("SELECT * FROM files WHERE role = 'primary' AND topic_id = ? ORDER BY created_at DESC LIMIT 8").all(topicId).map(rowToFile);
+  const contextFiles = db.prepare("SELECT * FROM files WHERE role = 'context' AND topic_id = ? ORDER BY created_at DESC LIMIT 12").all(topicId).map(rowToFile);
   const memoryNotes = getNotes().slice(0, 24).reverse();
   const discussionInputs = getDiscussionInputs(24).reverse();
   const discussionTopic = getDiscussionTopic();
@@ -651,36 +821,91 @@ function stripTags(value) {
   return cleanText(String(value || "").replace(/<[^>]*>/g, " ")).replace(/\s{2,}/g, " ");
 }
 
-app.get("/api/state", (_req, res) => {
-  res.json({
+function statePayload(extra = {}) {
+  return {
     files: getFiles(),
     notes: getNotes(),
     records: getRecords(),
     discussionInputs: getDiscussionInputs(),
     discussionTopic: getDiscussionTopic(),
     activities: getActivities(),
-    settings: getSettingsState()
-  });
+    settings: getSettingsState(),
+    activeTopicId: getActiveTopicId(),
+    topics: getTopics(),
+    ...extra
+  };
+}
+
+app.get("/api/topics", (_req, res) => {
+  res.json({ activeTopicId: getActiveTopicId(), topics: getTopics() });
+});
+
+app.post("/api/topics/current/save", (_req, res) => {
+  writeTopicSnapshot();
+  res.json({ ok: true, topic: rowToTopic(getActiveTopic()) });
+});
+
+app.post("/api/topics", (req, res) => {
+  writeTopicSnapshot();
+  const title = cleanText(req.body?.title || "");
+  const topic = createTopicRecord(title);
+  setSetting("active_topic_id", topic.id);
+  addActivity("Topic", "New discussion", now(), topic.id);
+  writeTopicSnapshot(topic.id);
+  res.json(statePayload());
+});
+
+app.post("/api/topics/:id/switch", (req, res) => {
+  const topic = db.prepare("SELECT * FROM topics WHERE id = ?").get(req.params.id);
+  if (!topic) return res.status(404).json({ error: "Topic not found" });
+  writeTopicSnapshot();
+  setSetting("active_topic_id", topic.id);
+  db.prepare("UPDATE topics SET updated_at = ? WHERE id = ?").run(now(), topic.id);
+  writeTopicSnapshot(topic.id);
+  res.json(statePayload());
+});
+
+app.delete("/api/topics/:id", (req, res) => {
+  const topic = db.prepare("SELECT * FROM topics WHERE id = ?").get(req.params.id);
+  if (!topic) return res.status(404).json({ error: "Topic not found" });
+  db.prepare("SELECT * FROM files WHERE topic_id = ?").all(topic.id).forEach(removeStoredFile);
+  db.prepare("DELETE FROM files WHERE topic_id = ?").run(topic.id);
+  db.prepare("DELETE FROM notes WHERE topic_id = ?").run(topic.id);
+  db.prepare("DELETE FROM discussion_records WHERE topic_id = ?").run(topic.id);
+  db.prepare("DELETE FROM discussion_inputs WHERE topic_id = ?").run(topic.id);
+  db.prepare("DELETE FROM activities WHERE topic_id = ?").run(topic.id);
+  db.prepare("DELETE FROM topics WHERE id = ?").run(topic.id);
+  fs.rmSync(path.join(topicsDir, topic.folder_name), { recursive: true, force: true });
+  if (getSetting("active_topic_id") === topic.id) {
+    const nextTopic = db.prepare("SELECT * FROM topics ORDER BY updated_at DESC, created_at DESC LIMIT 1").get() || createTopicRecord();
+    setSetting("active_topic_id", nextTopic.id);
+  }
+  res.json(statePayload());
+});
+
+app.get("/api/state", (_req, res) => {
+  writeTopicSnapshot();
+  res.json(statePayload());
 });
 
 app.post("/api/discussion-inputs", (req, res) => {
   const text = cleanText(req.body?.text || "");
   if (!text) return res.status(400).json({ error: "Missing discussion input" });
   const createdAt = now();
-  db.prepare("INSERT INTO discussion_inputs (id, text, source, created_at) VALUES (?, ?, ?, ?)")
-    .run(crypto.randomUUID(), text, "user", createdAt);
-  db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
-    .run(crypto.randomUUID(), "Discussion input", text.slice(0, 80), createdAt);
+  db.prepare("INSERT INTO discussion_inputs (id, topic_id, text, source, created_at) VALUES (?, ?, ?, ?, ?)")
+    .run(crypto.randomUUID(), getActiveTopicId(), text, "user", createdAt);
+  addActivity("Discussion input", text.slice(0, 80), createdAt);
   res.json({ discussionInputs: getDiscussionInputs(), activities: getActivities() });
 });
 
 app.post("/api/discussion-topic", (req, res) => {
   const topic = cleanText(req.body?.topic || "");
   if (!topic) return res.status(400).json({ error: "Missing discussion topic" });
-  setSetting("discussion_topic", topic);
-  db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
-    .run(crypto.randomUUID(), "Discussion topic", topic.slice(0, 80), now());
-  res.json({ discussionTopic: getDiscussionTopic(), activities: getActivities() });
+  const updatedAt = now();
+  db.prepare("UPDATE topics SET title = ?, updated_at = ? WHERE id = ?").run(topic, updatedAt, getActiveTopicId());
+  addActivity("Discussion topic", topic.slice(0, 80), updatedAt);
+  writeTopicSnapshot();
+  res.json({ discussionTopic: getDiscussionTopic(), topics: getTopics(), activities: getActivities() });
 });
 
 app.delete("/api/files/:id", (req, res) => {
@@ -689,43 +914,44 @@ app.delete("/api/files/:id", (req, res) => {
   removeStoredFile(row);
   db.prepare("DELETE FROM files WHERE id = ?").run(req.params.id);
   const createdAt = now();
-  db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
-    .run(crypto.randomUUID(), row.role === "primary" ? "Primary removed" : "Resource removed", row.original_name, createdAt);
-  res.json({ files: getFiles(), activities: getActivities() });
+  addActivity(row.role === "primary" ? "Primary removed" : "Resource removed", row.original_name, createdAt);
+  writeTopicSnapshot();
+  res.json({ files: getFiles(), activities: getActivities(), topics: getTopics() });
 });
 
 app.post("/api/files/primary/reorder", (req, res) => {
   const ids = Array.isArray(req.body?.ids) ? req.body.ids.map((id) => cleanText(id)).filter(Boolean) : [];
   const existingIds = db.prepare(`
     SELECT id FROM files
-    WHERE role = 'primary'
+    WHERE role = 'primary' AND topic_id = ?
     ORDER BY sort_order ASC, created_at DESC
-  `).all().map((row) => row.id);
+  `).all(getActiveTopicId()).map((row) => row.id);
   const orderedIds = [
     ...ids.filter((id, index) => existingIds.includes(id) && ids.indexOf(id) === index),
     ...existingIds.filter((id) => !ids.includes(id))
   ];
-  const update = db.prepare("UPDATE files SET sort_order = ? WHERE id = ? AND role = 'primary'");
+  const update = db.prepare("UPDATE files SET sort_order = ? WHERE id = ? AND role = 'primary' AND topic_id = ?");
   db.exec("BEGIN");
   try {
-    orderedIds.forEach((id, index) => update.run(index, id));
+    orderedIds.forEach((id, index) => update.run(index, id, getActiveTopicId()));
     db.exec("COMMIT");
   } catch (error) {
     db.exec("ROLLBACK");
     throw error;
   }
-  res.json({ files: getFiles() });
+  writeTopicSnapshot();
+  res.json({ files: getFiles(), topics: getTopics() });
 });
 
 app.post("/api/discussion/reset", (_req, res) => {
-  db.prepare("SELECT * FROM files").all().forEach(removeStoredFile);
-  db.exec(`
-    DELETE FROM files;
-    DELETE FROM notes;
-    DELETE FROM discussion_inputs;
-    DELETE FROM activities;
-    DELETE FROM settings WHERE key = 'discussion_topic';
-  `);
+  const topicId = getActiveTopicId();
+  db.prepare("SELECT * FROM files WHERE topic_id = ?").all(topicId).forEach(removeStoredFile);
+  db.prepare("DELETE FROM files WHERE topic_id = ?").run(topicId);
+  db.prepare("DELETE FROM notes WHERE topic_id = ?").run(topicId);
+  db.prepare("DELETE FROM discussion_inputs WHERE topic_id = ?").run(topicId);
+  db.prepare("DELETE FROM activities WHERE topic_id = ?").run(topicId);
+  db.prepare("UPDATE topics SET title = ?, updated_at = ? WHERE id = ?").run(`新讨论 ${shortLocalTime(now())}`, now(), topicId);
+  writeTopicSnapshot(topicId);
   res.json({
     files: getFiles(),
     notes: getNotes(),
@@ -733,7 +959,9 @@ app.post("/api/discussion/reset", (_req, res) => {
     discussionInputs: getDiscussionInputs(),
     discussionTopic: getDiscussionTopic(),
     activities: getActivities(),
-    settings: getSettingsState()
+    settings: getSettingsState(),
+    activeTopicId: getActiveTopicId(),
+    topics: getTopics()
   });
 });
 
@@ -755,16 +983,16 @@ app.post("/api/settings/wallpaper", upload.single("wallpaper"), (req, res) => {
     fs.rmSync(file.path, { force: true });
     return res.status(400).json({ error: "Wallpaper must be an image" });
   }
-  setSetting("wallpaper_url", `/api/raw/${encodeURIComponent(file.filename)}`);
-  db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
-    .run(crypto.randomUUID(), "Wallpaper", file.originalname, now());
+  setSetting("wallpaper_url", `/api/raw/${encodeURIComponent(getActiveTopicId())}/${encodeURIComponent(file.filename)}`);
+  addActivity("Wallpaper", file.originalname, now());
+  writeTopicSnapshot();
   res.json(getSettingsState());
 });
 
 app.delete("/api/settings/wallpaper", (_req, res) => {
   deleteSetting("wallpaper_url");
-  db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
-    .run(crypto.randomUUID(), "Wallpaper", "Default wallpaper", now());
+  addActivity("Wallpaper", "Default wallpaper", now());
+  writeTopicSnapshot();
   res.json(getSettingsState());
 });
 
@@ -773,7 +1001,8 @@ app.post("/api/files/primary", upload.array("files", 20), async (req, res) => {
   if (!uploaded.length) return res.status(400).json({ error: "Missing files" });
   const files = [];
   for (const file of uploaded) files.push(await persistUploadedFile(file, "primary"));
-  res.json({ uploaded: files, file: files[0], files: getFiles(), activities: getActivities() });
+  writeTopicSnapshot();
+  res.json({ uploaded: files, file: files[0], files: getFiles(), activities: getActivities(), topics: getTopics() });
 });
 
 app.post("/api/files/context", upload.array("files", 20), async (req, res) => {
@@ -781,7 +1010,8 @@ app.post("/api/files/context", upload.array("files", 20), async (req, res) => {
   if (!uploaded.length) return res.status(400).json({ error: "Missing files" });
   const files = [];
   for (const file of uploaded) files.push(await persistUploadedFile(file, "context"));
-  res.json({ uploaded: files, files: getFiles(), activities: getActivities() });
+  writeTopicSnapshot();
+  res.json({ uploaded: files, files: getFiles(), activities: getActivities(), topics: getTopics() });
 });
 
 app.post("/api/files/generated", (req, res) => {
@@ -789,7 +1019,8 @@ app.post("/api/files/generated", (req, res) => {
   const text = cleanText(req.body?.text || "");
   if (!text) return res.status(400).json({ error: "Missing generated file text" });
   const file = persistGeneratedFile(title, text);
-  res.json({ file, files: getFiles(), activities: getActivities() });
+  writeTopicSnapshot();
+  res.json({ file, files: getFiles(), activities: getActivities(), topics: getTopics() });
 });
 
 app.post("/api/files/generated/upload", upload.array("files", 20), async (req, res) => {
@@ -797,7 +1028,8 @@ app.post("/api/files/generated/upload", upload.array("files", 20), async (req, r
   if (!uploaded.length) return res.status(400).json({ error: "Missing files" });
   const files = [];
   for (const file of uploaded) files.push(await persistUploadedFile(file, "generated"));
-  res.json({ uploaded: files, file: files[0], files: getFiles(), activities: getActivities() });
+  writeTopicSnapshot();
+  res.json({ uploaded: files, file: files[0], files: getFiles(), activities: getActivities(), topics: getTopics() });
 });
 
 app.post("/api/files/:id/content", (req, res) => {
@@ -807,7 +1039,7 @@ app.post("/api/files/:id/content", (req, res) => {
     return res.status(400).json({ error: "Only editable generated or primary text files can be updated" });
   }
   const text = cleanText(req.body?.text || "");
-  const filePath = path.join(uploadDir, row.stored_name);
+  const filePath = filePathForRow(row);
   fs.writeFileSync(filePath, text, "utf8");
   const updatedAt = now();
   db.prepare(`
@@ -815,9 +1047,9 @@ app.post("/api/files/:id/content", (req, res) => {
     SET extracted_text = ?, summary = ?, size = ?, updated_at = ?
     WHERE id = ?
   `).run(text, summarizeText(text, row.original_name), Buffer.byteLength(text, "utf8"), updatedAt, row.id);
-  db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
-    .run(crypto.randomUUID(), "File edited", row.original_name, updatedAt);
-  res.json({ file: rowToFile(db.prepare("SELECT * FROM files WHERE id = ?").get(row.id)), files: getFiles(), activities: getActivities() });
+  addActivity("File edited", row.original_name, updatedAt);
+  writeTopicSnapshot();
+  res.json({ file: rowToFile(db.prepare("SELECT * FROM files WHERE id = ?").get(row.id)), files: getFiles(), activities: getActivities(), topics: getTopics() });
 });
 
 app.post("/api/files/:id/promote-primary", (req, res) => {
@@ -832,9 +1064,9 @@ app.post("/api/files/:id/promote-primary", (req, res) => {
   const updatedAt = now();
   db.prepare("UPDATE files SET role = 'primary', sort_order = ?, updated_at = ? WHERE id = ?")
     .run(nextFileSortOrder("primary"), updatedAt, row.id);
-  db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
-    .run(crypto.randomUUID(), "Outcome file", row.original_name, updatedAt);
-  res.json({ file: rowToFile(db.prepare("SELECT * FROM files WHERE id = ?").get(row.id)), files: getFiles(), activities: getActivities() });
+  addActivity("Outcome file", row.original_name, updatedAt);
+  writeTopicSnapshot();
+  res.json({ file: rowToFile(db.prepare("SELECT * FROM files WHERE id = ?").get(row.id)), files: getFiles(), activities: getActivities(), topics: getTopics() });
 });
 
 app.post("/api/files/:id/demote-context", (req, res) => {
@@ -849,9 +1081,9 @@ app.post("/api/files/:id/demote-context", (req, res) => {
   const updatedAt = now();
   db.prepare("UPDATE files SET role = 'context', sort_order = ?, updated_at = ? WHERE id = ?")
     .run(nextFileSortOrder("context"), updatedAt, row.id);
-  db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
-    .run(crypto.randomUUID(), "Background file", row.original_name, updatedAt);
-  res.json({ file: rowToFile(db.prepare("SELECT * FROM files WHERE id = ?").get(row.id)), files: getFiles(), activities: getActivities() });
+  addActivity("Background file", row.original_name, updatedAt);
+  writeTopicSnapshot();
+  res.json({ file: rowToFile(db.prepare("SELECT * FROM files WHERE id = ?").get(row.id)), files: getFiles(), activities: getActivities(), topics: getTopics() });
 });
 
 app.post("/api/files/:id/role", (req, res) => {
@@ -868,9 +1100,9 @@ app.post("/api/files/:id/role", (req, res) => {
   db.prepare("UPDATE files SET role = ?, sort_order = ?, updated_at = ? WHERE id = ?")
     .run(role, nextFileSortOrder(role), updatedAt, row.id);
   const label = role === "primary" ? "Outcome file" : role === "context" ? "Background file" : "AI draft";
-  db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
-    .run(crypto.randomUUID(), label, row.original_name, updatedAt);
-  res.json({ file: rowToFile(db.prepare("SELECT * FROM files WHERE id = ?").get(row.id)), files: getFiles(), activities: getActivities() });
+  addActivity(label, row.original_name, updatedAt);
+  writeTopicSnapshot();
+  res.json({ file: rowToFile(db.prepare("SELECT * FROM files WHERE id = ?").get(row.id)), files: getFiles(), activities: getActivities(), topics: getTopics() });
 });
 
 app.post("/api/files/:id/copy-generated", (req, res) => {
@@ -879,7 +1111,8 @@ app.post("/api/files/:id/copy-generated", (req, res) => {
   const file = row.kind === "markdown" || row.kind === "text"
     ? persistGeneratedFile(copyFileTitle(row.original_name), copyFileTextForEditing(row))
     : copyStoredFileAsGenerated(row);
-  res.json({ file, files: getFiles(), activities: getActivities() });
+  writeTopicSnapshot();
+  res.json({ file, files: getFiles(), activities: getActivities(), topics: getTopics() });
 });
 
 app.get("/api/files/:id/preview", (req, res) => {
@@ -890,7 +1123,7 @@ app.get("/api/files/:id/preview", (req, res) => {
 
 app.get("/api/context/search", (req, res) => {
   const query = cleanText(req.query.q || "").toLowerCase();
-  const rows = db.prepare("SELECT * FROM files WHERE role = 'context'").all();
+  const rows = db.prepare("SELECT * FROM files WHERE role = 'context' AND topic_id = ?").all(getActiveTopicId());
   const terms = query.split(/\s+/).filter(Boolean);
   const results = rows
     .map((row) => {
@@ -928,8 +1161,8 @@ app.get("/api/web/search", async (req, res) => {
         source: "wikipedia"
       }));
     }
-    db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
-      .run(crypto.randomUUID(), "Web", query, now());
+  addActivity("Web", query, now());
+    writeTopicSnapshot();
     res.json({ query, results });
   } catch (error) {
     res.status(502).json({ error: error.message, query, results: [] });
@@ -940,8 +1173,9 @@ app.post("/api/notes", (req, res) => {
   const { kind = "point", text, source = "" } = req.body || {};
   if (!cleanText(text)) return res.status(400).json({ error: "Missing note text" });
   const createdAt = now();
-  db.prepare("INSERT INTO notes (id, kind, text, source, created_at) VALUES (?, ?, ?, ?, ?)")
-    .run(crypto.randomUUID(), kind, cleanText(text), cleanText(source), createdAt);
+  db.prepare("INSERT INTO notes (id, topic_id, kind, text, source, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+    .run(crypto.randomUUID(), getActiveTopicId(), kind, cleanText(text), cleanText(source), createdAt);
+  writeTopicSnapshot();
   res.json({ notes: getNotes() });
 });
 
@@ -951,9 +1185,9 @@ app.post("/api/records/finish", (req, res) => {
   const endedAt = now();
   const notes = db.prepare(`
     SELECT * FROM notes
-    WHERE created_at >= ? AND created_at <= ?
+    WHERE topic_id = ? AND created_at >= ? AND created_at <= ?
     ORDER BY created_at ASC
-  `).all(startedAt, endedAt);
+  `).all(getActiveTopicId(), startedAt, endedAt);
   if (!notes.length) return res.json({ created: null, records: getRecords(), activities: getActivities() });
 
   const content = notes
@@ -966,11 +1200,11 @@ app.post("/api/records/finish", (req, res) => {
   const createdAt = endedAt;
 
   db.prepare(`
-    INSERT INTO discussion_records (id, title, content, note_count, started_at, ended_at, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(id, title, content, notes.length, startedAt, endedAt, createdAt);
-  db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
-    .run(crypto.randomUUID(), "Record", title, createdAt);
+    INSERT INTO discussion_records (id, topic_id, title, content, note_count, started_at, ended_at, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, getActiveTopicId(), title, content, notes.length, startedAt, endedAt, createdAt);
+  addActivity("Record", title, createdAt);
+  writeTopicSnapshot();
 
   res.json({
     created: getRecords().find((record) => record.id === id),
@@ -1260,8 +1494,8 @@ app.post("/api/realtime/session", async (req, res) => {
   if (!response.ok) {
     return res.status(response.status).type("text/plain").send(payload);
   }
-  db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
-    .run(crypto.randomUUID(), "Realtime", "Voice session started", now());
+  addActivity("Realtime", "Voice session started", now());
+  writeTopicSnapshot();
   res.type("application/sdp").send(payload);
 });
 
