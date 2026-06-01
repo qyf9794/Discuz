@@ -218,11 +218,11 @@ button {
 .topic-confirmation {
   display: flex;
   min-width: 0;
-  max-width: min(420px, 36vw);
+  max-width: min(560px, 46vw);
   flex: 1;
   align-items: center;
   gap: 10px;
-  min-height: 40px;
+  min-height: 46px;
   padding: 7px 9px 7px 11px;
   border: 1px solid rgba(255, 255, 255, 0.42);
   border-radius: 14px;
@@ -252,11 +252,22 @@ button {
 
 .topic-confirmation strong {
   display: block;
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
   color: rgba(23, 33, 43, 0.94);
-  font-size: 12px;
-  text-overflow: ellipsis;
+  font-size: 16px;
+  line-height: 1.25;
+  scrollbar-width: none;
   white-space: nowrap;
+}
+
+.topic-confirmation strong::-webkit-scrollbar {
+  display: none;
+}
+
+.topic-confirmation:has(.topic-confirmation-actions) strong {
+  font-size: 18px;
+  font-weight: 780;
 }
 
 .topic-confirmation p {
