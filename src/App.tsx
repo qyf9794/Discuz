@@ -87,7 +87,11 @@ function readAnalyserLevel(analyser?: AnalyserNode, data?: Uint8Array<ArrayBuffe
     const centered = (value - 128) / 128;
     sum += centered * centered;
   }
-  return Math.min(1, Math.sqrt(sum / data.length) * 4.8);
+  const rms = Math.sqrt(sum / data.length);
+  const noiseFloor = 0.018;
+  if (rms <= noiseFloor) return 0;
+  const normalized = Math.min(1, (rms - noiseFloor) / 0.18);
+  return Math.pow(normalized, 0.72);
 }
 
 function voiceStartErrorMessage(error: unknown) {
@@ -1172,8 +1176,8 @@ export function App() {
     if (!AudioContextClass) return;
     const context = new AudioContextClass();
     const inputAnalyser = context.createAnalyser();
-    inputAnalyser.fftSize = 256;
-    inputAnalyser.smoothingTimeConstant = 0.72;
+    inputAnalyser.fftSize = 512;
+    inputAnalyser.smoothingTimeConstant = 0.35;
     const inputSource = context.createMediaStreamSource(inputStream);
     inputSource.connect(inputAnalyser);
 
@@ -1189,11 +1193,8 @@ export function App() {
     const tick = () => {
       const current = voiceMeterRef.current;
       if (!current) return;
-      const level = Math.max(
-        readAnalyserLevel(current.inputAnalyser, current.inputData),
-        readAnalyserLevel(current.outputAnalyser, current.outputData)
-      );
-      setVoiceLevel((previous) => previous * 0.68 + level * 0.32);
+      const level = readAnalyserLevel(current.inputAnalyser, current.inputData);
+      setVoiceLevel((previous) => previous * 0.82 + level * 0.18);
       current.frameId = requestAnimationFrame(tick);
     };
     meter.frameId = requestAnimationFrame(tick);
@@ -2484,9 +2485,10 @@ function VoiceLevelBars({ state, level }: { state: VoiceState; level: number }) 
   return (
     <div className={`voice-level-bars ${connecting ? "connecting" : ""} ${live ? "live" : ""}`} aria-hidden="true">
       {multipliers.map((multiplier, index) => {
-        const activeLevel = live || connecting ? level : 0;
-        const height = 5 + Math.min(1, activeLevel * (0.5 + multiplier)) * 33;
-        return <span key={index} style={{ height: `${height}px` }} />;
+        const activeLevel = live ? level : 0;
+        const shape = 0.42 + multiplier * 0.72;
+        const height = 4 + Math.min(1, activeLevel * shape) * 30;
+        return <span key={index} style={{ height: `${height}px`, opacity: live ? 0.46 + Math.min(1, activeLevel + 0.15) * 0.54 : 0.3 }} />;
       })}
     </div>
   );
