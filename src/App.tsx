@@ -87,7 +87,7 @@ function readAnalyserLevel(analyser?: AnalyserNode, data?: Uint8Array<ArrayBuffe
 function voiceStartErrorMessage(error: unknown) {
   const message = error instanceof Error ? error.message : String(error || "");
   const name = error instanceof DOMException ? error.name : "";
-  if (name === "NotAllowedError" || name === "SecurityError" || /permission denied|notallowed|denied/i.test(message)) {
+  if (isVoicePermissionError(error)) {
     return "麦克风权限被拒绝。请在浏览器地址栏或站点设置中允许 localhost 使用麦克风，并确认系统设置允许当前浏览器使用麦克风，然后刷新页面再试。";
   }
   if (name === "NotFoundError" || /requested device not found|no.*microphone|not found/i.test(message)) {
@@ -97,6 +97,12 @@ function voiceStartErrorMessage(error: unknown) {
     return "麦克风暂时不可用，可能被其他应用占用。请关闭占用麦克风的应用后再试。";
   }
   return message || "无法启动语音。";
+}
+
+function isVoicePermissionError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error || "");
+  const name = error instanceof DOMException ? error.name : "";
+  return name === "NotAllowedError" || name === "SecurityError" || /permission denied|notallowed|denied/i.test(message);
 }
 
 function loadStoredJson<T>(key: string, fallback: T): T {
@@ -159,6 +165,8 @@ export function App() {
   const [webEnabled, setWebEnabled] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsPopoverStyle, setSettingsPopoverStyle] = useState<CSSProperties>({});
+  const [micPermissionOpen, setMicPermissionOpen] = useState(false);
+  const [micPermissionDenied, setMicPermissionDenied] = useState(false);
   const [leftWidth, setLeftWidth] = useState(63);
   const [topHeight, setTopHeight] = useState(75);
   const [fullscreenPanel, setFullscreenPanel] = useState<PanelId | null>(null);
@@ -561,10 +569,15 @@ export function App() {
     if (tool === "draft") {
       const text = draftText.trim() || "# 临时文档\n\n";
       await createGeneratedFile(`临时文档-${shortTime(new Date().toISOString()).replace(":", "-")}.md`, text);
+      setDraftText("");
+      setStatusText("临时文档已保存，已新建空白页");
       return;
     }
     if (tool === "whiteboard") {
       await createGeneratedFile(`白板记录-${shortTime(new Date().toISOString()).replace(":", "-")}.md`, boardToMarkdown());
+      setBoardItems([]);
+      setDrawPoints([]);
+      setStatusText("白板已保存，已新建空白页");
     }
   };
 
@@ -951,6 +964,8 @@ export function App() {
         stream.getTracks().forEach((track) => track.stop());
         return;
       }
+      setMicPermissionOpen(false);
+      setMicPermissionDenied(false);
       streamRef.current = stream;
       startVoiceMeter(stream);
       const peer = new RTCPeerConnection();
@@ -1020,6 +1035,32 @@ export function App() {
       setVoiceState("error");
       setStatusText("Error");
       setError(voiceStartErrorMessage(err));
+      if (isVoicePermissionError(err)) {
+        setMicPermissionDenied(true);
+        setMicPermissionOpen(true);
+      }
+    }
+  };
+
+  const requestVoiceStart = async () => {
+    setError("");
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setMicPermissionOpen(true);
+      setStatusText("需要麦克风权限");
+      return;
+    }
+    try {
+      const permission = await navigator.permissions?.query?.({ name: "microphone" as never });
+      if (permission?.state === "granted") {
+        await startVoice();
+        return;
+      }
+      setMicPermissionDenied(permission?.state === "denied");
+      setStatusText(permission?.state === "denied" ? "麦克风权限被拒绝" : "等待麦克风授权");
+      setMicPermissionOpen(true);
+    } catch {
+      setStatusText("等待麦克风授权");
+      setMicPermissionOpen(true);
     }
   };
 
@@ -1169,7 +1210,7 @@ export function App() {
           </button>
         </form>
         <div className="voice-dock">
-          <VoiceButton state={voiceState} onStart={startVoice} onStop={stopVoice} />
+          <VoiceButton state={voiceState} onStart={requestVoiceStart} onStop={stopVoice} />
         </div>
         <VoiceLevelBars state={voiceState} level={voiceLevel} />
       </div>
@@ -1486,6 +1527,15 @@ export function App() {
           setWebEnabled={setWebEnabled}
           onSettingsSaved={(settings) => setState((current) => ({ ...current, settings }))}
           style={settingsPopoverStyle}
+        />
+      )}
+      {micPermissionOpen && (
+        <MicrophonePermissionWindow
+          denied={micPermissionDenied}
+          onRequest={() => {
+            startVoice().catch((err) => setError(err instanceof Error ? err.message : "无法启动语音。"));
+          }}
+          onClose={() => setMicPermissionOpen(false)}
         />
       )}
       {activeTool && (
@@ -1951,6 +2001,45 @@ function VoiceLevelBars({ state, level }: { state: VoiceState; level: number }) 
         return <span key={index} style={{ height: `${height}px` }} />;
       })}
     </div>
+  );
+}
+
+function MicrophonePermissionWindow({
+  denied,
+  onRequest,
+  onClose
+}: {
+  denied: boolean;
+  onRequest: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <aside className="permission-window" role="dialog" aria-modal="true" aria-labelledby="mic-permission-title">
+      <header className="permission-head">
+        <div>
+          <Mic size={20} />
+          <strong id="mic-permission-title">开启麦克风权限</strong>
+        </div>
+        <button className="icon-button" title="关闭" onClick={onClose}><X size={17} /></button>
+      </header>
+      <p>
+        {denied
+          ? "当前浏览器已经拒绝了麦克风权限，所以再次点击按钮可能不会弹出系统授权窗口。"
+          : "语音讨论需要访问麦克风。点击下方按钮后，浏览器会弹出系统授权窗口，请选择允许。"}
+      </p>
+      <p>
+        如果之前拒绝过，需要在浏览器地址栏的站点设置中把麦克风改为允许；如果听不到声音，也请确认站点声音没有被静音。
+      </p>
+      {denied && (
+        <p className="permission-warning">
+          操作路径：地址栏左侧图标 → 网站设置 → 麦克风 → 允许，然后刷新页面。
+        </p>
+      )}
+      <div className="permission-actions">
+        <button className="secondary-button" onClick={onClose}>稍后</button>
+        <button className="primary-button" onClick={onRequest}>{denied ? "重新检测权限" : "请求麦克风权限"}</button>
+      </div>
+    </aside>
   );
 }
 

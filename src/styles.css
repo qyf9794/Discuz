@@ -54,6 +54,7 @@ button {
 
 .panel,
 .settings-popover,
+.permission-window,
 .file-preview-window,
 .record-preview-window,
 .generated-editor-window,
@@ -1182,6 +1183,76 @@ button {
   max-width: calc(100vw - 24px);
   padding: 14px;
   border-radius: 20px;
+}
+
+.permission-window {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  z-index: 11;
+  display: grid;
+  width: min(440px, calc(100vw - 40px));
+  gap: 13px;
+  padding: 18px;
+  border-radius: 22px;
+  transform: translate(-50%, -50%);
+}
+
+.permission-head,
+.permission-head > div,
+.permission-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.permission-head {
+  justify-content: space-between;
+}
+
+.permission-head > div {
+  color: rgba(23, 33, 43, 0.92);
+}
+
+.permission-head strong {
+  font-size: 15px;
+}
+
+.permission-window p {
+  margin: 0;
+  color: rgba(45, 61, 76, 0.82);
+  font-size: 13px;
+  line-height: 1.58;
+}
+
+.permission-window .permission-warning {
+  color: #9b341f;
+  font-weight: 720;
+}
+
+.permission-actions {
+  justify-content: flex-end;
+  margin-top: 2px;
+}
+
+.primary-button,
+.secondary-button {
+  min-height: 36px;
+  padding: 0 13px;
+  border: 0;
+  border-radius: 11px;
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.primary-button {
+  background: rgba(8, 125, 140, 0.18);
+  color: #087d8c;
+}
+
+.secondary-button {
+  background: rgba(255, 255, 255, 0.42);
+  color: rgba(56, 70, 82, 0.82);
 }
 
 .settings-head,
