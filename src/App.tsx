@@ -23,13 +23,14 @@ import {
 } from "lucide-react";
 import { ChangeEvent, DragEvent, forwardRef, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, Dispatch, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, ReactNode, RefObject, SetStateAction } from "react";
-import type { AppState, DiscussionDirection, DiscussionRecord, DiscussionTopic, DiscuzFile, Note } from "./types";
+import type { AppState, DiscussionDirection, DiscussionRecord, DiscussionTopic, DiscuzFile, MeetingMessage, Note } from "./types";
 
 const emptyState: AppState = {
   files: [],
   notes: [],
   records: [],
   discussionInputs: [],
+  meetingMessages: [],
   directions: [],
   discussionTopic: "",
   activeTopicId: "",
@@ -168,6 +169,7 @@ function toolCallLabel(name = "任务") {
     add_file_to_topic: "加入主题区",
     move_file_to_area: "移动文件",
     update_generated_file: "更新临时文案",
+    generate_image: "生成图片",
     propose_discussion_directions: "建议讨论方向",
     update_discussion_directions: "更新讨论方向",
     complete_discussion_direction: "完成讨论方向",
@@ -184,6 +186,7 @@ export function App() {
   const [contextHits, setContextHits] = useState<Array<{ file: DiscuzFile; snippet: string }>>([]);
   const [webHits, setWebHits] = useState<SearchResult[]>([]);
   const [webEnabled, setWebEnabled] = useState(true);
+  const [meetingRecordEnabled, setMeetingRecordEnabled] = useState(() => localStorage.getItem("discuz-meeting-record-enabled") !== "false");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [directionProposal, setDirectionProposal] = useState<DirectionProposal | null>(null);
   const [settingsPopoverStyle, setSettingsPopoverStyle] = useState<CSSProperties>({});
@@ -241,6 +244,7 @@ export function App() {
   const lastStatusLogRef = useRef("Ready");
   const lastErrorLogRef = useRef("");
   const assistantTranscriptRef = useRef("");
+  const userTranscriptRef = useRef("");
   const boardRef = useRef<HTMLDivElement | null>(null);
   const recordStreamRef = useRef<HTMLDivElement | null>(null);
 
@@ -264,6 +268,7 @@ export function App() {
     [state.files, generatedEditorId]
   );
   const currentNotes = useMemo(() => [...state.notes].reverse(), [state.notes]);
+  const meetingMessages = useMemo(() => [...(state.meetingMessages ?? [])].reverse(), [state.meetingMessages]);
   const compactViewport = layoutScale < 0.95;
   const effectiveTopHeight = compactViewport ? Math.min(topHeight, 62) : topHeight;
 
@@ -300,6 +305,10 @@ export function App() {
   useEffect(() => {
     localStorage.setItem("discuz-audio-input-id", selectedAudioInputId);
   }, [selectedAudioInputId]);
+
+  useEffect(() => {
+    localStorage.setItem("discuz-meeting-record-enabled", String(meetingRecordEnabled));
+  }, [meetingRecordEnabled]);
 
   useEffect(() => {
     localStorage.setItem("discuz-board-items", JSON.stringify(boardItems));
@@ -350,7 +359,7 @@ export function App() {
     if (recordStreamRef.current) {
       recordStreamRef.current.scrollTop = recordStreamRef.current.scrollHeight;
     }
-  }, [state.notes.length]);
+  }, [state.meetingMessages.length]);
 
   const refreshAudioInputDevices = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) {
@@ -526,6 +535,25 @@ export function App() {
     }
   };
 
+  const saveMeetingMessage = async (text: string, role: MeetingMessage["role"]) => {
+    const trimmed = text.trim();
+    if (!meetingRecordEnabled) return;
+    if (!trimmed) return;
+    const response = await fetch("/api/meeting-messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ role, text: trimmed })
+    });
+    if (response.ok) {
+      const payload = await response.json();
+      setState((current) => ({
+        ...current,
+        meetingMessages: payload.meetingMessages ?? current.meetingMessages,
+        activities: payload.activities ?? current.activities
+      }));
+    }
+  };
+
   const createGeneratedFile = async (title: string, text: string) => {
     const finishTask = beginTask("生成临时文案");
     try {
@@ -542,6 +570,36 @@ export function App() {
         activities: payload.activities ?? current.activities
       }));
       return payload.file as DiscuzFile;
+    } finally {
+      finishTask();
+    }
+  };
+
+  const generateImageFile = async (title: string, prompt: string, size = "1024x1024", quality = "medium") => {
+    const finishTask = beginTask("生成图片");
+    try {
+      const response = await fetch("/api/files/generated/image", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title, prompt, size, quality })
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = await response.json();
+      const file = payload.file as DiscuzFile;
+      setState((current) => ({
+        ...current,
+        files: payload.files ?? current.files,
+        activities: payload.activities ?? current.activities,
+        topics: payload.topics ?? current.topics
+      }));
+      if (file?.id) {
+        setSelectedId(file.id);
+        setPreviewFileId(file.id);
+        setGeneratedEditorId(null);
+        setPreviewRecordId(null);
+        setActiveTool(null);
+      }
+      return file;
     } finally {
       finishTask();
     }
@@ -705,13 +763,6 @@ export function App() {
     if (tool === "whiteboard") notifyForegroundDiscussion("无限白板", boardToMarkdown());
   };
 
-  const openRecordWindow = (recordId: string) => {
-    setActiveTool(null);
-    setPreviewFileId(null);
-    setGeneratedEditorId(null);
-    setPreviewRecordId(recordId);
-  };
-
   const boardToMarkdown = () => {
     const textItems = boardItems
       .filter((item) => item.kind === "text" && item.value.trim())
@@ -775,6 +826,7 @@ export function App() {
         discussionInputs: payload.discussionInputs ?? current.discussionInputs,
         activities: payload.activities ?? current.activities
       }));
+      saveMeetingMessage(text, "user").catch((err) => setError(err instanceof Error ? err.message : "Unable to save meeting record"));
 
       const channel = dataChannelRef.current;
       if (channel?.readyState === "open") {
@@ -1006,6 +1058,18 @@ export function App() {
           output = { ok: true, generated: file.originalName };
         } else {
           output = { ok: false, error: "Missing generated file text." };
+        }
+      }
+      if (message.name === "generate_image") {
+        const title = String(args.title || "AI生成图片.png").trim();
+        const prompt = String(args.prompt || "").trim();
+        const size = ["1024x1024", "1024x1536", "1536x1024"].includes(args.size) ? args.size : "1024x1024";
+        const quality = ["low", "medium", "high", "auto"].includes(args.quality) ? args.quality : "medium";
+        if (prompt) {
+          const file = await generateImageFile(title, prompt, size, quality);
+          output = { ok: true, generated: file.originalName, opened: file.originalName };
+        } else {
+          output = { ok: false, error: "Missing image prompt." };
         }
       }
       if (message.name === "copy_file_to_generated") {
@@ -1263,6 +1327,8 @@ export function App() {
     const sessionId = voiceSessionRef.current + 1;
     voiceSessionRef.current = sessionId;
     voiceSessionStartedAtRef.current = null;
+    assistantTranscriptRef.current = "";
+    userTranscriptRef.current = "";
     setVoiceState("connecting");
     setStatusText("Connecting");
     try {
@@ -1339,7 +1405,18 @@ export function App() {
             setTranscript(assistantTranscriptRef.current.slice(-220));
           }
           if (message.type === "response.output_audio_transcript.done") {
+            const text = String(message.transcript || assistantTranscriptRef.current || "").trim();
+            if (text) saveMeetingMessage(text, "assistant").catch((err) => setError(err instanceof Error ? err.message : "Unable to save meeting record"));
             assistantTranscriptRef.current = "";
+          }
+          if (message.type === "conversation.item.input_audio_transcription.delta") {
+            userTranscriptRef.current += message.delta;
+            setTranscript(userTranscriptRef.current.slice(-220));
+          }
+          if (message.type === "conversation.item.input_audio_transcription.completed") {
+            const text = String(message.transcript || userTranscriptRef.current || "").trim();
+            if (text) saveMeetingMessage(text, "user").catch((err) => setError(err instanceof Error ? err.message : "Unable to save meeting record"));
+            userTranscriptRef.current = "";
           }
           if (message.type === "response.function_call_arguments.done") {
             handleToolCallRef.current?.(message).catch((err) => setError(err.message));
@@ -1876,43 +1953,54 @@ export function App() {
           <div className="record-list">
             <section className="record-current">
               <header>
-                <strong>生成记录</strong>
-                <span>{currentNotes.length} 段</span>
+                <div className="record-title-block">
+                  <strong>会议记录</strong>
+                  <span>{meetingRecordEnabled ? `${meetingMessages.length} 段` : "已关闭"}</span>
+                </div>
+                <button
+                  className={meetingRecordEnabled ? "toggle record-toggle enabled" : "toggle record-toggle"}
+                  title={meetingRecordEnabled ? "关闭会议记录" : "打开会议记录"}
+                  aria-label={meetingRecordEnabled ? "关闭会议记录" : "打开会议记录"}
+                  aria-pressed={meetingRecordEnabled}
+                  onClick={() => setMeetingRecordEnabled((value) => !value)}
+                >
+                  <span />
+                </button>
               </header>
               <div className="record-stream" ref={recordStreamRef}>
-                {currentNotes.length ? (
-                  currentNotes.map((note) => (
-                    <article key={note.id} className="note-line">
-                      <span>{noteLabel(note.kind)} · {shortTime(note.createdAt)}</span>
-                      <p>{note.text}</p>
+                {meetingMessages.length ? (
+                  meetingMessages.map((message) => (
+                    <article key={message.id} className={`note-line ${message.role}`}>
+                      <span>{message.role === "assistant" ? "AI" : "用户"} · {shortTime(message.createdAt)}</span>
+                      <p>{message.text}</p>
                     </article>
                   ))
                 ) : (
                   <div className="empty-record">
                     <CheckCircle2 size={22} />
-                    <span>讨论要点会按段落生成</span>
+                    <span>对话内容会在这里记录</span>
                   </div>
                 )}
               </div>
             </section>
             <section className="record-history">
               <header>
-                <strong>历史记录</strong>
-                <span>{state.records.length} 张</span>
+                <strong>要点</strong>
+                <span>{currentNotes.length} 段</span>
               </header>
               <div className="history-card-list">
-                {state.records.length ? (
-                  state.records.map((record) => (
-                    <button key={record.id} className="history-card" onDoubleClick={() => openRecordWindow(record.id)}>
-                      <span>{record.noteCount} 段 · {shortTime(record.createdAt)}</span>
-                      <strong>{record.title}</strong>
-                      <p>{record.content}</p>
-                    </button>
+                {currentNotes.length ? (
+                  currentNotes.map((note) => (
+                    <article key={note.id} className="history-card">
+                      <span>{noteLabel(note.kind)} · {shortTime(note.createdAt)}</span>
+                      <strong>{note.source || "AI summary"}</strong>
+                      <p>{note.text}</p>
+                    </article>
                   ))
                 ) : (
                   <div className="empty-record">
                     <FileText size={22} />
-                    <span>关闭麦克风后生成记录卡片</span>
+                    <span>讨论要点会自动总结</span>
                   </div>
                 )}
               </div>

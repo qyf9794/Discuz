@@ -59,6 +59,13 @@ export type DiscussionInput = {
   createdAt: string;
 };
 
+export type MeetingMessage = {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  createdAt: string;
+};
+
 export type DiscussionDirection = {
   id: string;
   text: string;
@@ -73,6 +80,7 @@ export type AppState = {
   notes: Note[];
   records: DiscussionRecord[];
   discussionInputs: DiscussionInput[];
+  meetingMessages: MeetingMessage[];
   directions: DiscussionDirection[];
   discussionTopic: string;
   activeTopicId: string;

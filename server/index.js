@@ -72,6 +72,14 @@ db.exec(`
     created_at TEXT NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS meeting_messages (
+    id TEXT PRIMARY KEY,
+    topic_id TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL,
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS discussion_directions (
     id TEXT PRIMARY KEY,
     topic_id TEXT NOT NULL DEFAULT '',
@@ -123,6 +131,7 @@ if (!fileColumns.includes("sort_order")) {
 addColumnIfMissing("notes", "topic_id", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("discussion_records", "topic_id", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("discussion_inputs", "topic_id", "TEXT NOT NULL DEFAULT ''");
+addColumnIfMissing("meeting_messages", "topic_id", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("discussion_directions", "topic_id", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("activities", "topic_id", "TEXT NOT NULL DEFAULT ''");
 
@@ -151,6 +160,7 @@ function ensureActiveTopic() {
   db.prepare("UPDATE notes SET topic_id = ? WHERE topic_id = ''").run(activeTopic.id);
   db.prepare("UPDATE discussion_records SET topic_id = ? WHERE topic_id = ''").run(activeTopic.id);
   db.prepare("UPDATE discussion_inputs SET topic_id = ? WHERE topic_id = ''").run(activeTopic.id);
+  db.prepare("UPDATE meeting_messages SET topic_id = ? WHERE topic_id = ''").run(activeTopic.id);
   db.prepare("UPDATE discussion_directions SET topic_id = ? WHERE topic_id = ''").run(activeTopic.id);
   db.prepare("UPDATE activities SET topic_id = ? WHERE topic_id = ''").run(activeTopic.id);
   migrateLegacyFilesToTopic(activeTopic.id);
@@ -358,6 +368,7 @@ function topicSnapshot(topicId = getActiveTopicId()) {
     notes: db.prepare("SELECT * FROM notes WHERE topic_id = ? ORDER BY created_at DESC").all(topicId),
     records: db.prepare("SELECT * FROM discussion_records WHERE topic_id = ? ORDER BY created_at DESC").all(topicId),
     discussionInputs: db.prepare("SELECT * FROM discussion_inputs WHERE topic_id = ? ORDER BY created_at DESC").all(topicId),
+    meetingMessages: db.prepare("SELECT * FROM meeting_messages WHERE topic_id = ? ORDER BY created_at DESC").all(topicId),
     directions: getDirections(topicId),
     activities: db.prepare("SELECT * FROM activities WHERE topic_id = ? ORDER BY created_at DESC").all(topicId)
   };
@@ -615,6 +626,92 @@ function persistGeneratedFile(title, text) {
   return rowToFile(db.prepare("SELECT * FROM files WHERE id = ?").get(id));
 }
 
+function generatedImageTitle(value) {
+  const fallback = `AI生成图片-${shortLocalTime(now()).replace(/[/: ]/g, "-")}.png`;
+  const originalName = normalizeUploadedFilename(value || fallback);
+  const parsed = path.parse(originalName);
+  const baseName = cleanText(parsed.name).slice(0, 80) || path.parse(fallback).name;
+  return `${baseName}.png`;
+}
+
+async function persistGeneratedImage({ title, prompt, size = "1024x1024", quality = "medium" }) {
+  const openAiApiKey = getOpenAiApiKey();
+  if (!openAiApiKey) {
+    throw new Error("OPENAI_API_KEY is not configured");
+  }
+  const cleanedPrompt = cleanText(prompt);
+  if (!cleanedPrompt) {
+    throw new Error("Missing image prompt");
+  }
+  const safeSize = ["1024x1024", "1024x1536", "1536x1024"].includes(size) ? size : "1024x1024";
+  const safeQuality = ["low", "medium", "high", "auto"].includes(quality) ? quality : "medium";
+
+  const response = await fetch("https://api.openai.com/v1/images/generations", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${openAiApiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "gpt-image-1",
+      prompt: cleanedPrompt,
+      n: 1,
+      size: safeSize,
+      quality: safeQuality
+    })
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload?.error?.message || `OpenAI image generation failed: ${response.status}`);
+  }
+  const imageBase64 = payload?.data?.[0]?.b64_json;
+  if (!imageBase64) {
+    throw new Error("OpenAI image generation returned no image data");
+  }
+
+  const id = crypto.randomUUID();
+  const originalName = generatedImageTitle(title);
+  const storedName = `${id}.png`;
+  const buffer = Buffer.from(imageBase64, "base64");
+  const filePath = path.join(currentTopicUploadDir(), storedName);
+  fs.writeFileSync(filePath, buffer);
+  const createdAt = now();
+  const extractedText = [
+    `AI生成图片：${originalName}`,
+    `提示词：${cleanedPrompt}`,
+    `尺寸：${safeSize}`,
+    `质量：${safeQuality}`
+  ].join("\n");
+  const summary = summarizeText(extractedText, originalName);
+  const sortOrder = nextFileSortOrder("generated");
+
+  db.prepare(`
+    INSERT INTO files (
+      id, topic_id, role, original_name, stored_name, mime_type, size, kind,
+      extracted_text, rendered_html, summary, sort_order, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    getActiveTopicId(),
+    "generated",
+    originalName,
+    storedName,
+    "image/png",
+    buffer.byteLength,
+    "image",
+    extractedText,
+    "",
+    summary,
+    sortOrder,
+    createdAt,
+    createdAt
+  );
+
+  addActivity("AI image", originalName, createdAt);
+
+  return rowToFile(db.prepare("SELECT * FROM files WHERE id = ?").get(id));
+}
+
 function copyFileTextForEditing(row) {
   const file = rowToFile(row);
   if (cleanText(file.extractedText)) return file.extractedText;
@@ -766,6 +863,15 @@ function getDiscussionInputs(limit = 24) {
     id: row.id,
     text: row.text,
     source: row.source,
+    createdAt: row.created_at
+  }));
+}
+
+function getMeetingMessages(limit = 120) {
+  return db.prepare("SELECT * FROM meeting_messages WHERE topic_id = ? ORDER BY created_at DESC LIMIT ?").all(getActiveTopicId(), limit).map((row) => ({
+    id: row.id,
+    role: row.role,
+    text: row.text,
     createdAt: row.created_at
   }));
 }
@@ -935,6 +1041,7 @@ function buildDiscussionContext() {
     "AI 临时生成文案区的文件可以编辑、修改、迭代。所有文件都可以通过打开前台预览窗口临时成为当前讨论对象，但这不会改变它们所属区域或最终成果状态。",
     "用户可以用语音要求你操控界面：打开/关闭前台文件窗口、打开无限白板或临时文档、保存或清空白板/临时文档、复制文件到临时区、把文件移动到主题区/资源区/临时区。遇到这些请求时应调用对应工具完成，不只用语言说明。",
     "当你需要生成文案、副本、修改稿或阶段性成果草稿时，先调用 create_generated_file，把它放入资源窗口下半区的 AI 临时生成文案。用户可以先打开编辑并“保存编辑”，这只表示编辑确认；只有用户进一步“确认为成果”后，它才会进入讨论主题窗口，作为最终成果继续讨论。",
+    "当用户要求生成、绘制、设计图片、地图、海报、示意图或视觉素材时，调用 generate_image。图片会保存到 AI 临时生成区；生成完成后用一句话提示用户可以预览或确认为成果。",
     "如果用户要求把某个资源文件、AI 临时文案或修改稿作为成果继续讨论，你可以调用 add_file_to_topic，把它加入讨论主题窗口。加入后它就是主讨论文件，应作为后续重点讨论对象。",
     "不要泛泛而谈，不要把话题扩展到无关方向。每次回复优先给出中肯、可执行、能推进讨论的意见。",
     "如果信息不足，先指出缺口，再建议用户补充哪类材料。需要资料时，优先调用本地背景材料检索；本地资料不足时，再调用联网搜索。",
@@ -997,6 +1104,7 @@ function statePayload(extra = {}) {
     notes: getNotes(),
     records: getRecords(),
     discussionInputs: getDiscussionInputs(),
+    meetingMessages: getMeetingMessages(),
     directions: getDirections(),
     discussionTopic: getDiscussionTopic(),
     activities: getActivities(),
@@ -1044,6 +1152,7 @@ app.delete("/api/topics/:id", (req, res) => {
   db.prepare("DELETE FROM notes WHERE topic_id = ?").run(topic.id);
   db.prepare("DELETE FROM discussion_records WHERE topic_id = ?").run(topic.id);
   db.prepare("DELETE FROM discussion_inputs WHERE topic_id = ?").run(topic.id);
+  db.prepare("DELETE FROM meeting_messages WHERE topic_id = ?").run(topic.id);
   db.prepare("DELETE FROM discussion_directions WHERE topic_id = ?").run(topic.id);
   db.prepare("DELETE FROM activities WHERE topic_id = ?").run(topic.id);
   db.prepare("DELETE FROM topics WHERE id = ?").run(topic.id);
@@ -1139,6 +1248,7 @@ app.post("/api/discussion/reset", (_req, res) => {
   db.prepare("DELETE FROM files WHERE topic_id = ?").run(topicId);
   db.prepare("DELETE FROM notes WHERE topic_id = ?").run(topicId);
   db.prepare("DELETE FROM discussion_inputs WHERE topic_id = ?").run(topicId);
+  db.prepare("DELETE FROM meeting_messages WHERE topic_id = ?").run(topicId);
   db.prepare("DELETE FROM discussion_directions WHERE topic_id = ?").run(topicId);
   db.prepare("DELETE FROM activities WHERE topic_id = ?").run(topicId);
   db.prepare("UPDATE topics SET title = ?, updated_at = ? WHERE id = ?").run(`新讨论 ${shortLocalTime(now())}`, now(), topicId);
@@ -1148,6 +1258,7 @@ app.post("/api/discussion/reset", (_req, res) => {
     notes: getNotes(),
     records: getRecords(),
     discussionInputs: getDiscussionInputs(),
+    meetingMessages: getMeetingMessages(),
     directions: getDirections(),
     discussionTopic: getDiscussionTopic(),
     activities: getActivities(),
@@ -1213,6 +1324,21 @@ app.post("/api/files/generated", (req, res) => {
   const file = persistGeneratedFile(title, text);
   writeTopicSnapshot();
   res.json({ file, files: getFiles(), activities: getActivities(), topics: getTopics() });
+});
+
+app.post("/api/files/generated/image", async (req, res) => {
+  try {
+    const file = await persistGeneratedImage({
+      title: cleanText(req.body?.title || ""),
+      prompt: cleanText(req.body?.prompt || ""),
+      size: cleanText(req.body?.size || "1024x1024"),
+      quality: cleanText(req.body?.quality || "medium")
+    });
+    writeTopicSnapshot();
+    res.json({ file, files: getFiles(), activities: getActivities(), topics: getTopics() });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
 });
 
 app.post("/api/files/generated/upload", upload.array("files", 20), async (req, res) => {
@@ -1369,6 +1495,17 @@ app.post("/api/notes", (req, res) => {
     .run(crypto.randomUUID(), getActiveTopicId(), kind, cleanText(text), cleanText(source), createdAt);
   writeTopicSnapshot();
   res.json({ notes: getNotes() });
+});
+
+app.post("/api/meeting-messages", (req, res) => {
+  const role = req.body?.role === "assistant" ? "assistant" : "user";
+  const text = cleanText(req.body?.text || "");
+  if (!text) return res.status(400).json({ error: "Missing meeting message text" });
+  const createdAt = now();
+  db.prepare("INSERT INTO meeting_messages (id, topic_id, role, text, created_at) VALUES (?, ?, ?, ?, ?)")
+    .run(crypto.randomUUID(), getActiveTopicId(), role, text, createdAt);
+  writeTopicSnapshot();
+  res.json({ meetingMessages: getMeetingMessages(), activities: getActivities() });
 });
 
 app.post("/api/records/finish", (req, res) => {
@@ -1569,6 +1706,36 @@ app.post("/api/realtime/session", async (req, res) => {
       },
       {
         type: "function",
+        name: "generate_image",
+        description: "Generate a PNG image from a prompt and save it into the AI temporary generated files section. Use when the user asks to draw, create, design, or generate an image, map, poster, diagram, visual, or illustration.",
+        parameters: {
+          type: "object",
+          properties: {
+            title: {
+              type: "string",
+              description: "A concise Chinese filename for the generated image. A .png extension will be appended or normalized."
+            },
+            prompt: {
+              type: "string",
+              description: "A detailed visual prompt describing the desired image, including subject, style, layout, text labels, colors, and aspect ratio."
+            },
+            size: {
+              type: "string",
+              enum: ["1024x1024", "1024x1536", "1536x1024"],
+              description: "Image size. Use 1024x1024 for square, 1024x1536 for portrait, 1536x1024 for landscape."
+            },
+            quality: {
+              type: "string",
+              enum: ["low", "medium", "high", "auto"],
+              description: "Generation quality. Use medium by default; high only when the user asks for higher quality."
+            }
+          },
+          required: ["title", "prompt", "size", "quality"],
+          additionalProperties: false
+        }
+      },
+      {
+        type: "function",
         name: "copy_file_to_generated",
         description: "Copy a topic or resource file into the AI temporary generated section so it can be edited without changing the original file.",
         parameters: {
@@ -1729,6 +1896,10 @@ app.post("/api/realtime/session", async (req, res) => {
     tool_choice: "auto",
     audio: {
       input: {
+        transcription: {
+          model: "gpt-4o-transcribe",
+          language: "zh"
+        },
         turn_detection: {
           type: "semantic_vad",
           eagerness: "low",

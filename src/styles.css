@@ -5,6 +5,10 @@
   font-synthesis: none;
   text-rendering: geometricPrecision;
   -webkit-font-smoothing: antialiased;
+  --bottom-discussion-height: 150px;
+  --bottom-discussion-offset: 10px;
+  --bottom-discussion-clearance: 18px;
+  --bottom-discussion-safe-area: calc(var(--bottom-discussion-height) + var(--bottom-discussion-offset) + var(--bottom-discussion-clearance));
 }
 
 * {
@@ -304,9 +308,9 @@ button {
   position: fixed;
   left: 0;
   right: 0;
-  bottom: 10px;
+  bottom: var(--bottom-discussion-offset);
   z-index: 2147483000;
-  height: 150px;
+  height: var(--bottom-discussion-height);
   pointer-events: none;
 }
 
@@ -500,6 +504,10 @@ button {
   gap: 16px;
   overflow: auto;
   padding: 16px;
+}
+
+.fullscreen-panel .topic-file-list {
+  padding-bottom: var(--bottom-discussion-safe-area);
 }
 
 .topic-file-card {
@@ -1039,6 +1047,10 @@ button {
   overflow: hidden;
 }
 
+.fullscreen-panel .search-card {
+  margin-bottom: calc(var(--bottom-discussion-safe-area) - 20px);
+}
+
 .search-line {
   display: grid;
   order: 2;
@@ -1143,6 +1155,10 @@ button {
   overflow: hidden;
 }
 
+.fullscreen-panel .record-list {
+  padding-bottom: calc(var(--bottom-discussion-safe-area) - 20px);
+}
+
 .record-current,
 .record-history {
   display: flex;
@@ -1163,6 +1179,12 @@ button {
   color: rgba(27, 39, 51, 0.88);
 }
 
+.record-title-block {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
 .record-current header strong,
 .record-history header strong {
   font-size: 12px;
@@ -1173,6 +1195,12 @@ button {
 .record-history header span {
   color: rgba(83, 99, 112, 0.76);
   font-size: 11px;
+}
+
+.record-toggle {
+  flex: 0 0 auto;
+  transform: scale(0.82);
+  transform-origin: right center;
 }
 
 .record-stream,
@@ -1572,6 +1600,10 @@ button {
   transform: translateX(18px);
 }
 
+.record-current .record-toggle.enabled {
+  background: #22c55e;
+}
+
 .tool-window,
 .file-preview-window,
 .generated-editor-window {
@@ -1919,6 +1951,11 @@ button {
 }
 
 @media (max-width: 680px) {
+  :root {
+    --bottom-discussion-height: 96px;
+    --bottom-discussion-clearance: 14px;
+  }
+
   .app-shell {
     padding: 12px;
   }
@@ -1932,7 +1969,7 @@ button {
   }
 
   .bottom-discussion-bar {
-    height: 96px;
+    height: var(--bottom-discussion-height);
   }
 
   .discussion-text-form {
