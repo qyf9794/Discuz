@@ -796,7 +796,7 @@ export function App() {
           role: "user",
           content: [{
             type: "input_text",
-            text: `系统事件：用户已确认讨论主题《${title}》。请先提出 3 到 6 个讨论方向，并调用 propose_discussion_directions 等用户确认。不要直接开始展开讨论。`
+            text: `系统事件：用户已确认讨论主题《${title}》。请先阅读当前主题文件和用户输入；如果目标还不清楚，先询问用户想重点讨论什么。不要立刻提出讨论方向。经过几轮实质讨论、理解用户关注点后，再调用 propose_discussion_directions 提出 3 到 6 个方向等用户确认。`
           }]
         }
       }));
