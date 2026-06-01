@@ -59,11 +59,21 @@ export type DiscussionInput = {
   createdAt: string;
 };
 
+export type DiscussionDirection = {
+  id: string;
+  text: string;
+  completed: boolean;
+  sortOrder: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type AppState = {
   files: DiscuzFile[];
   notes: Note[];
   records: DiscussionRecord[];
   discussionInputs: DiscussionInput[];
+  directions: DiscussionDirection[];
   discussionTopic: string;
   activeTopicId: string;
   topics: DiscussionTopic[];

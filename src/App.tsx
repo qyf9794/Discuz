@@ -23,13 +23,14 @@ import {
 } from "lucide-react";
 import { ChangeEvent, DragEvent, forwardRef, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, Dispatch, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, ReactNode, RefObject, SetStateAction } from "react";
-import type { AppState, DiscussionRecord, DiscussionTopic, DiscuzFile, Note } from "./types";
+import type { AppState, DiscussionDirection, DiscussionRecord, DiscussionTopic, DiscuzFile, Note } from "./types";
 
 const emptyState: AppState = {
   files: [],
   notes: [],
   records: [],
   discussionInputs: [],
+  directions: [],
   discussionTopic: "",
   activeTopicId: "",
   topics: [],
@@ -37,12 +38,15 @@ const emptyState: AppState = {
   settings: { openaiApiKeyConfigured: false, openaiApiKeySource: "none", wallpaperUrl: "" }
 };
 type TopicProposal = { title: string; reason: string; intent: "confirm" | "drift" };
+type DirectionProposal = { directions: string[]; reason: string };
 type SettingsState = NonNullable<AppState["settings"]>;
 type VoiceState = "idle" | "connecting" | "live" | "thinking" | "error";
 type SearchResult = { title: string; url: string; snippet: string; source: string };
 type PanelId = "topic" | "resources" | "record";
 type ToolId = "whiteboard" | "draft" | "image" | "video" | "audio";
 type StatusLogEntry = { id: string; kind: "status" | "error"; text: string; createdAt: string };
+type TaskItem = { id: string; label: string; startedAt: string };
+type RealtimeToolCall = { name?: string; arguments?: string; call_id?: string };
 const fileDragType = "application/x-discuz-file-id";
 type AudioContextConstructor = typeof AudioContext;
 type VoiceMeter = {
@@ -133,11 +137,38 @@ async function uploadFiles(endpoint: string, field: string, files: File[]) {
 }
 
 function setCardDragImage(event: DragEvent<HTMLElement>) {
-  const ghost = document.createElement("span");
-  ghost.className = "drag-ghost";
+  const source = event.currentTarget;
+  const rect = source.getBoundingClientRect();
+  const ghost = source.cloneNode(true) as HTMLElement;
+  ghost.classList.add("drag-ghost");
+  ghost.style.width = `${rect.width}px`;
+  ghost.style.height = `${rect.height}px`;
   document.body.appendChild(ghost);
-  event.dataTransfer.setDragImage(ghost, 0, 0);
+  event.dataTransfer.setDragImage(ghost, Math.min(36, rect.width / 2), Math.min(28, rect.height / 2));
   window.setTimeout(() => ghost.remove(), 0);
+}
+
+function toolCallLabel(name = "任务") {
+  return ({
+    search_context: "检索本地材料",
+    web_search: "联网搜索",
+    set_layout: "调整布局",
+    open_discussion_tool: "打开工具窗口",
+    save_discussion_tool: "保存工具内容",
+    clear_discussion_tool: "清空工具内容",
+    close_foreground_window: "关闭窗口",
+    open_file_preview: "打开文件窗口",
+    save_discussion_note: "保存讨论要点",
+    create_generated_file: "生成临时文案",
+    copy_file_to_generated: "复制到临时区",
+    add_file_to_topic: "加入主题区",
+    move_file_to_area: "移动文件",
+    update_generated_file: "更新临时文案",
+    propose_discussion_directions: "建议讨论方向",
+    update_discussion_directions: "更新讨论方向",
+    complete_discussion_direction: "完成讨论方向",
+    propose_discussion_topic: "确认讨论主题"
+  } as Record<string, string>)[name] || name;
 }
 
 export function App() {
@@ -150,6 +181,7 @@ export function App() {
   const [webHits, setWebHits] = useState<SearchResult[]>([]);
   const [webEnabled, setWebEnabled] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [directionProposal, setDirectionProposal] = useState<DirectionProposal | null>(null);
   const [settingsPopoverStyle, setSettingsPopoverStyle] = useState<CSSProperties>({});
   const [micPermissionOpen, setMicPermissionOpen] = useState(false);
   const [micPermissionDenied, setMicPermissionDenied] = useState(false);
@@ -178,6 +210,7 @@ export function App() {
   const [transcript, setTranscript] = useState("");
   const [statusText, setStatusText] = useState("Ready");
   const [error, setError] = useState("");
+  const [pendingTasks, setPendingTasks] = useState<TaskItem[]>([]);
   const [statusLog, setStatusLog] = useState<StatusLogEntry[]>(() => [{
     id: crypto.randomUUID(),
     kind: "status",
@@ -194,8 +227,10 @@ export function App() {
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
+  const handleToolCallRef = useRef<((_message: RealtimeToolCall) => Promise<void>) | null>(null);
   const voiceSessionRef = useRef(0);
   const voiceSessionStartedAtRef = useRef<string | null>(null);
+  const voiceReconnectTimerRef = useRef<number | null>(null);
   const voiceMeterRef = useRef<VoiceMeter | null>(null);
   const lastStatusLogRef = useRef("Ready");
   const lastErrorLogRef = useRef("");
@@ -415,31 +450,60 @@ export function App() {
     }
   };
 
+  const beginTask = useCallback((label: string) => {
+    const id = crypto.randomUUID();
+    const startedAt = new Date().toISOString();
+    setPendingTasks((current) => [...current, { id, label, startedAt }].slice(-6));
+    setStatusText(`${label}中`);
+    let finished = false;
+    return () => {
+      if (finished) return;
+      finished = true;
+      setPendingTasks((current) => current.filter((task) => task.id !== id));
+      setStatusText(`${label}完成`);
+    };
+  }, []);
+
   const setPrimary = async (files: FileList | File[]) => {
     const list = Array.from(files);
     if (!list.length) return;
-    const payload = await uploadFiles("/api/files/primary", "files", list);
-    setState((current) => ({ ...current, files: payload.files, activities: payload.activities }));
-    setSelectedId(payload.uploaded?.[0]?.id ?? payload.file?.id ?? selectedId);
-    setError("");
+    const finishTask = beginTask("上传主题文件");
+    try {
+      const payload = await uploadFiles("/api/files/primary", "files", list);
+      setState((current) => ({ ...current, files: payload.files, activities: payload.activities }));
+      setSelectedId(payload.uploaded?.[0]?.id ?? payload.file?.id ?? selectedId);
+      setError("");
+    } finally {
+      finishTask();
+    }
   };
 
   const addContext = async (files: FileList | File[]) => {
     const list = Array.from(files);
     if (!list.length) return;
-    const payload = await uploadFiles("/api/files/context", "files", list);
-    setState((current) => ({ ...current, files: payload.files, activities: payload.activities }));
-    setError("");
+    const finishTask = beginTask("上传资源文件");
+    try {
+      const payload = await uploadFiles("/api/files/context", "files", list);
+      setState((current) => ({ ...current, files: payload.files, activities: payload.activities }));
+      setError("");
+    } finally {
+      finishTask();
+    }
   };
 
   const addGeneratedFiles = async (files: FileList | File[]) => {
     const list = Array.from(files);
     if (!list.length) return;
-    const payload = await uploadFiles("/api/files/generated/upload", "files", list);
-    setState((current) => ({ ...current, files: payload.files, activities: payload.activities }));
-    setGeneratedEditorId(payload.uploaded?.[0]?.id ?? payload.file?.id ?? null);
-    setSelectedId(payload.uploaded?.[0]?.id ?? payload.file?.id ?? selectedId);
-    setError("");
+    const finishTask = beginTask("上传临时文件");
+    try {
+      const payload = await uploadFiles("/api/files/generated/upload", "files", list);
+      setState((current) => ({ ...current, files: payload.files, activities: payload.activities }));
+      setGeneratedEditorId(payload.uploaded?.[0]?.id ?? payload.file?.id ?? null);
+      setSelectedId(payload.uploaded?.[0]?.id ?? payload.file?.id ?? selectedId);
+      setError("");
+    } finally {
+      finishTask();
+    }
   };
 
   const saveNote = async (text: string, kind: Note["kind"] = "point", source = "AI") => {
@@ -457,88 +521,113 @@ export function App() {
   };
 
   const createGeneratedFile = async (title: string, text: string) => {
-    const response = await fetch("/api/files/generated", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title, text })
-    });
-    if (!response.ok) throw new Error(await response.text());
-    const payload = await response.json();
-    setState((current) => ({
-      ...current,
-      files: payload.files ?? current.files,
-      activities: payload.activities ?? current.activities
-    }));
-    return payload.file as DiscuzFile;
+    const finishTask = beginTask("生成临时文案");
+    try {
+      const response = await fetch("/api/files/generated", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title, text })
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = await response.json();
+      setState((current) => ({
+        ...current,
+        files: payload.files ?? current.files,
+        activities: payload.activities ?? current.activities
+      }));
+      return payload.file as DiscuzFile;
+    } finally {
+      finishTask();
+    }
   };
 
   const updateGeneratedFile = async (file: DiscuzFile, text: string) => {
-    const response = await fetch(`/api/files/${encodeURIComponent(file.id)}/content`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text })
-    });
-    if (!response.ok) throw new Error(await response.text());
-    const payload = await response.json();
-    setState((current) => ({
-      ...current,
-      files: payload.files ?? current.files,
-      activities: payload.activities ?? current.activities
-    }));
+    const finishTask = beginTask("保存文件编辑");
+    try {
+      const response = await fetch(`/api/files/${encodeURIComponent(file.id)}/content`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text })
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = await response.json();
+      setState((current) => ({
+        ...current,
+        files: payload.files ?? current.files,
+        activities: payload.activities ?? current.activities
+      }));
+    } finally {
+      finishTask();
+    }
   };
 
   const promoteFileToPrimary = async (file: DiscuzFile, requireConfirm = false) => {
     if (file.role === "primary") return file;
     if (requireConfirm && !window.confirm(`将“${file.originalName}”确认为成果并存入讨论主题？`)) return null;
-    const response = await fetch(`/api/files/${encodeURIComponent(file.id)}/promote-primary`, { method: "POST" });
-    if (!response.ok) throw new Error(await response.text());
-    const payload = await response.json();
-    setState((current) => ({
-      ...current,
-      files: payload.files ?? current.files,
-      activities: payload.activities ?? current.activities
-    }));
-    setSelectedId(file.id);
-    setGeneratedEditorId(null);
-    setError("");
-    return payload.file as DiscuzFile;
+    const finishTask = beginTask("加入主题区");
+    try {
+      const response = await fetch(`/api/files/${encodeURIComponent(file.id)}/promote-primary`, { method: "POST" });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = await response.json();
+      setState((current) => ({
+        ...current,
+        files: payload.files ?? current.files,
+        activities: payload.activities ?? current.activities
+      }));
+      setSelectedId(file.id);
+      setGeneratedEditorId(null);
+      setError("");
+      return payload.file as DiscuzFile;
+    } finally {
+      finishTask();
+    }
   };
 
   const moveFileToRole = async (file: DiscuzFile, role: DiscuzFile["role"]) => {
     if (file.role === role) return file;
-    const response = await fetch(`/api/files/${encodeURIComponent(file.id)}/role`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ role })
-    });
-    if (!response.ok) throw new Error(await response.text());
-    const payload = await response.json();
-    setState((current) => ({
-      ...current,
-      files: payload.files ?? current.files,
-      activities: payload.activities ?? current.activities
-    }));
-    setSelectedId(file.id);
-    if (role !== "generated") setGeneratedEditorId(null);
-    if (previewFileId === file.id && role === "generated") setPreviewFileId(null);
-    setError("");
-    return payload.file as DiscuzFile;
+    const finishTask = beginTask("移动文件");
+    try {
+      const response = await fetch(`/api/files/${encodeURIComponent(file.id)}/role`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role })
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = await response.json();
+      setState((current) => ({
+        ...current,
+        files: payload.files ?? current.files,
+        activities: payload.activities ?? current.activities
+      }));
+      setSelectedId(file.id);
+      if (role !== "generated") setGeneratedEditorId(null);
+      if (previewFileId === file.id && role === "generated") setPreviewFileId(null);
+      setError("");
+      return payload.file as DiscuzFile;
+    } finally {
+      finishTask();
+    }
   };
 
   const copyFileToGenerated = async (file: DiscuzFile) => {
-    const response = await fetch(`/api/files/${encodeURIComponent(file.id)}/copy-generated`, { method: "POST" });
-    if (!response.ok) throw new Error(await response.text());
-    const payload = await response.json();
-    setState((current) => ({
-      ...current,
-      files: payload.files ?? current.files,
-      activities: payload.activities ?? current.activities
-    }));
-    const copiedFile = payload.file as DiscuzFile | undefined;
-    setGeneratedEditorId(copiedFile && (copiedFile.kind === "markdown" || copiedFile.kind === "text") ? copiedFile.id : null);
-    setSelectedId(payload.file?.id ?? file.id);
-    setError("");
-    return payload.file as DiscuzFile;
+    const finishTask = beginTask("复制到临时区");
+    try {
+      const response = await fetch(`/api/files/${encodeURIComponent(file.id)}/copy-generated`, { method: "POST" });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = await response.json();
+      setState((current) => ({
+        ...current,
+        files: payload.files ?? current.files,
+        activities: payload.activities ?? current.activities
+      }));
+      const copiedFile = payload.file as DiscuzFile | undefined;
+      setGeneratedEditorId(copiedFile && (copiedFile.kind === "markdown" || copiedFile.kind === "text") ? copiedFile.id : null);
+      setSelectedId(payload.file?.id ?? file.id);
+      setError("");
+      return payload.file as DiscuzFile;
+    } finally {
+      finishTask();
+    }
   };
 
   const notifyForegroundDiscussion = (title: string, text: string) => {
@@ -570,15 +659,32 @@ export function App() {
 
   const openFileDiscussionWindow = (file: DiscuzFile) => {
     setSelectedId(file.id);
-    if (file.role === "generated" && (file.kind === "markdown" || file.kind === "text")) setGeneratedEditorId(file.id);
-    else setPreviewFileId(file.id);
+    setActiveTool(null);
+    setPreviewRecordId(null);
+    if (file.role === "generated" && (file.kind === "markdown" || file.kind === "text")) {
+      setPreviewFileId(null);
+      setGeneratedEditorId(file.id);
+    } else {
+      setGeneratedEditorId(null);
+      setPreviewFileId(file.id);
+    }
     notifyForegroundDiscussion(file.originalName, describeFileForDiscussion(file));
   };
 
   const openToolDiscussionWindow = (tool: ToolId) => {
+    setPreviewFileId(null);
+    setPreviewRecordId(null);
+    setGeneratedEditorId(null);
     setActiveTool(tool);
     if (tool === "draft") notifyForegroundDiscussion("临时文档", draftText || "当前临时文档为空。");
     if (tool === "whiteboard") notifyForegroundDiscussion("无限白板", boardToMarkdown());
+  };
+
+  const openRecordWindow = (recordId: string) => {
+    setActiveTool(null);
+    setPreviewFileId(null);
+    setGeneratedEditorId(null);
+    setPreviewRecordId(recordId);
   };
 
   const boardToMarkdown = () => {
@@ -629,34 +735,39 @@ export function App() {
   const sendDiscussionInput = async () => {
     const text = discussionText.trim();
     if (!text) return;
+    const finishTask = beginTask("发送讨论输入");
     setDiscussionText("");
-    const response = await fetch("/api/discussion-inputs", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text })
-    });
-    if (!response.ok) throw new Error(await response.text());
-    const payload = await response.json();
-    setState((current) => ({
-      ...current,
-      discussionInputs: payload.discussionInputs ?? current.discussionInputs,
-      activities: payload.activities ?? current.activities
-    }));
-
-    const channel = dataChannelRef.current;
-    if (channel?.readyState === "open") {
-      channel.send(JSON.stringify({
-        type: "conversation.item.create",
-        item: {
-          type: "message",
-          role: "user",
-          content: [{ type: "input_text", text: `用户文字输入：${text}` }]
-        }
+    try {
+      const response = await fetch("/api/discussion-inputs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text })
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = await response.json();
+      setState((current) => ({
+        ...current,
+        discussionInputs: payload.discussionInputs ?? current.discussionInputs,
+        activities: payload.activities ?? current.activities
       }));
-      channel.send(JSON.stringify({ type: "response.create" }));
-      setStatusText("Text sent");
-    } else {
-      setStatusText("Saved for next discussion");
+
+      const channel = dataChannelRef.current;
+      if (channel?.readyState === "open") {
+        channel.send(JSON.stringify({
+          type: "conversation.item.create",
+          item: {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: `用户文字输入：${text}` }]
+          }
+        }));
+        channel.send(JSON.stringify({ type: "response.create" }));
+        setStatusText("Text sent");
+      } else {
+        setStatusText("Saved for next discussion");
+      }
+    } finally {
+      finishTask();
     }
   };
 
@@ -671,9 +782,73 @@ export function App() {
     setState((current) => ({
       ...current,
       discussionTopic: payload.discussionTopic ?? current.discussionTopic,
+      directions: payload.directions ?? current.directions,
       activities: payload.activities ?? current.activities
     }));
     setTopicProposal(null);
+    setDirectionProposal(null);
+    const channel = dataChannelRef.current;
+    if (channel?.readyState === "open") {
+      channel.send(JSON.stringify({
+        type: "conversation.item.create",
+        item: {
+          type: "message",
+          role: "user",
+          content: [{
+            type: "input_text",
+            text: `系统事件：用户已确认讨论主题《${title}》。请先提出 3 到 6 个讨论方向，并调用 propose_discussion_directions 等用户确认。不要直接开始展开讨论。`
+          }]
+        }
+      }));
+      channel.send(JSON.stringify({ type: "response.create" }));
+    }
+  };
+
+  const confirmDirectionProposal = async (directions: string[]) => {
+    const response = await fetch("/api/directions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ directions })
+    });
+    if (!response.ok) throw new Error(await response.text());
+    const payload = await response.json();
+    setState((current) => ({
+      ...current,
+      directions: payload.directions ?? current.directions,
+      notes: payload.notes ?? current.notes,
+      activities: payload.activities ?? current.activities,
+      topics: payload.topics ?? current.topics
+    }));
+    setDirectionProposal(null);
+  };
+
+  const completeDirection = async (direction: DiscussionDirection, note = "") => {
+    const response = await fetch(`/api/directions/${encodeURIComponent(direction.id)}/complete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note })
+    });
+    if (!response.ok) throw new Error(await response.text());
+    const payload = await response.json();
+    setState((current) => ({
+      ...current,
+      directions: payload.directions ?? current.directions,
+      notes: payload.notes ?? current.notes,
+      activities: payload.activities ?? current.activities,
+      topics: payload.topics ?? current.topics
+    }));
+  };
+
+  const deleteDirection = async (direction: DiscussionDirection) => {
+    const response = await fetch(`/api/directions/${encodeURIComponent(direction.id)}`, { method: "DELETE" });
+    if (!response.ok) throw new Error(await response.text());
+    const payload = await response.json();
+    setState((current) => ({
+      ...current,
+      directions: payload.directions ?? current.directions,
+      activities: payload.activities ?? current.activities,
+      topics: payload.topics ?? current.topics
+    }));
   };
 
   const notifyPrimaryFileDeleted = (file: DiscuzFile) => {
@@ -718,166 +893,211 @@ export function App() {
     }
   };
 
-  const handleToolCall = async (message: { name?: string; arguments?: string; call_id?: string }) => {
+  const handleToolCall = async (message: RealtimeToolCall) => {
     const channel = dataChannelRef.current;
     if (!channel || channel.readyState !== "open" || !message.call_id || !message.name) return;
     const args = JSON.parse(message.arguments || "{}");
+    const finishTask = beginTask(toolCallLabel(message.name));
     let output = {};
-    if (message.name === "search_context") {
-      const response = await fetch(`/api/context/search?q=${encodeURIComponent(args.query || "")}`);
-      output = await response.json();
-    }
-    if (message.name === "web_search") {
-      if (!webEnabled) output = { error: "Web search is disabled by the user." };
-      else {
-        const response = await fetch(`/api/web/search?q=${encodeURIComponent(args.query || "")}`);
+    try {
+      if (message.name === "search_context") {
+        const response = await fetch(`/api/context/search?q=${encodeURIComponent(args.query || "")}`);
         output = await response.json();
       }
-    }
-    if (message.name === "set_layout") {
-      applyLayoutCommand(args.target || "reset", args.mode || "reset");
-      output = { ok: true, layout: args };
-    }
-    if (message.name === "open_discussion_tool") {
-      const tool = (args.tool || "whiteboard") as ToolId;
-      openToolDiscussionWindow(tool);
-      output = { ok: true, opened: args.tool };
-    }
-    if (message.name === "save_discussion_tool") {
-      const tool = (args.tool === "whiteboard" || args.tool === "draft" ? args.tool : activeTool) as ToolId | null;
-      if (tool === "whiteboard" || tool === "draft") {
-        await saveToolToGenerated(tool);
-        output = { ok: true, saved: tool };
-      } else {
-        output = { ok: false, error: "No savable tool is open." };
-      }
-    }
-    if (message.name === "clear_discussion_tool") {
-      const tool = (args.tool === "whiteboard" || args.tool === "draft" ? args.tool : activeTool) as ToolId | null;
-      if (tool === "whiteboard" || tool === "draft") {
-        clearToolContent(tool);
-        output = { ok: true, cleared: tool };
-      } else {
-        output = { ok: false, error: "No clearable tool is open." };
-      }
-    }
-    if (message.name === "close_foreground_window") {
-      const target = String(args.target || "all");
-      if (target === "tool" || target === "all") setActiveTool(null);
-      if (target === "file" || target === "all") {
-        setPreviewFileId(null);
-        setGeneratedEditorId(null);
-      }
-      if (target === "record" || target === "all") setPreviewRecordId(null);
-      output = { ok: true, closed: target };
-    }
-    if (message.name === "open_file_preview") {
-      const role = args.role === "primary" || args.role === "context" || args.role === "generated" ? args.role : undefined;
-      const queryText = String(args.query || "").trim().toLowerCase();
-      const candidate = state.files.find((file) => {
-        const roleMatches = !role || file.role === role;
-        const nameMatches = !queryText || file.originalName.toLowerCase().includes(queryText);
-        return roleMatches && nameMatches;
-      }) ?? state.files.find((file) => !role || file.role === role);
-      if (candidate) {
-        openFileDiscussionWindow(candidate);
-        output = { ok: true, opened: candidate.originalName };
-      } else {
-        output = { ok: false, error: "No matching file found." };
-      }
-    }
-    if (message.name === "save_discussion_note") {
-      const kind = ["point", "decision", "question", "action"].includes(args.kind) ? args.kind as Note["kind"] : "point";
-      const text = String(args.text || "").trim();
-      if (text) {
-        await saveNote(text, kind, "AI summary");
-        output = { ok: true, saved: text };
-      } else {
-        output = { ok: false, error: "Missing note text." };
-      }
-    }
-    if (message.name === "create_generated_file") {
-      const title = String(args.title || "AI临时文案.md").trim();
-      const text = String(args.text || "").trim();
-      if (text) {
-        const file = await createGeneratedFile(title, text);
-        output = { ok: true, generated: file.originalName };
-      } else {
-        output = { ok: false, error: "Missing generated file text." };
-      }
-    }
-    if (message.name === "copy_file_to_generated") {
-      const role = args.role === "primary" || args.role === "context" || args.role === "generated" ? args.role : undefined;
-      const queryText = String(args.query || "").trim().toLowerCase();
-      const candidate = state.files.find((file) => {
-        const roleMatches = !role || file.role === role;
-        const nameMatches = !queryText || file.originalName.toLowerCase().includes(queryText);
-        return roleMatches && nameMatches;
-      });
-      if (candidate) {
-        const file = await copyFileToGenerated(candidate);
-        output = { ok: true, copied: file.originalName };
-      } else {
-        output = { ok: false, error: "No matching file found to copy." };
-      }
-    }
-    if (message.name === "add_file_to_topic") {
-      const queryText = String(args.query || "").trim().toLowerCase();
-      const candidates = state.files.filter((file) => file.role === "context" || file.role === "generated");
-      const file = (queryText
-        ? candidates.find((candidate) => candidate.originalName.toLowerCase().includes(queryText))
-        : candidates.length === 1 ? candidates[0] : undefined);
-      if (file) {
-        await promoteFileToPrimary(file);
-        output = { ok: true, added: file.originalName };
-      } else {
-        output = { ok: false, error: "No matching resource or AI generated file found." };
-      }
-    }
-    if (message.name === "move_file_to_area") {
-      const role = args.role === "primary" || args.role === "context" || args.role === "generated" ? args.role as DiscuzFile["role"] : undefined;
-      const queryText = String(args.query || "").trim().toLowerCase();
-      const candidate = state.files.find((file) => {
-        const nameMatches = !queryText || file.originalName.toLowerCase().includes(queryText);
-        return nameMatches;
-      });
-      if (candidate && role) {
-        if (role === "generated" && candidate.role !== "generated") {
-          const file = await copyFileToGenerated(candidate);
-          output = { ok: true, copied: file.originalName, target: role };
-        } else {
-          await moveFileToRole(candidate, role);
-          output = { ok: true, moved: candidate.originalName, target: role };
+      if (message.name === "web_search") {
+        if (!webEnabled) output = { error: "Web search is disabled by the user." };
+        else {
+          const response = await fetch(`/api/web/search?q=${encodeURIComponent(args.query || "")}`);
+          output = await response.json();
         }
-      } else {
-        output = { ok: false, error: "No matching file or target area found." };
       }
-    }
-    if (message.name === "update_generated_file") {
-      const queryText = String(args.query || "").trim().toLowerCase();
-      const text = String(args.text || "").trim();
-      const candidate = state.files.find((file) => {
-        const nameMatches = !queryText || file.originalName.toLowerCase().includes(queryText);
-        return file.role === "generated" && nameMatches && (file.kind === "markdown" || file.kind === "text");
-      });
-      if (candidate && text) {
-        await updateGeneratedFile(candidate, text);
-        setGeneratedEditorId(candidate.id);
-        output = { ok: true, updated: candidate.originalName };
-      } else {
-        output = { ok: false, error: "No editable generated text file or replacement text found." };
+      if (message.name === "set_layout") {
+        applyLayoutCommand(args.target || "reset", args.mode || "reset");
+        output = { ok: true, layout: args };
       }
-    }
-    if (message.name === "propose_discussion_topic") {
-      const title = String(args.title || "").trim();
-      const reason = String(args.reason || "").trim();
-      const intent = args.intent === "drift" ? "drift" : "confirm";
-      if (title) {
-        setTopicProposal({ title, reason, intent });
-        output = { ok: true, proposed: title };
-      } else {
-        output = { ok: false, error: "Missing topic title." };
+      if (message.name === "open_discussion_tool") {
+        const tool = (args.tool || "whiteboard") as ToolId;
+        openToolDiscussionWindow(tool);
+        output = { ok: true, opened: args.tool };
       }
+      if (message.name === "save_discussion_tool") {
+        const tool = (args.tool === "whiteboard" || args.tool === "draft" ? args.tool : activeTool) as ToolId | null;
+        if (tool === "whiteboard" || tool === "draft") {
+          await saveToolToGenerated(tool);
+          output = { ok: true, saved: tool };
+        } else {
+          output = { ok: false, error: "No savable tool is open." };
+        }
+      }
+      if (message.name === "clear_discussion_tool") {
+        const tool = (args.tool === "whiteboard" || args.tool === "draft" ? args.tool : activeTool) as ToolId | null;
+        if (tool === "whiteboard" || tool === "draft") {
+          clearToolContent(tool);
+          output = { ok: true, cleared: tool };
+        } else {
+          output = { ok: false, error: "No clearable tool is open." };
+        }
+      }
+      if (message.name === "close_foreground_window") {
+        const target = String(args.target || "all");
+        if (target === "tool" || target === "all") setActiveTool(null);
+        if (target === "file" || target === "all") {
+          setPreviewFileId(null);
+          setGeneratedEditorId(null);
+        }
+        if (target === "record" || target === "all") setPreviewRecordId(null);
+        output = { ok: true, closed: target };
+      }
+      if (message.name === "open_file_preview") {
+        const role = args.role === "primary" || args.role === "context" || args.role === "generated" ? args.role : undefined;
+        const queryText = String(args.query || "").trim().toLowerCase();
+        const candidate = state.files.find((file) => {
+          const roleMatches = !role || file.role === role;
+          const nameMatches = !queryText || file.originalName.toLowerCase().includes(queryText);
+          return roleMatches && nameMatches;
+        }) ?? state.files.find((file) => !role || file.role === role);
+        if (candidate) {
+          openFileDiscussionWindow(candidate);
+          output = { ok: true, opened: candidate.originalName };
+        } else {
+          output = { ok: false, error: "No matching file found." };
+        }
+      }
+      if (message.name === "save_discussion_note") {
+        const kind = ["point", "decision", "question", "action"].includes(args.kind) ? args.kind as Note["kind"] : "point";
+        const text = String(args.text || "").trim();
+        if (text) {
+          await saveNote(text, kind, "AI summary");
+          output = { ok: true, saved: text };
+        } else {
+          output = { ok: false, error: "Missing note text." };
+        }
+      }
+      if (message.name === "create_generated_file") {
+        const title = String(args.title || "AI临时文案.md").trim();
+        const text = String(args.text || "").trim();
+        if (text) {
+          const file = await createGeneratedFile(title, text);
+          output = { ok: true, generated: file.originalName };
+        } else {
+          output = { ok: false, error: "Missing generated file text." };
+        }
+      }
+      if (message.name === "copy_file_to_generated") {
+        const role = args.role === "primary" || args.role === "context" || args.role === "generated" ? args.role : undefined;
+        const queryText = String(args.query || "").trim().toLowerCase();
+        const candidate = state.files.find((file) => {
+          const roleMatches = !role || file.role === role;
+          const nameMatches = !queryText || file.originalName.toLowerCase().includes(queryText);
+          return roleMatches && nameMatches;
+        });
+        if (candidate) {
+          const file = await copyFileToGenerated(candidate);
+          output = { ok: true, copied: file.originalName };
+        } else {
+          output = { ok: false, error: "No matching file found to copy." };
+        }
+      }
+      if (message.name === "add_file_to_topic") {
+        const queryText = String(args.query || "").trim().toLowerCase();
+        const candidates = state.files.filter((file) => file.role === "context" || file.role === "generated");
+        const file = (queryText
+          ? candidates.find((candidate) => candidate.originalName.toLowerCase().includes(queryText))
+          : candidates.length === 1 ? candidates[0] : undefined);
+        if (file) {
+          await promoteFileToPrimary(file);
+          output = { ok: true, added: file.originalName };
+        } else {
+          output = { ok: false, error: "No matching resource or AI generated file found." };
+        }
+      }
+      if (message.name === "move_file_to_area") {
+        const role = args.role === "primary" || args.role === "context" || args.role === "generated" ? args.role as DiscuzFile["role"] : undefined;
+        const queryText = String(args.query || "").trim().toLowerCase();
+        const candidate = state.files.find((file) => {
+          const nameMatches = !queryText || file.originalName.toLowerCase().includes(queryText);
+          return nameMatches;
+        });
+        if (candidate && role) {
+          if (role === "generated" && candidate.role !== "generated") {
+            const file = await copyFileToGenerated(candidate);
+            output = { ok: true, copied: file.originalName, target: role };
+          } else {
+            await moveFileToRole(candidate, role);
+            output = { ok: true, moved: candidate.originalName, target: role };
+          }
+        } else {
+          output = { ok: false, error: "No matching file or target area found." };
+        }
+      }
+      if (message.name === "update_generated_file") {
+        const queryText = String(args.query || "").trim().toLowerCase();
+        const text = String(args.text || "").trim();
+        const candidate = state.files.find((file) => {
+          const nameMatches = !queryText || file.originalName.toLowerCase().includes(queryText);
+          return file.role === "generated" && nameMatches && (file.kind === "markdown" || file.kind === "text");
+        });
+        if (candidate && text) {
+          await updateGeneratedFile(candidate, text);
+          setGeneratedEditorId(candidate.id);
+          output = { ok: true, updated: candidate.originalName };
+        } else {
+          output = { ok: false, error: "No editable generated text file or replacement text found." };
+        }
+      }
+      if (message.name === "propose_discussion_directions") {
+        const directions = (Array.isArray(args.directions) ? args.directions : [])
+          .map((item: unknown) => String(item || "").trim())
+          .filter(Boolean)
+          .slice(0, 6);
+        if (directions.length) {
+          setDirectionProposal({ directions, reason: String(args.reason || "").trim() });
+          output = { ok: true, proposed: directions };
+        } else {
+          output = { ok: false, error: "Missing discussion directions." };
+        }
+      }
+      if (message.name === "update_discussion_directions") {
+        const directions = (Array.isArray(args.directions) ? args.directions : [])
+          .map((item: unknown) => String(item || "").trim())
+          .filter(Boolean)
+          .slice(0, 8);
+        if (directions.length) {
+          await confirmDirectionProposal(directions);
+          output = { ok: true, directions };
+        } else {
+          output = { ok: false, error: "Missing discussion directions." };
+        }
+      }
+      if (message.name === "complete_discussion_direction") {
+        const queryText = String(args.query || "").trim().toLowerCase();
+        const candidate = state.directions.find((direction, index) => {
+          return direction.id === queryText || String(index + 1) === queryText || direction.text.toLowerCase().includes(queryText);
+        });
+        if (candidate) {
+          await completeDirection(candidate, String(args.note || "").trim());
+          output = { ok: true, completed: candidate.text };
+        } else {
+          output = { ok: false, error: "No matching discussion direction found." };
+        }
+      }
+      if (message.name === "propose_discussion_topic") {
+        const title = String(args.title || "").trim();
+        const reason = String(args.reason || "").trim();
+        const intent = args.intent === "drift" ? "drift" : "confirm";
+        if (title) {
+          setTopicProposal({ title, reason, intent });
+          output = { ok: true, proposed: title };
+        } else {
+          output = { ok: false, error: "Missing topic title." };
+        }
+      }
+    } catch (err) {
+      const messageText = err instanceof Error ? err.message : "Tool call failed";
+      setError(messageText);
+      output = { ok: false, error: messageText };
+    } finally {
+      finishTask();
     }
     channel.send(JSON.stringify({
       type: "conversation.item.create",
@@ -889,6 +1109,10 @@ export function App() {
     }));
     channel.send(JSON.stringify({ type: "response.create" }));
   };
+
+  useEffect(() => {
+    handleToolCallRef.current = handleToolCall;
+  });
 
   const finalizeDiscussionRecord = useCallback(async () => {
     const startedAt = voiceSessionStartedAtRef.current;
@@ -970,6 +1194,8 @@ export function App() {
 
   const disconnectVoice = useCallback(() => {
     voiceSessionRef.current += 1;
+    if (voiceReconnectTimerRef.current) window.clearTimeout(voiceReconnectTimerRef.current);
+    voiceReconnectTimerRef.current = null;
     dataChannelRef.current = null;
     peerRef.current?.close();
     peerRef.current = null;
@@ -1017,9 +1243,12 @@ export function App() {
       if (!navigator.mediaDevices?.getUserMedia) {
         throw new Error("当前浏览器不支持麦克风访问。请使用支持麦克风权限的浏览器，并通过 localhost 或 HTTPS 打开应用。");
       }
-      const audioConstraint = selectedAudioInputId
-        ? { deviceId: { exact: selectedAudioInputId } }
-        : true;
+      const audioConstraint = {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        ...(selectedAudioInputId ? { deviceId: { exact: selectedAudioInputId } } : {})
+      };
       const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraint });
       if (sessionId !== voiceSessionRef.current) {
         stream.getTracks().forEach((track) => track.stop());
@@ -1045,11 +1274,22 @@ export function App() {
       peer.onconnectionstatechange = () => {
         if (sessionId !== voiceSessionRef.current) return;
         if (peer.connectionState === "connected") {
+          if (voiceReconnectTimerRef.current) window.clearTimeout(voiceReconnectTimerRef.current);
+          voiceReconnectTimerRef.current = null;
           voiceSessionStartedAtRef.current ||= new Date().toISOString();
           setVoiceState("live");
           setStatusText("Live");
         }
-        if (["failed", "disconnected", "closed"].includes(peer.connectionState)) stopVoice();
+        if (peer.connectionState === "disconnected") {
+          setStatusText("连接波动，正在恢复");
+          if (!voiceReconnectTimerRef.current) {
+            voiceReconnectTimerRef.current = window.setTimeout(() => {
+              voiceReconnectTimerRef.current = null;
+              if (sessionId === voiceSessionRef.current && peer.connectionState === "disconnected") stopVoice();
+            }, 8000);
+          }
+        }
+        if (["failed", "closed"].includes(peer.connectionState)) stopVoice();
       };
 
       const channel = peer.createDataChannel("oai-events");
@@ -1071,7 +1311,7 @@ export function App() {
             assistantTranscriptRef.current = "";
           }
           if (message.type === "response.function_call_arguments.done") {
-            handleToolCall(message).catch((err) => setError(err.message));
+            handleToolCallRef.current?.(message).catch((err) => setError(err.message));
           }
           if (message.type === "error") {
             setError(message.error?.message || "Realtime error");
@@ -1229,6 +1469,7 @@ export function App() {
     setPreviewRecordId(null);
     setGeneratedEditorId(null);
     setTopicProposal(null);
+    setDirectionProposal(null);
     setDiscussionText("");
     setContextHits([]);
     setWebHits([]);
@@ -1244,6 +1485,7 @@ export function App() {
     setGeneratedEditorId(null);
     setActiveTool(null);
     setTopicProposal(null);
+    setDirectionProposal(null);
     setDiscussionText("");
     setContextHits([]);
     setWebHits([]);
@@ -1287,6 +1529,8 @@ export function App() {
     resetLocalDiscussionView(await response.json());
   };
 
+  const hasTopicCards = primaryFiles.length > 0 || state.directions.length > 0 || Boolean(directionProposal);
+
   return (
     <main
       className="app-shell"
@@ -1306,6 +1550,7 @@ export function App() {
       <div className="light-wash" />
       <div className="bottom-discussion-bar">
         <StatusLogPanel ref={statusLogRef} entries={statusLog} transcript={transcript} />
+        <TaskIndicator tasks={pendingTasks} />
         <form
           className="discussion-text-form"
           onSubmit={(event) => {
@@ -1362,8 +1607,18 @@ export function App() {
           }
         />
         <div className="topic-preview">
-          {primaryFiles.length ? (
+          {hasTopicCards ? (
             <div className="topic-file-list">
+              {(state.directions.length > 0 || directionProposal) && (
+                <DiscussionDirectionsCard
+                  directions={state.directions}
+                  proposal={directionProposal}
+                  onConfirmProposal={() => directionProposal && confirmDirectionProposal(directionProposal.directions).catch((err) => setError(err.message))}
+                  onDismissProposal={() => setDirectionProposal(null)}
+                  onComplete={(direction) => completeDirection(direction).catch((err) => setError(err.message))}
+                  onDelete={(direction) => deleteDirection(direction).catch((err) => setError(err.message))}
+                />
+              )}
               {primaryFiles.map((file) => (
                 <article
                   key={file.id}
@@ -1615,7 +1870,7 @@ export function App() {
               <div className="history-card-list">
                 {state.records.length ? (
                   state.records.map((record) => (
-                    <button key={record.id} className="history-card" onDoubleClick={() => setPreviewRecordId(record.id)}>
+                    <button key={record.id} className="history-card" onDoubleClick={() => openRecordWindow(record.id)}>
                       <span>{record.noteCount} 段 · {shortTime(record.createdAt)}</span>
                       <strong>{record.title}</strong>
                       <p>{record.content}</p>
@@ -1735,6 +1990,62 @@ function TopicConfirmation({
   );
 }
 
+function DiscussionDirectionsCard({
+  directions,
+  proposal,
+  onConfirmProposal,
+  onDismissProposal,
+  onComplete,
+  onDelete
+}: {
+  directions: DiscussionDirection[];
+  proposal: DirectionProposal | null;
+  onConfirmProposal: () => void;
+  onDismissProposal: () => void;
+  onComplete: (_direction: DiscussionDirection) => void;
+  onDelete: (_direction: DiscussionDirection) => void;
+}) {
+  const proposalItems = proposal?.directions ?? [];
+  return (
+    <article className="topic-file-card directions-card">
+      <div className="directions-card-head">
+        <span>{proposal ? "待确认方向" : "讨论方向"}</span>
+        {proposal && (
+          <div className="directions-card-actions">
+            <button title="确认方向" onClick={onConfirmProposal}><Check size={14} /></button>
+            <button title="关闭" onClick={onDismissProposal}><X size={14} /></button>
+          </div>
+        )}
+      </div>
+      {proposal?.reason && <p className="directions-reason">{proposal.reason}</p>}
+      <ul className="directions-list">
+        {(proposal ? proposalItems : directions).map((item, index) => {
+          const text = typeof item === "string" ? item : item.text;
+          const completed = typeof item === "string" ? false : item.completed;
+          return (
+            <li key={typeof item === "string" ? `${text}-${index}` : item.id} className={completed ? "completed" : ""}>
+              <button
+                className="direction-dot"
+                title={completed ? "已完成" : "标记完成"}
+                disabled={Boolean(proposal) || completed}
+                onClick={() => typeof item !== "string" && onComplete(item)}
+              >
+                {completed ? <CheckCircle2 size={16} /> : null}
+              </button>
+              <span>{text}</span>
+              {typeof item !== "string" && (
+                <button className="direction-delete" title="删除方向" onClick={() => onDelete(item)}>
+                  <X size={14} />
+                </button>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </article>
+  );
+}
+
 const StatusLogPanel = forwardRef<HTMLDivElement, { entries: StatusLogEntry[]; transcript: string }>(function StatusLogPanel({
   entries,
   transcript
@@ -1758,6 +2069,17 @@ const StatusLogPanel = forwardRef<HTMLDivElement, { entries: StatusLogEntry[]; t
     </div>
   );
 });
+
+function TaskIndicator({ tasks }: { tasks: TaskItem[] }) {
+  if (!tasks.length) return null;
+  const active = tasks[tasks.length - 1];
+  return (
+    <div className="task-indicator" title={tasks.map((task) => task.label).join(" / ")}>
+      <Sparkles size={14} />
+      <span>{tasks.length > 1 ? `${tasks.length} 个任务` : active.label}</span>
+    </div>
+  );
+}
 
 function EmptyTopic({ onChoose }: { onChoose: () => void }) {
   return (

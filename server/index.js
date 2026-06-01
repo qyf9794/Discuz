@@ -72,6 +72,16 @@ db.exec(`
     created_at TEXT NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS discussion_directions (
+    id TEXT PRIMARY KEY,
+    topic_id TEXT NOT NULL DEFAULT '',
+    text TEXT NOT NULL,
+    completed INTEGER NOT NULL DEFAULT 0,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS activities (
     id TEXT PRIMARY KEY,
     topic_id TEXT NOT NULL DEFAULT '',
@@ -113,6 +123,7 @@ if (!fileColumns.includes("sort_order")) {
 addColumnIfMissing("notes", "topic_id", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("discussion_records", "topic_id", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("discussion_inputs", "topic_id", "TEXT NOT NULL DEFAULT ''");
+addColumnIfMissing("discussion_directions", "topic_id", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("activities", "topic_id", "TEXT NOT NULL DEFAULT ''");
 
 function createTopicRecord(title = "") {
@@ -140,6 +151,7 @@ function ensureActiveTopic() {
   db.prepare("UPDATE notes SET topic_id = ? WHERE topic_id = ''").run(activeTopic.id);
   db.prepare("UPDATE discussion_records SET topic_id = ? WHERE topic_id = ''").run(activeTopic.id);
   db.prepare("UPDATE discussion_inputs SET topic_id = ? WHERE topic_id = ''").run(activeTopic.id);
+  db.prepare("UPDATE discussion_directions SET topic_id = ? WHERE topic_id = ''").run(activeTopic.id);
   db.prepare("UPDATE activities SET topic_id = ? WHERE topic_id = ''").run(activeTopic.id);
   migrateLegacyFilesToTopic(activeTopic.id);
   return activeTopic.id;
@@ -346,6 +358,7 @@ function topicSnapshot(topicId = getActiveTopicId()) {
     notes: db.prepare("SELECT * FROM notes WHERE topic_id = ? ORDER BY created_at DESC").all(topicId),
     records: db.prepare("SELECT * FROM discussion_records WHERE topic_id = ? ORDER BY created_at DESC").all(topicId),
     discussionInputs: db.prepare("SELECT * FROM discussion_inputs WHERE topic_id = ? ORDER BY created_at DESC").all(topicId),
+    directions: getDirections(topicId),
     activities: db.prepare("SELECT * FROM activities WHERE topic_id = ? ORDER BY created_at DESC").all(topicId)
   };
 }
@@ -681,6 +694,77 @@ function getDiscussionInputs(limit = 24) {
   }));
 }
 
+function getDirections(topicId = getActiveTopicId()) {
+  return db.prepare(`
+    SELECT * FROM discussion_directions
+    WHERE topic_id = ?
+    ORDER BY sort_order ASC, created_at ASC
+  `).all(topicId).map((row) => ({
+    id: row.id,
+    text: row.text,
+    completed: Boolean(row.completed),
+    sortOrder: row.sort_order,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  }));
+}
+
+function replaceDirections(items) {
+  const topicId = getActiveTopicId();
+  const cleaned = (Array.isArray(items) ? items : [])
+    .map((item) => cleanText(typeof item === "string" ? item : item?.text))
+    .filter(Boolean)
+    .slice(0, 8);
+  if (!cleaned.length) return getDirections(topicId);
+  const createdAt = now();
+  db.exec("BEGIN");
+  try {
+    db.prepare("DELETE FROM discussion_directions WHERE topic_id = ?").run(topicId);
+    const insert = db.prepare(`
+      INSERT INTO discussion_directions (id, topic_id, text, completed, sort_order, created_at, updated_at)
+      VALUES (?, ?, ?, 0, ?, ?, ?)
+    `);
+    cleaned.forEach((text, index) => insert.run(crypto.randomUUID(), topicId, text, index, createdAt, createdAt));
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+  addActivity("Directions", `更新 ${cleaned.length} 个讨论方向`, createdAt);
+  writeTopicSnapshot(topicId);
+  return getDirections(topicId);
+}
+
+function completeDirection(directionIdOrQuery, noteText = "") {
+  const topicId = getActiveTopicId();
+  const query = cleanText(directionIdOrQuery).toLowerCase();
+  const directions = getDirections(topicId);
+  const row = directions.find((item) => item.id === query) ||
+    directions.find((item, index) => String(index + 1) === query) ||
+    directions.find((item) => item.text.toLowerCase().includes(query));
+  if (!row) return null;
+  const createdAt = now();
+  db.prepare("UPDATE discussion_directions SET completed = 1, updated_at = ? WHERE id = ? AND topic_id = ?")
+    .run(createdAt, row.id, topicId);
+  const text = cleanText(noteText) || `已完成讨论方向：${row.text}`;
+  db.prepare("INSERT INTO notes (id, topic_id, kind, text, source, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+    .run(crypto.randomUUID(), topicId, "action", text, "Discussion direction", createdAt);
+  addActivity("Direction done", row.text.slice(0, 80), createdAt);
+  writeTopicSnapshot(topicId);
+  return row;
+}
+
+function deleteDirection(directionId) {
+  const id = cleanText(directionId);
+  const topicId = getActiveTopicId();
+  const row = db.prepare("SELECT * FROM discussion_directions WHERE id = ? AND topic_id = ?").get(id, topicId);
+  if (!row) return null;
+  db.prepare("DELETE FROM discussion_directions WHERE id = ? AND topic_id = ?").run(id, topicId);
+  addActivity("Direction removed", row.text.slice(0, 80), now());
+  writeTopicSnapshot(topicId);
+  return row;
+}
+
 function memoryLabel(kind) {
   return { point: "要点", decision: "结论", question: "问题", action: "行动" }[kind] || "记录";
 }
@@ -735,6 +819,7 @@ function buildDiscussionContext() {
   const contextFiles = db.prepare("SELECT * FROM files WHERE role = 'context' AND topic_id = ? ORDER BY created_at DESC LIMIT 12").all(topicId).map(rowToFile);
   const memoryNotes = getNotes().slice(0, 24).reverse();
   const discussionInputs = getDiscussionInputs(24).reverse();
+  const directions = getDirections(topicId);
   const discussionTopic = getDiscussionTopic();
   const recentActivities = getActivities().slice(0, 8).reverse();
   const primaryText = primaryFiles
@@ -752,11 +837,15 @@ function buildDiscussionContext() {
   const typedContext = discussionInputs
     .map((input) => `- ${shortLocalTime(input.createdAt)}｜${input.source === "user" ? "用户输入" : "AI"}：${input.text}`)
     .join("\n");
+  const directionMemory = directions
+    .map((direction, index) => `- ${direction.completed ? "已完成" : "未完成"}｜${index + 1}. ${direction.text}`)
+    .join("\n");
   return [
     "你是 Discuz，一个用于本地文件语音讨论的 AI 伙伴。你的对话必须紧密围绕当前主讨论文件、用户给出的背景材料和用户刚刚提出的问题。",
     "默认讨论对象是当前打开的主题文件、前台弹出的预览窗口和白板。除非用户明确要求讨论其他资源文件，或当前信息确实不足，否则不要主动把讨论焦点切到其他文件。",
     "讨论主题不只来自主题文件，也来自用户在底部输入框提交的主题、观点、问题和链接。用户的文字输入优先级很高，要把它当作当前讨论指令的一部分。",
     "随着讨论深入，如果你判断已经形成更准确的讨论主题，必须调用 propose_discussion_topic 请用户确认。若你发现用户正在严重偏离已确认主题，也要调用 propose_discussion_topic 提醒用户，并说明是继续原主题还是确认更换主题。",
+    "用户确认讨论主题后，你必须先提出 3 到 6 个讨论方向，调用 propose_discussion_directions 等用户确认，不要直接把方向写入 todo。用户确认后，界面会在当前主题标题下方显示 todo 列表。若用户要求调整方向，调用 update_discussion_directions 用完整新列表替换。每完成一个方向，调用 complete_discussion_direction 标记完成，并写一条简洁记录。",
     "如果收到系统事件提示当前主题文件已被删除，你必须立即停止基于该文件继续分析，并询问用户是停止此主题的讨论，还是更换新的讨论主题/上传新的主题文件。",
     "每次重新打开语音时，你必须先读取下面的讨论记忆，承接此前已经形成的要点、结论、问题和行动项。不要让用户重复已经讨论过的背景；如果记忆和当前文件冲突，以当前文件为准并说明差异。",
     "记录窗口保存的是讨论要点，不是逐句转写。不要把自己或用户的原话逐句写入记录；只有在形成一个完整观点、阶段性结论、待确认问题或行动项后，才调用 save_discussion_note 保存一段简洁总结。每条记录应是一小段话，优先概括“讨论了什么、形成了什么判断、下一步是什么”。",
@@ -771,6 +860,7 @@ function buildDiscussionContext() {
     "如果信息不足，先指出缺口，再建议用户补充哪类材料。需要资料时，优先调用本地背景材料检索；本地资料不足时，再调用联网搜索。",
     "引用资料时必须说明来源文件名或网页标题。你的默认任务是提炼关键观点、结论、争议点、风险和下一步，不主动修改原文件。",
     discussionTopic ? `已确认讨论主题：${discussionTopic}` : "当前还没有用户确认的讨论主题。",
+    directionMemory ? `讨论方向 todo：\n${directionMemory}` : "当前还没有已确认的讨论方向 todo。",
     typedContext ? `用户文字输入与链接：\n${typedContext}` : "当前还没有用户文字输入。",
     primaryFiles.length ? `主讨论文件：\n${primaryText}` : "当前还没有主讨论文件。",
     context ? `背景材料摘要：\n${context}` : "当前还没有背景材料。",
@@ -827,6 +917,7 @@ function statePayload(extra = {}) {
     notes: getNotes(),
     records: getRecords(),
     discussionInputs: getDiscussionInputs(),
+    directions: getDirections(),
     discussionTopic: getDiscussionTopic(),
     activities: getActivities(),
     settings: getSettingsState(),
@@ -873,6 +964,7 @@ app.delete("/api/topics/:id", (req, res) => {
   db.prepare("DELETE FROM notes WHERE topic_id = ?").run(topic.id);
   db.prepare("DELETE FROM discussion_records WHERE topic_id = ?").run(topic.id);
   db.prepare("DELETE FROM discussion_inputs WHERE topic_id = ?").run(topic.id);
+  db.prepare("DELETE FROM discussion_directions WHERE topic_id = ?").run(topic.id);
   db.prepare("DELETE FROM activities WHERE topic_id = ?").run(topic.id);
   db.prepare("DELETE FROM topics WHERE id = ?").run(topic.id);
   fs.rmSync(path.join(topicsDir, topic.folder_name), { recursive: true, force: true });
@@ -905,7 +997,25 @@ app.post("/api/discussion-topic", (req, res) => {
   db.prepare("UPDATE topics SET title = ?, updated_at = ? WHERE id = ?").run(topic, updatedAt, getActiveTopicId());
   addActivity("Discussion topic", topic.slice(0, 80), updatedAt);
   writeTopicSnapshot();
-  res.json({ discussionTopic: getDiscussionTopic(), topics: getTopics(), activities: getActivities() });
+  res.json({ discussionTopic: getDiscussionTopic(), directions: getDirections(), topics: getTopics(), activities: getActivities() });
+});
+
+app.post("/api/directions", (req, res) => {
+  const directions = Array.isArray(req.body?.directions) ? req.body.directions : [];
+  const nextDirections = replaceDirections(directions);
+  res.json({ directions: nextDirections, notes: getNotes(), activities: getActivities(), topics: getTopics() });
+});
+
+app.post("/api/directions/:id/complete", (req, res) => {
+  const row = completeDirection(req.params.id, req.body?.note || "");
+  if (!row) return res.status(404).json({ error: "Direction not found" });
+  res.json({ directions: getDirections(), notes: getNotes(), activities: getActivities(), topics: getTopics() });
+});
+
+app.delete("/api/directions/:id", (req, res) => {
+  const row = deleteDirection(req.params.id);
+  if (!row) return res.status(404).json({ error: "Direction not found" });
+  res.json({ directions: getDirections(), activities: getActivities(), topics: getTopics() });
 });
 
 app.delete("/api/files/:id", (req, res) => {
@@ -949,6 +1059,7 @@ app.post("/api/discussion/reset", (_req, res) => {
   db.prepare("DELETE FROM files WHERE topic_id = ?").run(topicId);
   db.prepare("DELETE FROM notes WHERE topic_id = ?").run(topicId);
   db.prepare("DELETE FROM discussion_inputs WHERE topic_id = ?").run(topicId);
+  db.prepare("DELETE FROM discussion_directions WHERE topic_id = ?").run(topicId);
   db.prepare("DELETE FROM activities WHERE topic_id = ?").run(topicId);
   db.prepare("UPDATE topics SET title = ?, updated_at = ? WHERE id = ?").run(`新讨论 ${shortLocalTime(now())}`, now(), topicId);
   writeTopicSnapshot(topicId);
@@ -957,6 +1068,7 @@ app.post("/api/discussion/reset", (_req, res) => {
     notes: getNotes(),
     records: getRecords(),
     discussionInputs: getDiscussionInputs(),
+    directions: getDirections(),
     discussionTopic: getDiscussionTopic(),
     activities: getActivities(),
     settings: getSettingsState(),
@@ -1448,6 +1560,68 @@ app.post("/api/realtime/session", async (req, res) => {
       },
       {
         type: "function",
+        name: "propose_discussion_directions",
+        description: "Propose 3 to 6 discussion directions after the discussion topic is confirmed. This only asks the user to confirm; it does not save the todo list yet.",
+        parameters: {
+          type: "object",
+          properties: {
+            directions: {
+              type: "array",
+              minItems: 3,
+              maxItems: 6,
+              items: { type: "string" },
+              description: "Concise Chinese discussion directions for the current confirmed topic."
+            },
+            reason: {
+              type: "string",
+              description: "A short reason explaining why these directions fit the confirmed topic."
+            }
+          },
+          required: ["directions", "reason"],
+          additionalProperties: false
+        }
+      },
+      {
+        type: "function",
+        name: "update_discussion_directions",
+        description: "Replace the current confirmed discussion direction todo list according to user feedback. Provide the complete new ordered list.",
+        parameters: {
+          type: "object",
+          properties: {
+            directions: {
+              type: "array",
+              minItems: 1,
+              maxItems: 8,
+              items: { type: "string" },
+              description: "The full updated ordered todo list."
+            }
+          },
+          required: ["directions"],
+          additionalProperties: false
+        }
+      },
+      {
+        type: "function",
+        name: "complete_discussion_direction",
+        description: "Mark one discussion direction as complete and record the completion in notes.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "The direction number, id, or a distinctive phrase from the direction text."
+            },
+            note: {
+              type: "string",
+              description: "A concise Chinese record of what was concluded or completed for this direction."
+            }
+          },
+          required: ["query", "note"],
+          additionalProperties: false
+        }
+      },
+      {
+        type: "function",
         name: "propose_discussion_topic",
         description: "Ask the user to confirm a clearer discussion topic, or warn that the discussion is drifting and ask whether to switch topics.",
         parameters: {
@@ -1474,6 +1648,14 @@ app.post("/api/realtime/session", async (req, res) => {
     ],
     tool_choice: "auto",
     audio: {
+      input: {
+        turn_detection: {
+          type: "semantic_vad",
+          eagerness: "low",
+          create_response: true,
+          interrupt_response: false
+        }
+      },
       output: { voice: "marin" }
     }
   };
