@@ -228,6 +228,8 @@ export function App() {
   const streamRef = useRef<MediaStream | null>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
   const handleToolCallRef = useRef<((_message: RealtimeToolCall) => Promise<void>) | null>(null);
+  const responseActiveRef = useRef(false);
+  const responsePendingRef = useRef(false);
   const voiceSessionRef = useRef(0);
   const voiceSessionStartedAtRef = useRef<string | null>(null);
   const voiceReconnectTimerRef = useRef<number | null>(null);
@@ -630,6 +632,25 @@ export function App() {
     }
   };
 
+  const requestRealtimeResponse = useCallback(() => {
+    const channel = dataChannelRef.current;
+    if (!channel || channel.readyState !== "open") return false;
+    if (responseActiveRef.current) {
+      responsePendingRef.current = true;
+      setStatusText("等待上一轮回复完成");
+      return false;
+    }
+    responseActiveRef.current = true;
+    responsePendingRef.current = false;
+    channel.send(JSON.stringify({ type: "response.create" }));
+    return true;
+  }, []);
+
+  const flushRealtimeResponse = useCallback(() => {
+    if (!responsePendingRef.current) return;
+    requestRealtimeResponse();
+  }, [requestRealtimeResponse]);
+
   const notifyForegroundDiscussion = (title: string, text: string) => {
     const channel = dataChannelRef.current;
     if (!channel || channel.readyState !== "open") return;
@@ -644,7 +665,7 @@ export function App() {
         }]
       }
     }));
-    channel.send(JSON.stringify({ type: "response.create" }));
+    requestRealtimeResponse();
   };
 
   const describeFileForDiscussion = (file: DiscuzFile) => {
@@ -761,7 +782,7 @@ export function App() {
             content: [{ type: "input_text", text: `用户文字输入：${text}` }]
           }
         }));
-        channel.send(JSON.stringify({ type: "response.create" }));
+        requestRealtimeResponse();
         setStatusText("Text sent");
       } else {
         setStatusText("Saved for next discussion");
@@ -800,7 +821,7 @@ export function App() {
           }]
         }
       }));
-      channel.send(JSON.stringify({ type: "response.create" }));
+      requestRealtimeResponse();
     }
   };
 
@@ -870,7 +891,7 @@ export function App() {
           }]
         }
       }));
-      channel.send(JSON.stringify({ type: "response.create" }));
+      requestRealtimeResponse();
     }
   };
 
@@ -1107,7 +1128,7 @@ export function App() {
         output: JSON.stringify(output)
       }
     }));
-    channel.send(JSON.stringify({ type: "response.create" }));
+    requestRealtimeResponse();
   };
 
   useEffect(() => {
@@ -1196,6 +1217,8 @@ export function App() {
     voiceSessionRef.current += 1;
     if (voiceReconnectTimerRef.current) window.clearTimeout(voiceReconnectTimerRef.current);
     voiceReconnectTimerRef.current = null;
+    responseActiveRef.current = false;
+    responsePendingRef.current = false;
     dataChannelRef.current = null;
     peerRef.current?.close();
     peerRef.current = null;
@@ -1214,6 +1237,8 @@ export function App() {
   useEffect(() => {
     const saveAndDisconnect = () => {
       voiceSessionRef.current += 1;
+      responseActiveRef.current = false;
+      responsePendingRef.current = false;
       dataChannelRef.current = null;
       peerRef.current?.close();
       streamRef.current?.getTracks().forEach((track) => track.stop());
@@ -1298,10 +1323,15 @@ export function App() {
         if (sessionId !== voiceSessionRef.current) return;
         try {
           const message = JSON.parse(event.data);
-          if (message.type === "response.created") setVoiceState("thinking");
+          if (message.type === "response.created") {
+            responseActiveRef.current = true;
+            setVoiceState("thinking");
+          }
           if (message.type === "response.done") {
+            responseActiveRef.current = false;
             setVoiceState("live");
             setStatusText("Live");
+            window.setTimeout(() => flushRealtimeResponse(), 0);
           }
           if (message.type === "response.output_audio_transcript.delta") {
             assistantTranscriptRef.current += message.delta;
@@ -1314,6 +1344,8 @@ export function App() {
             handleToolCallRef.current?.(message).catch((err) => setError(err.message));
           }
           if (message.type === "error") {
+            responseActiveRef.current = false;
+            if (/active response in progress/i.test(message.error?.message || "")) responsePendingRef.current = true;
             setError(message.error?.message || "Realtime error");
             setVoiceState("error");
           }

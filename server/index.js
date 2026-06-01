@@ -882,7 +882,9 @@ function getSettingsState() {
 }
 
 function getDiscussionTopic() {
-  return cleanText(getActiveTopic()?.title || "");
+  const title = cleanText(getActiveTopic()?.title || "");
+  if (!title || title === "默认讨论" || /^新讨论\s/.test(title)) return "";
+  return title;
 }
 
 refreshStoredFiles().catch((error) => {
