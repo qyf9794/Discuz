@@ -6,7 +6,7 @@ export type DiscuzFile = {
   storedName: string;
   mimeType: string;
   size: number;
-  kind: "image" | "audio" | "video" | "pdf" | "doc" | "docx" | "pptx" | "markdown" | "text" | "unknown";
+  kind: "image" | "audio" | "video" | "pdf" | "doc" | "docx" | "pptx" | "spreadsheet" | "markdown" | "text" | "unknown";
   extractedText: string;
   renderedHtml: string;
   summary: string;

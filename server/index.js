@@ -264,8 +264,9 @@ function detectKindFromMetadata(originalName, mimeType = "", storedName = "") {
   if (mime === "application/msword" || ext === ".doc") return "doc";
   if (ext === ".docx") return "docx";
   if (ext === ".pptx") return "pptx";
+  if ([".xlsx", ".xlsm", ".xls", ".csv", ".tsv"].includes(ext)) return "spreadsheet";
   if ([".md", ".markdown"].includes(ext)) return "markdown";
-  if ([".txt", ".csv", ".json", ".log", ".xml", ".html", ".css", ".js", ".ts", ".tsx", ".jsx"].includes(ext)) return "text";
+  if ([".txt", ".json", ".log", ".xml", ".html", ".css", ".js", ".ts", ".tsx", ".jsx"].includes(ext)) return "text";
   return "unknown";
 }
 
@@ -453,6 +454,141 @@ async function extractPptx(filePath) {
   return { text: cleanText(slides.join("\n\n")), html: "" };
 }
 
+function asArray(value) {
+  if (value == null) return [];
+  return Array.isArray(value) ? value : [value];
+}
+
+function columnNameToIndex(value = "") {
+  return String(value || "").split("").reduce((sum, char) => sum * 26 + char.toUpperCase().charCodeAt(0) - 64, 0) - 1;
+}
+
+function cellRefToColumnIndex(ref = "") {
+  const column = String(ref || "").match(/[A-Za-z]+/)?.[0] || "";
+  return column ? columnNameToIndex(column) : -1;
+}
+
+function collectSharedStringText(value) {
+  return collectText(value, []).join("");
+}
+
+function worksheetTargetPath(target = "") {
+  const normalized = String(target || "").replace(/^\/+/, "");
+  if (normalized.startsWith("xl/")) return normalized;
+  return `xl/${normalized}`;
+}
+
+async function extractXlsx(filePath) {
+  const zip = await JSZip.loadAsync(fs.readFileSync(filePath));
+  const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_" });
+  const sharedStringsXml = zip.files["xl/sharedStrings.xml"] ? await zip.files["xl/sharedStrings.xml"].async("string") : "";
+  const sharedStrings = sharedStringsXml
+    ? asArray(parser.parse(sharedStringsXml)?.sst?.si).map(collectSharedStringText)
+    : [];
+  const workbookXml = zip.files["xl/workbook.xml"] ? await zip.files["xl/workbook.xml"].async("string") : "";
+  const relsXml = zip.files["xl/_rels/workbook.xml.rels"] ? await zip.files["xl/_rels/workbook.xml.rels"].async("string") : "";
+  const workbook = workbookXml ? parser.parse(workbookXml) : {};
+  const rels = relsXml ? parser.parse(relsXml) : {};
+  const relMap = new Map(asArray(rels?.Relationships?.Relationship).map((rel) => [rel?.["@_Id"], worksheetTargetPath(rel?.["@_Target"])]));
+  const workbookSheets = asArray(workbook?.workbook?.sheets?.sheet);
+  const sheetEntries = workbookSheets.length
+    ? workbookSheets.map((sheet) => ({
+      name: cleanText(sheet?.["@_name"] || "Sheet"),
+      path: relMap.get(sheet?.["@_r:id"])
+    }))
+    : Object.keys(zip.files)
+      .filter((name) => /^xl\/worksheets\/sheet\d+\.xml$/.test(name))
+      .sort((a, b) => Number(a.match(/sheet(\d+)/)?.[1] || 0) - Number(b.match(/sheet(\d+)/)?.[1] || 0))
+      .map((name, index) => ({ name: `Sheet${index + 1}`, path: name }));
+  const sections = [];
+  let totalChars = 0;
+  const maxChars = 70000;
+  for (const sheet of sheetEntries) {
+    if (!sheet.path || !zip.files[sheet.path] || totalChars >= maxChars) continue;
+    const xml = await zip.files[sheet.path].async("string");
+    const parsed = parser.parse(xml);
+    const rows = asArray(parsed?.worksheet?.sheetData?.row);
+    const renderedRows = [];
+    for (const row of rows.slice(0, 220)) {
+      const cells = [];
+      for (const cell of asArray(row?.c).slice(0, 40)) {
+        const columnIndex = cellRefToColumnIndex(cell?.["@_r"]);
+        while (cells.length < Math.max(0, columnIndex)) cells.push("");
+        let value = "";
+        if (cell?.["@_t"] === "s") value = sharedStrings[Number(cell?.v)] || "";
+        else if (cell?.["@_t"] === "inlineStr") value = collectSharedStringText(cell?.is);
+        else if (cell?.["@_t"] === "b") value = String(cell?.v) === "1" ? "TRUE" : "FALSE";
+        else if (cell?.f != null && cell?.v == null) value = `=${collectText(cell.f, []).join("")}`;
+        else value = cleanText(cell?.v ?? "");
+        cells.push(cleanText(value));
+      }
+      const usefulCells = cells.map((item) => item.trim()).filter(Boolean);
+      if (usefulCells.length) renderedRows.push(cells.join(" | ").replace(/\s+\|/g, " |").replace(/\|\s+/g, "| "));
+      if (renderedRows.length >= 120) break;
+    }
+    const truncatedRows = rows.length > 120 ? `\n... 已截取前 120 行，共 ${rows.length} 行。` : "";
+    const section = `工作表：${sheet.name}\n${renderedRows.join("\n") || "（空工作表）"}${truncatedRows}`;
+    totalChars += section.length;
+    sections.push(section);
+  }
+  return { text: cleanText(sections.join("\n\n").slice(0, maxChars)), html: "" };
+}
+
+function parseDelimitedRows(text, delimiter) {
+  const rows = [];
+  let row = [];
+  let cell = "";
+  let quoted = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    const next = text[index + 1];
+    if (char === "\"") {
+      if (quoted && next === "\"") {
+        cell += "\"";
+        index += 1;
+      } else {
+        quoted = !quoted;
+      }
+    } else if (char === delimiter && !quoted) {
+      row.push(cell);
+      cell = "";
+    } else if ((char === "\n" || char === "\r") && !quoted) {
+      if (char === "\r" && next === "\n") index += 1;
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = "";
+    } else {
+      cell += char;
+    }
+  }
+  row.push(cell);
+  if (row.some((value) => value.trim())) rows.push(row);
+  return rows;
+}
+
+function extractDelimitedSpreadsheet(filePath, delimiter, label) {
+  const text = fs.readFileSync(filePath, "utf8");
+  const rows = parseDelimitedRows(text, delimiter).slice(0, 160);
+  const rendered = rows
+    .map((row) => row.slice(0, 40).map((cell) => cleanText(cell)).join(" | "))
+    .filter((row) => row.replace(/[|\s]/g, ""));
+  const rowCount = parseDelimitedRows(text, delimiter).length;
+  const truncated = rowCount > 160 ? `\n... 已截取前 160 行，共 ${rowCount} 行。` : "";
+  return { text: cleanText(`${label}\n${rendered.join("\n")}${truncated}`), html: "" };
+}
+
+async function extractSpreadsheet(filePath, metadata = {}) {
+  const ext = path.extname(metadata.originalName || filePath).toLowerCase();
+  if (ext === ".xlsx" || ext === ".xlsm") return extractXlsx(filePath);
+  if (ext === ".csv") return extractDelimitedSpreadsheet(filePath, ",", "CSV 表格");
+  if (ext === ".tsv") return extractDelimitedSpreadsheet(filePath, "\t", "TSV 表格");
+  return {
+    text: "已识别为 Excel 表格，但当前仅支持直接读取 .xlsx、.xlsm、.csv 和 .tsv。请将旧版 .xls 转换为 .xlsx 或 .csv 后重新上传。",
+    html: ""
+  };
+}
+
 function responseOutputText(payload) {
   if (typeof payload?.output_text === "string") return cleanText(payload.output_text);
   const parts = [];
@@ -529,6 +665,7 @@ async function extractContentAtPath(filePath, kind, metadata = {}) {
   if (kind === "doc") return extractDoc(filePath);
   if (kind === "docx") return extractDocx(filePath);
   if (kind === "pptx") return extractPptx(filePath);
+  if (kind === "spreadsheet") return extractSpreadsheet(filePath, metadata);
   if (kind === "markdown" || kind === "text") {
     return { text: cleanText(fs.readFileSync(filePath, "utf8")), html: "" };
   }
@@ -1026,17 +1163,21 @@ function buildDiscussionContext() {
     .join("\n");
   return [
     "你是 Discuz，一个用于本地文件语音讨论的 AI 伙伴。你的对话必须紧密围绕当前主讨论文件、用户给出的背景材料和用户刚刚提出的问题。",
-    "语音回复必须短：每次最多 2 句中文，每句尽量不超过 25 个字。不要一次讲完整方案；先推进一个小步骤。需要用户确认时，只问 1 个问题。",
+    "语音风格：更活泼、轻松、有一点笑意，像一位反应快、亲切的讨论搭子。不要严肃播报、不要会议主持腔、不要长篇铺陈。",
+    "语音节奏：说得自然一点，可以略快但不要赶；用短句，语气有起伏。每次最多 2 句中文，每句尽量不超过 25 个字。需要用户确认时，只问 1 个问题。",
+    "表达习惯：可以用“好呀”“可以”“这个点不错”“我先看这块”这类自然口语开头，但不要过度卖萌、不要夸张，不要使用表情符号。",
+    "开场规则：语音刚开始或用户还没有明确提出讨论内容时，不要上来就概括主题或调用 propose_discussion_topic。先自然打招呼，例如“嗨，我在”，再问一句“你想先聊哪块？”等用户说明。",
     "默认讨论对象是当前打开的主题文件、前台弹出的预览窗口和白板。除非用户明确要求讨论其他资源文件，或当前信息确实不足，否则不要主动把讨论焦点切到其他文件。",
     "讨论主题不只来自主题文件，也来自用户在底部输入框提交的主题、观点、问题和链接。用户的文字输入优先级很高，要把它当作当前讨论指令的一部分。",
-    "首先必须和用户确认讨论主题：当当前还没有已确认讨论主题时，你收到用户语音或文字后，若能从用户刚说的话、当前主题文件或图片摘要中概括主题，就必须先调用 propose_discussion_topic 生成拟确认主题给用户确认。只有完全无法概括时，才用一句话询问用户想讨论什么主题。主题确认前，不要规划讨论方向、不要生成 todo，也不要进入长期展开。",
+    "主题确认节奏：先和用户轻松聊一句，弄清用户想做什么。只有当用户已经说出具体讨论内容、问题或目标后，且能从用户刚说的话、当前主题文件或图片摘要中概括主题，才调用 propose_discussion_topic 生成拟确认主题给用户确认。用户还没明确说要讨论什么时，只打招呼并询问，不要主动拟主题。主题确认前，不要规划讨论方向、不要生成 todo，也不要进入长期展开。",
     "随着讨论深入，如果你判断已经形成更准确的讨论主题，必须调用 propose_discussion_topic 请用户确认。若你发现用户正在严重偏离已确认主题，也要调用 propose_discussion_topic 提醒用户，并说明是继续原主题还是确认更换主题。",
-    "讨论方向 todo 的节奏：主题刚确认后，先围绕主题文件或用户目标进行简短交流。如果用户要求规划方向，或已经有至少几轮实质讨论并且你理解了用户关注点，就调用 propose_discussion_directions 提出 3 到 6 个方向等用户确认。用户确认后，界面会在主题区显示 todo。若用户要求调整方向，调用 update_discussion_directions 用完整新列表替换。每完成一个方向，调用 complete_discussion_direction 标记完成，并写一条简洁记录。",
+    "讨论方向 todo 的节奏：主题一旦被用户确认，就立即调用 propose_discussion_directions 提出 3 到 5 个方向等用户确认，不要再等待几轮讨论。语音只轻轻提示“我先列几个方向，你看要不要删改”。用户确认后，界面会在主题区显示 todo。用户不满意时，优先调用 update_discussion_directions 用完整新列表快速替换；用户只想删掉某一条时，可以提醒他点该条右侧删除按钮。每完成一个方向，调用 complete_discussion_direction 标记完成，并写一条简洁记录。",
     "如果收到系统事件提示当前主题文件已被删除，你必须立即停止基于该文件继续分析，并询问用户是停止此主题的讨论，还是更换新的讨论主题/上传新的主题文件。",
     "每次重新打开语音时，你必须先读取下面的讨论记忆，承接此前已经形成的要点、结论、问题和行动项。不要让用户重复已经讨论过的背景；如果记忆和当前文件冲突，以当前文件为准并说明差异。",
     "记录窗口保存的是讨论要点，不是逐句转写。不要把自己或用户的原话逐句写入记录；只有在形成一个完整观点、阶段性结论、待确认问题或行动项后，才调用 save_discussion_note 保存一段简洁总结。每条记录应是一小段话，优先概括“讨论了什么、形成了什么判断、下一步是什么”。",
     "你可以按需调用工具打开白板、临时草稿、媒体窗口，或打开某个主题/资源文件的重点预览窗口辅助讨论。临时窗口用于当次讨论，关闭后视为临时内容；只有用户明确要求保存时，才把内容作为成果或资源延续。",
     "主题区文件是阅读和主要讨论中心；如果需要修改主题文件内容，先调用 copy_file_to_generated，把副本放到 AI 临时生成文案区编辑，不要直接改原主题文件。",
+    "如果主题文件或背景材料是 Excel/CSV 表格，你可以基于已提取的工作表、表头和行内容讨论数据结构、异常值、趋势、统计口径、待补充字段和下一步分析。",
     "资源用户区文件只作为阅读和参考上下文，不纳入主要讨论对象，除非用户明确要求打开某个资源文件作为前台临时主题讨论。资源原件不能编辑；需要修改时必须先复制到 AI 临时生成文案区。",
     "AI 临时生成文案区的文件可以编辑、修改、迭代。所有文件都可以通过打开前台预览窗口临时成为当前讨论对象，但这不会改变它们所属区域或最终成果状态。",
     "用户可以用语音要求你操控界面：打开/关闭前台文件窗口、打开无限白板或临时文档、保存或清空白板/临时文档、复制文件到临时区、把文件移动到主题区/资源区/临时区。遇到这些请求时应调用对应工具完成，不只用语言说明。",
@@ -1808,14 +1949,14 @@ app.post("/api/realtime/session", async (req, res) => {
       {
         type: "function",
         name: "propose_discussion_directions",
-        description: "Propose 3 to 6 discussion directions after the topic is confirmed and either the user asks for directions or several substantive turns have clarified the user's focus. This only asks the user to confirm; it does not save the todo list yet.",
+        description: "Propose 3 to 5 discussion directions immediately after the user confirms the topic. This only asks the user to confirm; it does not save the todo list yet.",
         parameters: {
           type: "object",
           properties: {
             directions: {
               type: "array",
               minItems: 3,
-              maxItems: 6,
+              maxItems: 5,
               items: { type: "string" },
               description: "Concise Chinese discussion directions for the current confirmed topic."
             },
@@ -1907,7 +2048,7 @@ app.post("/api/realtime/session", async (req, res) => {
           interrupt_response: false
         }
       },
-      output: { voice: "marin" }
+      output: { voice: "shimmer" }
     }
   };
   const fd = new FormData();

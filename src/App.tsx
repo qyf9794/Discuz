@@ -873,7 +873,7 @@ export function App() {
           role: "user",
           content: [{
             type: "input_text",
-            text: `系统事件：用户已确认讨论主题《${title}》。请先阅读当前主题文件和用户输入；如果目标还不清楚，先询问用户想重点讨论什么。不要立刻提出讨论方向。经过几轮实质讨论、理解用户关注点后，再调用 propose_discussion_directions 提出 3 到 6 个方向等用户确认。`
+            text: `系统事件：用户已确认讨论主题《${title}》。请立即基于当前主题、主题文件和用户输入调用 propose_discussion_directions，提出 3 到 5 个讨论方向供用户确认。语音只简单说“我先列几个方向，你看要不要删改”。如果用户不满意，优先调用 update_discussion_directions 快速替换完整列表；如果用户只是不想要某一条，提醒他可以直接点圆圈右侧删除。`
           }]
         }
       }));
@@ -1138,7 +1138,7 @@ export function App() {
         const directions = (Array.isArray(args.directions) ? args.directions : [])
           .map((item: unknown) => String(item || "").trim())
           .filter(Boolean)
-          .slice(0, 6);
+          .slice(0, 5);
         if (directions.length) {
           setDirectionProposal({ directions, reason: String(args.reason || "").trim() });
           output = { ok: true, proposed: directions };
