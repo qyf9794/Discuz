@@ -1,6 +1,6 @@
 export type DiscuzFile = {
   id: string;
-  role: "primary" | "context";
+  role: "primary" | "context" | "generated";
   originalName: string;
   storedName: string;
   mimeType: string;
@@ -9,6 +9,7 @@ export type DiscuzFile = {
   extractedText: string;
   renderedHtml: string;
   summary: string;
+  sortOrder: number;
   createdAt: string;
   updatedAt: string;
   previewUrl: string;
@@ -56,5 +57,6 @@ export type AppState = {
   settings?: {
     openaiApiKeyConfigured: boolean;
     openaiApiKeySource: "local" | "env" | "none";
+    wallpaperUrl: string;
   };
 };

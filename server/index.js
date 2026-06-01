@@ -36,6 +36,7 @@ db.exec(`
     extracted_text TEXT NOT NULL DEFAULT '',
     rendered_html TEXT NOT NULL DEFAULT '',
     summary TEXT NOT NULL DEFAULT '',
+    sort_order INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
@@ -83,6 +84,9 @@ const fileColumns = db.prepare("PRAGMA table_info(files)").all().map((column) =>
 if (!fileColumns.includes("rendered_html")) {
   db.exec("ALTER TABLE files ADD COLUMN rendered_html TEXT NOT NULL DEFAULT ''");
 }
+if (!fileColumns.includes("sort_order")) {
+  db.exec("ALTER TABLE files ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0");
+}
 
 const upload = multer({
   storage: multer.diskStorage({
@@ -105,6 +109,23 @@ app.use("/api/raw", express.static(uploadDir));
 function now() {
   return new Date().toISOString();
 }
+
+function nextFileSortOrder(role) {
+  const row = db.prepare("SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order FROM files WHERE role = ?").get(role);
+  return Number(row?.next_order ?? 0);
+}
+
+function normalizePrimarySortOrder() {
+  const rows = db.prepare(`
+    SELECT id FROM files
+    WHERE role = 'primary'
+    ORDER BY sort_order ASC, created_at DESC
+  `).all();
+  const update = db.prepare("UPDATE files SET sort_order = ? WHERE id = ?");
+  rows.forEach((row, index) => update.run(index, row.id));
+}
+
+normalizePrimarySortOrder();
 
 function decodeMojibakeFilename(value) {
   const filename = String(value || "unknown");
@@ -135,6 +156,7 @@ function rowToFile(row) {
     extractedText: row.extracted_text,
     renderedHtml: row.rendered_html,
     summary: row.summary,
+    sortOrder: row.sort_order,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     previewUrl: `/api/raw/${encodeURIComponent(row.stored_name)}`
@@ -277,12 +299,13 @@ async function persistUploadedFile(file, role) {
   }
   const createdAt = now();
   const summary = summarizeText(extractedText, originalName);
+  const sortOrder = nextFileSortOrder(role);
 
   db.prepare(`
     INSERT INTO files (
       id, role, original_name, stored_name, mime_type, size, kind,
-      extracted_text, rendered_html, summary, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      extracted_text, rendered_html, summary, sort_order, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     role,
@@ -294,12 +317,103 @@ async function persistUploadedFile(file, role) {
     extractedText,
     renderedHtml,
     summary,
+    sortOrder,
     createdAt,
     createdAt
   );
 
   db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
     .run(crypto.randomUUID(), role === "primary" ? "Primary file" : "Context file", originalName, createdAt);
+
+  return rowToFile(db.prepare("SELECT * FROM files WHERE id = ?").get(id));
+}
+
+function persistGeneratedFile(title, text) {
+  const id = crypto.randomUUID();
+  const originalName = normalizeUploadedFilename(title || `AI临时文案-${shortLocalTime(now()).replace(/[/: ]/g, "-")}.md`);
+  const nameWithExt = path.extname(originalName) ? originalName : `${originalName}.md`;
+  const storedName = `${id}.md`;
+  const content = cleanText(text);
+  const filePath = path.join(uploadDir, storedName);
+  fs.writeFileSync(filePath, content, "utf8");
+  const createdAt = now();
+  const summary = summarizeText(content, nameWithExt);
+  const sortOrder = nextFileSortOrder("generated");
+
+  db.prepare(`
+    INSERT INTO files (
+      id, role, original_name, stored_name, mime_type, size, kind,
+      extracted_text, rendered_html, summary, sort_order, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    "generated",
+    nameWithExt,
+    storedName,
+    "text/markdown",
+    Buffer.byteLength(content, "utf8"),
+    "markdown",
+    content,
+    "",
+    summary,
+    sortOrder,
+    createdAt,
+    createdAt
+  );
+
+  db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
+    .run(crypto.randomUUID(), "AI draft", nameWithExt, createdAt);
+
+  return rowToFile(db.prepare("SELECT * FROM files WHERE id = ?").get(id));
+}
+
+function copyFileTextForEditing(row) {
+  const file = rowToFile(row);
+  if (cleanText(file.extractedText)) return file.extractedText;
+  if (file.kind === "image") {
+    return `# ${file.originalName}\n\n![${file.originalName}](${file.previewUrl})\n\n${file.summary}`;
+  }
+  return `# ${file.originalName}\n\n${file.summary || "No readable text extracted."}\n\n原文件：${file.previewUrl}`;
+}
+
+function copyFileTitle(originalName) {
+  const parsed = path.parse(normalizeUploadedFilename(originalName));
+  return `${parsed.name}-临时编辑.md`;
+}
+
+function copyStoredFileAsGenerated(row) {
+  const id = crypto.randomUUID();
+  const ext = path.extname(row.stored_name) || path.extname(row.original_name);
+  const storedName = `${id}${ext}`;
+  const sourcePath = path.join(uploadDir, row.stored_name);
+  const targetPath = path.join(uploadDir, storedName);
+  fs.copyFileSync(sourcePath, targetPath);
+  const createdAt = now();
+  const sortOrder = nextFileSortOrder("generated");
+
+  db.prepare(`
+    INSERT INTO files (
+      id, role, original_name, stored_name, mime_type, size, kind,
+      extracted_text, rendered_html, summary, sort_order, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    "generated",
+    row.original_name,
+    storedName,
+    row.mime_type,
+    row.size,
+    row.kind,
+    row.extracted_text || "",
+    row.rendered_html || "",
+    row.summary || "",
+    sortOrder,
+    createdAt,
+    createdAt
+  );
+
+  db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
+    .run(crypto.randomUUID(), "AI draft", row.original_name, createdAt);
 
   return rowToFile(db.prepare("SELECT * FROM files WHERE id = ?").get(id));
 }
@@ -355,7 +469,13 @@ async function refreshStoredFiles() {
 }
 
 function getFiles() {
-  return db.prepare("SELECT * FROM files ORDER BY role = 'primary' DESC, created_at DESC").all().map(rowToFile);
+  return db.prepare(`
+    SELECT * FROM files
+    ORDER BY
+      role = 'primary' DESC,
+      CASE WHEN role = 'primary' THEN sort_order ELSE NULL END ASC,
+      created_at DESC
+  `).all().map(rowToFile);
 }
 
 function getNotes() {
@@ -427,7 +547,8 @@ function getSettingsState() {
   const envKey = cleanText(process.env.OPENAI_API_KEY || "");
   return {
     openaiApiKeyConfigured: Boolean(localKey || envKey),
-    openaiApiKeySource: localKey ? "local" : envKey ? "env" : "none"
+    openaiApiKeySource: localKey ? "local" : envKey ? "env" : "none",
+    wallpaperUrl: cleanText(getSetting("wallpaper_url"))
   };
 }
 
@@ -470,6 +591,12 @@ function buildDiscussionContext() {
     "每次重新打开语音时，你必须先读取下面的讨论记忆，承接此前已经形成的要点、结论、问题和行动项。不要让用户重复已经讨论过的背景；如果记忆和当前文件冲突，以当前文件为准并说明差异。",
     "记录窗口保存的是讨论要点，不是逐句转写。不要把自己或用户的原话逐句写入记录；只有在形成一个完整观点、阶段性结论、待确认问题或行动项后，才调用 save_discussion_note 保存一段简洁总结。每条记录应是一小段话，优先概括“讨论了什么、形成了什么判断、下一步是什么”。",
     "你可以按需调用工具打开白板、临时草稿、媒体窗口，或打开某个主题/资源文件的重点预览窗口辅助讨论。临时窗口用于当次讨论，关闭后视为临时内容；只有用户明确要求保存时，才把内容作为成果或资源延续。",
+    "主题区文件是阅读和主要讨论中心；如果需要修改主题文件内容，先调用 copy_file_to_generated，把副本放到 AI 临时生成文案区编辑，不要直接改原主题文件。",
+    "资源用户区文件只作为阅读和参考上下文，不纳入主要讨论对象，除非用户明确要求打开某个资源文件作为前台临时主题讨论。资源原件不能编辑；需要修改时必须先复制到 AI 临时生成文案区。",
+    "AI 临时生成文案区的文件可以编辑、修改、迭代。所有文件都可以通过打开前台预览窗口临时成为当前讨论对象，但这不会改变它们所属区域或最终成果状态。",
+    "用户可以用语音要求你操控界面：打开/关闭前台文件窗口、打开无限白板或临时文档、保存或清空白板/临时文档、复制文件到临时区、把文件移动到主题区/资源区/临时区。遇到这些请求时应调用对应工具完成，不只用语言说明。",
+    "当你需要生成文案、副本、修改稿或阶段性成果草稿时，先调用 create_generated_file，把它放入资源窗口下半区的 AI 临时生成文案。用户可以先打开编辑并“保存编辑”，这只表示编辑确认；只有用户进一步“确认为成果”后，它才会进入讨论主题窗口，作为最终成果继续讨论。",
+    "如果用户要求把某个资源文件、AI 临时文案或修改稿作为成果继续讨论，你可以调用 add_file_to_topic，把它加入讨论主题窗口。加入后它就是主讨论文件，应作为后续重点讨论对象。",
     "不要泛泛而谈，不要把话题扩展到无关方向。每次回复优先给出中肯、可执行、能推进讨论的意见。",
     "如果信息不足，先指出缺口，再建议用户补充哪类材料。需要资料时，优先调用本地背景材料检索；本地资料不足时，再调用联网搜索。",
     "引用资料时必须说明来源文件名或网页标题。你的默认任务是提炼关键观点、结论、争议点、风险和下一步，不主动修改原文件。",
@@ -567,6 +694,29 @@ app.delete("/api/files/:id", (req, res) => {
   res.json({ files: getFiles(), activities: getActivities() });
 });
 
+app.post("/api/files/primary/reorder", (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map((id) => cleanText(id)).filter(Boolean) : [];
+  const existingIds = db.prepare(`
+    SELECT id FROM files
+    WHERE role = 'primary'
+    ORDER BY sort_order ASC, created_at DESC
+  `).all().map((row) => row.id);
+  const orderedIds = [
+    ...ids.filter((id, index) => existingIds.includes(id) && ids.indexOf(id) === index),
+    ...existingIds.filter((id) => !ids.includes(id))
+  ];
+  const update = db.prepare("UPDATE files SET sort_order = ? WHERE id = ? AND role = 'primary'");
+  db.exec("BEGIN");
+  try {
+    orderedIds.forEach((id, index) => update.run(index, id));
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+  res.json({ files: getFiles() });
+});
+
 app.post("/api/discussion/reset", (_req, res) => {
   db.prepare("SELECT * FROM files").all().forEach(removeStoredFile);
   db.exec(`
@@ -598,6 +748,26 @@ app.post("/api/settings/openai-key", (req, res) => {
   res.json(getSettingsState());
 });
 
+app.post("/api/settings/wallpaper", upload.single("wallpaper"), (req, res) => {
+  const file = req.file;
+  if (!file) return res.status(400).json({ error: "Missing wallpaper file" });
+  if (!String(file.mimetype || "").startsWith("image/")) {
+    fs.rmSync(file.path, { force: true });
+    return res.status(400).json({ error: "Wallpaper must be an image" });
+  }
+  setSetting("wallpaper_url", `/api/raw/${encodeURIComponent(file.filename)}`);
+  db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
+    .run(crypto.randomUUID(), "Wallpaper", file.originalname, now());
+  res.json(getSettingsState());
+});
+
+app.delete("/api/settings/wallpaper", (_req, res) => {
+  deleteSetting("wallpaper_url");
+  db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
+    .run(crypto.randomUUID(), "Wallpaper", "Default wallpaper", now());
+  res.json(getSettingsState());
+});
+
 app.post("/api/files/primary", upload.array("files", 20), async (req, res) => {
   const uploaded = req.files || [];
   if (!uploaded.length) return res.status(400).json({ error: "Missing files" });
@@ -612,6 +782,104 @@ app.post("/api/files/context", upload.array("files", 20), async (req, res) => {
   const files = [];
   for (const file of uploaded) files.push(await persistUploadedFile(file, "context"));
   res.json({ uploaded: files, files: getFiles(), activities: getActivities() });
+});
+
+app.post("/api/files/generated", (req, res) => {
+  const title = cleanText(req.body?.title || "AI临时文案.md");
+  const text = cleanText(req.body?.text || "");
+  if (!text) return res.status(400).json({ error: "Missing generated file text" });
+  const file = persistGeneratedFile(title, text);
+  res.json({ file, files: getFiles(), activities: getActivities() });
+});
+
+app.post("/api/files/generated/upload", upload.array("files", 20), async (req, res) => {
+  const uploaded = req.files || [];
+  if (!uploaded.length) return res.status(400).json({ error: "Missing files" });
+  const files = [];
+  for (const file of uploaded) files.push(await persistUploadedFile(file, "generated"));
+  res.json({ uploaded: files, file: files[0], files: getFiles(), activities: getActivities() });
+});
+
+app.post("/api/files/:id/content", (req, res) => {
+  const row = db.prepare("SELECT * FROM files WHERE id = ?").get(req.params.id);
+  if (!row) return res.status(404).json({ error: "File not found" });
+  if (!["generated", "primary"].includes(row.role) || !["markdown", "text"].includes(row.kind)) {
+    return res.status(400).json({ error: "Only editable generated or primary text files can be updated" });
+  }
+  const text = cleanText(req.body?.text || "");
+  const filePath = path.join(uploadDir, row.stored_name);
+  fs.writeFileSync(filePath, text, "utf8");
+  const updatedAt = now();
+  db.prepare(`
+    UPDATE files
+    SET extracted_text = ?, summary = ?, size = ?, updated_at = ?
+    WHERE id = ?
+  `).run(text, summarizeText(text, row.original_name), Buffer.byteLength(text, "utf8"), updatedAt, row.id);
+  db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
+    .run(crypto.randomUUID(), "File edited", row.original_name, updatedAt);
+  res.json({ file: rowToFile(db.prepare("SELECT * FROM files WHERE id = ?").get(row.id)), files: getFiles(), activities: getActivities() });
+});
+
+app.post("/api/files/:id/promote-primary", (req, res) => {
+  const row = db.prepare("SELECT * FROM files WHERE id = ?").get(req.params.id);
+  if (!row) return res.status(404).json({ error: "File not found" });
+  if (row.role === "primary") {
+    return res.json({ file: rowToFile(row), files: getFiles(), activities: getActivities() });
+  }
+  if (!["context", "generated"].includes(row.role)) {
+    return res.status(400).json({ error: "Only resource or AI generated files can be added to topic" });
+  }
+  const updatedAt = now();
+  db.prepare("UPDATE files SET role = 'primary', sort_order = ?, updated_at = ? WHERE id = ?")
+    .run(nextFileSortOrder("primary"), updatedAt, row.id);
+  db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
+    .run(crypto.randomUUID(), "Outcome file", row.original_name, updatedAt);
+  res.json({ file: rowToFile(db.prepare("SELECT * FROM files WHERE id = ?").get(row.id)), files: getFiles(), activities: getActivities() });
+});
+
+app.post("/api/files/:id/demote-context", (req, res) => {
+  const row = db.prepare("SELECT * FROM files WHERE id = ?").get(req.params.id);
+  if (!row) return res.status(404).json({ error: "File not found" });
+  if (row.role === "context") {
+    return res.json({ file: rowToFile(row), files: getFiles(), activities: getActivities() });
+  }
+  if (row.role !== "primary") {
+    return res.status(400).json({ error: "Only topic files can be moved back to resources" });
+  }
+  const updatedAt = now();
+  db.prepare("UPDATE files SET role = 'context', sort_order = ?, updated_at = ? WHERE id = ?")
+    .run(nextFileSortOrder("context"), updatedAt, row.id);
+  db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
+    .run(crypto.randomUUID(), "Background file", row.original_name, updatedAt);
+  res.json({ file: rowToFile(db.prepare("SELECT * FROM files WHERE id = ?").get(row.id)), files: getFiles(), activities: getActivities() });
+});
+
+app.post("/api/files/:id/role", (req, res) => {
+  const row = db.prepare("SELECT * FROM files WHERE id = ?").get(req.params.id);
+  if (!row) return res.status(404).json({ error: "File not found" });
+  const role = cleanText(req.body?.role || "");
+  if (!["primary", "context", "generated"].includes(role)) {
+    return res.status(400).json({ error: "Unsupported file role" });
+  }
+  if (row.role === role) {
+    return res.json({ file: rowToFile(row), files: getFiles(), activities: getActivities() });
+  }
+  const updatedAt = now();
+  db.prepare("UPDATE files SET role = ?, sort_order = ?, updated_at = ? WHERE id = ?")
+    .run(role, nextFileSortOrder(role), updatedAt, row.id);
+  const label = role === "primary" ? "Outcome file" : role === "context" ? "Background file" : "AI draft";
+  db.prepare("INSERT INTO activities (id, label, detail, created_at) VALUES (?, ?, ?, ?)")
+    .run(crypto.randomUUID(), label, row.original_name, updatedAt);
+  res.json({ file: rowToFile(db.prepare("SELECT * FROM files WHERE id = ?").get(row.id)), files: getFiles(), activities: getActivities() });
+});
+
+app.post("/api/files/:id/copy-generated", (req, res) => {
+  const row = db.prepare("SELECT * FROM files WHERE id = ?").get(req.params.id);
+  if (!row) return res.status(404).json({ error: "File not found" });
+  const file = row.kind === "markdown" || row.kind === "text"
+    ? persistGeneratedFile(copyFileTitle(row.original_name), copyFileTextForEditing(row))
+    : copyStoredFileAsGenerated(row);
+  res.json({ file, files: getFiles(), activities: getActivities() });
 });
 
 app.get("/api/files/:id/preview", (req, res) => {
@@ -781,12 +1049,51 @@ app.post("/api/realtime/session", async (req, res) => {
       },
       {
         type: "function",
-        name: "open_file_preview",
-        description: "Open a frontmost preview window for a topic or resource file when it should become the focused discussion object.",
+        name: "save_discussion_tool",
+        description: "Save the current whiteboard or temporary draft into the AI temporary generated files section.",
         parameters: {
           type: "object",
           properties: {
-            role: { type: "string", enum: ["primary", "context"], description: "primary for topic files, context for resource files." },
+            tool: { type: "string", enum: ["whiteboard", "draft"], description: "The tool to save. Use the currently open tool if the user says save this window." }
+          },
+          required: ["tool"],
+          additionalProperties: false
+        }
+      },
+      {
+        type: "function",
+        name: "clear_discussion_tool",
+        description: "Clear all content from the whiteboard or temporary draft. Use only when the user explicitly asks to clear it.",
+        parameters: {
+          type: "object",
+          properties: {
+            tool: { type: "string", enum: ["whiteboard", "draft"], description: "The tool to clear." }
+          },
+          required: ["tool"],
+          additionalProperties: false
+        }
+      },
+      {
+        type: "function",
+        name: "close_foreground_window",
+        description: "Close the foreground tool, file preview/editor, record preview, or all foreground windows.",
+        parameters: {
+          type: "object",
+          properties: {
+            target: { type: "string", enum: ["tool", "file", "record", "all"], description: "Which foreground window to close." }
+          },
+          required: ["target"],
+          additionalProperties: false
+        }
+      },
+      {
+        type: "function",
+        name: "open_file_preview",
+        description: "Open a frontmost preview window for a topic, resource, or temporary generated file when it should become the temporary focused discussion object.",
+        parameters: {
+          type: "object",
+          properties: {
+            role: { type: "string", enum: ["primary", "context", "generated"], description: "primary for topic files, context for resource files, generated for temporary editable files." },
             query: { type: "string", description: "Optional part of the filename to open. Leave empty to open the first matching file." }
           },
           required: ["role"],
@@ -811,6 +1118,97 @@ app.post("/api/realtime/session", async (req, res) => {
             }
           },
           required: ["kind", "text"],
+          additionalProperties: false
+        }
+      },
+      {
+        type: "function",
+        name: "create_generated_file",
+        description: "Create an AI temporary generated markdown draft, copy, edited document, or stage result in the lower generated section of resources. It remains temporary until the user confirms it as an outcome.",
+        parameters: {
+          type: "object",
+          properties: {
+            title: {
+              type: "string",
+              description: "A concise filename. A .md extension will be appended when missing."
+            },
+            text: {
+              type: "string",
+              description: "Markdown content for the generated temporary file."
+            }
+          },
+          required: ["title", "text"],
+          additionalProperties: false
+        }
+      },
+      {
+        type: "function",
+        name: "copy_file_to_generated",
+        description: "Copy a topic or resource file into the AI temporary generated section so it can be edited without changing the original file.",
+        parameters: {
+          type: "object",
+          properties: {
+            role: { type: "string", enum: ["primary", "context", "generated"], description: "The current area of the source file." },
+            query: { type: "string", description: "Part of the source filename to copy." }
+          },
+          required: ["role", "query"],
+          additionalProperties: false
+        }
+      },
+      {
+        type: "function",
+        name: "add_file_to_topic",
+        description: "Add an existing resource file or AI temporary generated file to the topic panel as an outcome for further focused discussion.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "Part of the filename to add to the topic panel. Leave empty only when there is exactly one suitable resource or generated file."
+            }
+          },
+          required: ["query"],
+          additionalProperties: false
+        }
+      },
+      {
+        type: "function",
+        name: "move_file_to_area",
+        description: "Move a file to the topic area, user resource area, or AI temporary file area. Moving to generated creates a temporary copy when the source is not already generated.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "Part of the filename to move or copy."
+            },
+            role: {
+              type: "string",
+              enum: ["primary", "context", "generated"],
+              description: "primary = topic area, context = user resource area, generated = AI temporary file area."
+            }
+          },
+          required: ["query", "role"],
+          additionalProperties: false
+        }
+      },
+      {
+        type: "function",
+        name: "update_generated_file",
+        description: "Replace the content of an editable AI temporary text/markdown file. Use when the user asks you to revise or edit a temporary document by voice.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "Part of the generated filename to edit."
+            },
+            text: {
+              type: "string",
+              description: "The full new markdown/text content to save into the temporary file."
+            }
+          },
+          required: ["query", "text"],
           additionalProperties: false
         }
       },

@@ -1,6 +1,7 @@
 import {
   Check,
   CheckCircle2,
+  Copy,
   FileText,
   FilePlus2,
   Globe2,
@@ -8,8 +9,10 @@ import {
   Maximize2,
   Minimize2,
   Mic,
+  Minus,
   Music,
   PenLine,
+  Plus,
   Search,
   Send,
   Settings2,
@@ -19,7 +22,7 @@ import {
   X
 } from "lucide-react";
 import { ChangeEvent, DragEvent, forwardRef, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { Dispatch, PointerEvent as ReactPointerEvent, ReactNode, RefObject, SetStateAction } from "react";
+import type { CSSProperties, Dispatch, PointerEvent as ReactPointerEvent, ReactNode, RefObject, SetStateAction } from "react";
 import type { AppState, DiscussionRecord, DiscuzFile, Note } from "./types";
 
 const emptyState: AppState = {
@@ -29,7 +32,7 @@ const emptyState: AppState = {
   discussionInputs: [],
   discussionTopic: "",
   activities: [],
-  settings: { openaiApiKeyConfigured: false, openaiApiKeySource: "none" }
+  settings: { openaiApiKeyConfigured: false, openaiApiKeySource: "none", wallpaperUrl: "" }
 };
 type TopicProposal = { title: string; reason: string; intent: "confirm" | "drift" };
 type SettingsState = NonNullable<AppState["settings"]>;
@@ -37,6 +40,73 @@ type VoiceState = "idle" | "connecting" | "live" | "thinking" | "error";
 type SearchResult = { title: string; url: string; snippet: string; source: string };
 type PanelId = "topic" | "resources" | "record";
 type ToolId = "whiteboard" | "draft" | "image" | "video" | "audio";
+type StatusLogEntry = { id: string; kind: "status" | "error"; text: string; createdAt: string };
+const fileDragType = "application/x-discuz-file-id";
+type AudioContextConstructor = typeof AudioContext;
+type VoiceMeter = {
+  context: AudioContext;
+  inputAnalyser?: AnalyserNode;
+  outputAnalyser?: AnalyserNode;
+  inputData?: Uint8Array<ArrayBuffer>;
+  outputData?: Uint8Array<ArrayBuffer>;
+  inputSource?: MediaStreamAudioSourceNode;
+  outputSource?: MediaStreamAudioSourceNode;
+  frameId: number;
+};
+
+function moveItemByDrop<T extends { id: string }>(items: T[], draggedId: string, targetId: string, after: boolean) {
+  const fromIndex = items.findIndex((item) => item.id === draggedId);
+  const toIndex = items.findIndex((item) => item.id === targetId);
+  if (fromIndex < 0 || toIndex < 0 || draggedId === targetId) return items;
+  const next = [...items];
+  const [dragged] = next.splice(fromIndex, 1);
+  const targetIndex = next.findIndex((item) => item.id === targetId);
+  next.splice(after ? targetIndex + 1 : targetIndex, 0, dragged);
+  return next;
+}
+
+function shouldDropAfter(event: DragEvent<HTMLElement>) {
+  const rect = event.currentTarget.getBoundingClientRect();
+  const midY = rect.top + rect.height / 2;
+  const midX = rect.left + rect.width / 2;
+  const nearSameRow = Math.abs(event.clientY - midY) < rect.height * 0.24;
+  return event.clientY > midY || (nearSameRow && event.clientX > midX);
+}
+
+function readAnalyserLevel(analyser?: AnalyserNode, data?: Uint8Array<ArrayBuffer>) {
+  if (!analyser || !data) return 0;
+  analyser.getByteTimeDomainData(data);
+  let sum = 0;
+  for (const value of data) {
+    const centered = (value - 128) / 128;
+    sum += centered * centered;
+  }
+  return Math.min(1, Math.sqrt(sum / data.length) * 4.8);
+}
+
+function voiceStartErrorMessage(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error || "");
+  const name = error instanceof DOMException ? error.name : "";
+  if (name === "NotAllowedError" || name === "SecurityError" || /permission denied|notallowed|denied/i.test(message)) {
+    return "麦克风权限被拒绝。请在浏览器地址栏或站点设置中允许 localhost 使用麦克风，并确认系统设置允许当前浏览器使用麦克风，然后刷新页面再试。";
+  }
+  if (name === "NotFoundError" || /requested device not found|no.*microphone|not found/i.test(message)) {
+    return "没有找到可用麦克风。请连接或启用麦克风后再试。";
+  }
+  if (name === "NotReadableError" || /could not start|not readable|in use/i.test(message)) {
+    return "麦克风暂时不可用，可能被其他应用占用。请关闭占用麦克风的应用后再试。";
+  }
+  return message || "无法启动语音。";
+}
+
+function loadStoredJson<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) as T : fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 function shortTime(value: string) {
   return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit" }).format(new Date(value));
@@ -54,47 +124,91 @@ async function uploadFiles(endpoint: string, field: string, files: File[]) {
   return response.json();
 }
 
+function setCardDragImage(event: DragEvent<HTMLElement>, mark: "promote" | "demote") {
+  const source = event.currentTarget;
+  const rect = source.getBoundingClientRect();
+  const clone = source.cloneNode(true) as HTMLElement;
+  clone.classList.add("drag-ghost");
+  clone.classList.remove("selected", "dragging-card");
+  clone.querySelector(".card-actions")?.remove();
+  clone.querySelector(".card-delete")?.remove();
+  clone.querySelector(".transfer-badge")?.remove();
+  const badge = document.createElement("span");
+  badge.className = `transfer-badge ${mark} drag-image-badge`;
+  badge.textContent = mark === "promote" ? "+" : "-";
+  clone.appendChild(badge);
+  clone.style.width = `${rect.width}px`;
+  clone.style.height = `${rect.height}px`;
+  clone.style.position = "fixed";
+  clone.style.left = "-10000px";
+  clone.style.top = "-10000px";
+  clone.style.margin = "0";
+  document.body.appendChild(clone);
+  event.dataTransfer.setDragImage(clone, rect.width / 2, Math.min(rect.height / 2, 120));
+  window.setTimeout(() => clone.remove(), 0);
+}
+
 export function App() {
   const [state, setState] = useState<AppState>(emptyState);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [dragTarget, setDragTarget] = useState<"primary" | "context" | null>(null);
+  const [dragTarget, setDragTarget] = useState<DiscuzFile["role"] | null>(null);
+  const [draggingFile, setDraggingFile] = useState<{ id: string; role: DiscuzFile["role"] } | null>(null);
   const [query, setQuery] = useState("");
   const [contextHits, setContextHits] = useState<Array<{ file: DiscuzFile; snippet: string }>>([]);
   const [webHits, setWebHits] = useState<SearchResult[]>([]);
   const [webEnabled, setWebEnabled] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsPopoverStyle, setSettingsPopoverStyle] = useState<CSSProperties>({});
   const [leftWidth, setLeftWidth] = useState(63);
   const [topHeight, setTopHeight] = useState(75);
   const [fullscreenPanel, setFullscreenPanel] = useState<PanelId | null>(null);
   const [activeTool, setActiveTool] = useState<ToolId | null>(null);
   const [previewFileId, setPreviewFileId] = useState<string | null>(null);
   const [previewRecordId, setPreviewRecordId] = useState<string | null>(null);
+  const [generatedEditorId, setGeneratedEditorId] = useState<string | null>(null);
   const [discussionText, setDiscussionText] = useState("");
   const [topicProposal, setTopicProposal] = useState<TopicProposal | null>(null);
   const [draftText, setDraftText] = useState(() => localStorage.getItem("discuz-draft") || "");
-  const [boardItems, setBoardItems] = useState<Array<{ id: string; kind: "text" | "image"; value: string; x: number; y: number }>>([]);
-  const [drawPoints, setDrawPoints] = useState<Array<{ id: string; x: number; y: number }>>([]);
+  const [boardItems, setBoardItems] = useState<Array<{ id: string; kind: "text" | "image"; value: string; x: number; y: number }>>(
+    () => loadStoredJson("discuz-board-items", [])
+  );
+  const [drawPoints, setDrawPoints] = useState<Array<{ id: string; x: number; y: number }>>(
+    () => loadStoredJson("discuz-board-points", [])
+  );
   const [drawing, setDrawing] = useState(false);
   const [voiceState, setVoiceState] = useState<VoiceState>("idle");
+  const [voiceLevel, setVoiceLevel] = useState(0);
   const [transcript, setTranscript] = useState("");
   const [statusText, setStatusText] = useState("Ready");
   const [error, setError] = useState("");
+  const [statusLog, setStatusLog] = useState<StatusLogEntry[]>(() => [{
+    id: crypto.randomUUID(),
+    kind: "status",
+    text: "Ready",
+    createdAt: new Date().toISOString()
+  }]);
   const primaryInputRef = useRef<HTMLInputElement | null>(null);
   const contextInputRef = useRef<HTMLInputElement | null>(null);
+  const generatedInputRef = useRef<HTMLInputElement | null>(null);
   const settingsButtonRef = useRef<HTMLButtonElement | null>(null);
   const settingsPopoverRef = useRef<HTMLElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const statusLogRef = useRef<HTMLDivElement | null>(null);
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
   const voiceSessionRef = useRef(0);
   const voiceSessionStartedAtRef = useRef<string | null>(null);
+  const voiceMeterRef = useRef<VoiceMeter | null>(null);
+  const lastStatusLogRef = useRef("Ready");
+  const lastErrorLogRef = useRef("");
   const assistantTranscriptRef = useRef("");
   const boardRef = useRef<HTMLDivElement | null>(null);
   const recordStreamRef = useRef<HTMLDivElement | null>(null);
 
   const primaryFiles = useMemo(() => state.files.filter((file) => file.role === "primary"), [state.files]);
   const contextFiles = useMemo(() => state.files.filter((file) => file.role === "context"), [state.files]);
+  const generatedFiles = useMemo(() => state.files.filter((file) => file.role === "generated"), [state.files]);
   const selectedFile = useMemo(
     () => state.files.find((file) => file.id === selectedId) ?? primaryFiles[0] ?? null,
     [state.files, selectedId, primaryFiles]
@@ -106,6 +220,10 @@ export function App() {
   const previewRecord = useMemo(
     () => state.records.find((record) => record.id === previewRecordId) ?? null,
     [state.records, previewRecordId]
+  );
+  const generatedEditorFile = useMemo(
+    () => state.files.find((file) => file.id === generatedEditorId) ?? null,
+    [state.files, generatedEditorId]
   );
   const currentNotes = useMemo(() => [...state.notes].reverse(), [state.notes]);
 
@@ -128,6 +246,14 @@ export function App() {
   }, [draftText]);
 
   useEffect(() => {
+    localStorage.setItem("discuz-board-items", JSON.stringify(boardItems));
+  }, [boardItems]);
+
+  useEffect(() => {
+    localStorage.setItem("discuz-board-points", JSON.stringify(drawPoints));
+  }, [drawPoints]);
+
+  useEffect(() => {
     if (!settingsOpen) return;
     const closeOnOutsidePointer = (event: PointerEvent) => {
       const target = event.target as Node | null;
@@ -140,11 +266,59 @@ export function App() {
     return () => document.removeEventListener("pointerdown", closeOnOutsidePointer);
   }, [settingsOpen]);
 
+  const positionSettingsPopover = () => {
+    const button = settingsButtonRef.current;
+    if (!button) return;
+    const rect = button.getBoundingClientRect();
+    const width = Math.min(360, window.innerWidth - 24);
+    const left = Math.min(Math.max(12, rect.right - width), window.innerWidth - width - 12);
+    setSettingsPopoverStyle({
+      left,
+      right: "auto",
+      top: Math.min(rect.bottom + 8, window.innerHeight - 24)
+    });
+  };
+
+  const toggleSettingsPopover = () => {
+    if (!settingsOpen) positionSettingsPopover();
+    setSettingsOpen((value) => !value);
+  };
+
   useEffect(() => {
     if (recordStreamRef.current) {
       recordStreamRef.current.scrollTop = recordStreamRef.current.scrollHeight;
     }
   }, [state.notes.length]);
+
+  useEffect(() => {
+    if (statusLogRef.current) {
+      statusLogRef.current.scrollTop = statusLogRef.current.scrollHeight;
+    }
+  }, [statusLog.length, transcript]);
+
+  useEffect(() => {
+    const text = statusText.trim();
+    if (!text || text === lastStatusLogRef.current) return;
+    lastStatusLogRef.current = text;
+    setStatusLog((current) => [
+      ...current,
+      { id: crypto.randomUUID(), kind: "status" as const, text, createdAt: new Date().toISOString() }
+    ].slice(-80));
+  }, [statusText]);
+
+  useEffect(() => {
+    const text = error.trim();
+    if (!text) {
+      lastErrorLogRef.current = "";
+      return;
+    }
+    if (text === lastErrorLogRef.current) return;
+    lastErrorLogRef.current = text;
+    setStatusLog((current) => [
+      ...current,
+      { id: crypto.randomUUID(), kind: "error" as const, text, createdAt: new Date().toISOString() }
+    ].slice(-80));
+  }, [error]);
 
   const startColumnResize = (event: ReactPointerEvent<HTMLDivElement>) => {
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -217,6 +391,16 @@ export function App() {
     setError("");
   };
 
+  const addGeneratedFiles = async (files: FileList | File[]) => {
+    const list = Array.from(files);
+    if (!list.length) return;
+    const payload = await uploadFiles("/api/files/generated/upload", "files", list);
+    setState((current) => ({ ...current, files: payload.files, activities: payload.activities }));
+    setGeneratedEditorId(payload.uploaded?.[0]?.id ?? payload.file?.id ?? null);
+    setSelectedId(payload.uploaded?.[0]?.id ?? payload.file?.id ?? selectedId);
+    setError("");
+  };
+
   const saveNote = async (text: string, kind: Note["kind"] = "point", source = "AI") => {
     const trimmed = text.trim();
     if (!trimmed) return;
@@ -229,6 +413,171 @@ export function App() {
       const payload = await response.json();
       setState((current) => ({ ...current, notes: payload.notes }));
     }
+  };
+
+  const createGeneratedFile = async (title: string, text: string) => {
+    const response = await fetch("/api/files/generated", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title, text })
+    });
+    if (!response.ok) throw new Error(await response.text());
+    const payload = await response.json();
+    setState((current) => ({
+      ...current,
+      files: payload.files ?? current.files,
+      activities: payload.activities ?? current.activities
+    }));
+    return payload.file as DiscuzFile;
+  };
+
+  const updateGeneratedFile = async (file: DiscuzFile, text: string) => {
+    const response = await fetch(`/api/files/${encodeURIComponent(file.id)}/content`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text })
+    });
+    if (!response.ok) throw new Error(await response.text());
+    const payload = await response.json();
+    setState((current) => ({
+      ...current,
+      files: payload.files ?? current.files,
+      activities: payload.activities ?? current.activities
+    }));
+  };
+
+  const promoteFileToPrimary = async (file: DiscuzFile, requireConfirm = false) => {
+    if (file.role === "primary") return file;
+    if (requireConfirm && !window.confirm(`将“${file.originalName}”确认为成果并存入讨论主题？`)) return null;
+    const response = await fetch(`/api/files/${encodeURIComponent(file.id)}/promote-primary`, { method: "POST" });
+    if (!response.ok) throw new Error(await response.text());
+    const payload = await response.json();
+    setState((current) => ({
+      ...current,
+      files: payload.files ?? current.files,
+      activities: payload.activities ?? current.activities
+    }));
+    setSelectedId(file.id);
+    setGeneratedEditorId(null);
+    setError("");
+    return payload.file as DiscuzFile;
+  };
+
+  const moveFileToRole = async (file: DiscuzFile, role: DiscuzFile["role"]) => {
+    if (file.role === role) return file;
+    const response = await fetch(`/api/files/${encodeURIComponent(file.id)}/role`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ role })
+    });
+    if (!response.ok) throw new Error(await response.text());
+    const payload = await response.json();
+    setState((current) => ({
+      ...current,
+      files: payload.files ?? current.files,
+      activities: payload.activities ?? current.activities
+    }));
+    setSelectedId(file.id);
+    if (role !== "generated") setGeneratedEditorId(null);
+    if (previewFileId === file.id && role === "generated") setPreviewFileId(null);
+    setError("");
+    return payload.file as DiscuzFile;
+  };
+
+  const copyFileToGenerated = async (file: DiscuzFile) => {
+    const response = await fetch(`/api/files/${encodeURIComponent(file.id)}/copy-generated`, { method: "POST" });
+    if (!response.ok) throw new Error(await response.text());
+    const payload = await response.json();
+    setState((current) => ({
+      ...current,
+      files: payload.files ?? current.files,
+      activities: payload.activities ?? current.activities
+    }));
+    const copiedFile = payload.file as DiscuzFile | undefined;
+    setGeneratedEditorId(copiedFile && (copiedFile.kind === "markdown" || copiedFile.kind === "text") ? copiedFile.id : null);
+    setSelectedId(payload.file?.id ?? file.id);
+    setError("");
+    return payload.file as DiscuzFile;
+  };
+
+  const notifyForegroundDiscussion = (title: string, text: string) => {
+    const channel = dataChannelRef.current;
+    if (!channel || channel.readyState !== "open") return;
+    channel.send(JSON.stringify({
+      type: "conversation.item.create",
+      item: {
+        type: "message",
+        role: "user",
+        content: [{
+          type: "input_text",
+          text: `系统事件：用户打开了前台讨论窗口《${title}》。这个窗口现在是当前临时讨论对象，请先阅读以下内容，再围绕它继续讨论。\n\n${text.slice(0, 6000)}`
+        }]
+      }
+    }));
+    channel.send(JSON.stringify({ type: "response.create" }));
+  };
+
+  const describeFileForDiscussion = (file: DiscuzFile) => {
+    return [
+      `文件名：${file.originalName}`,
+      `区域：${file.role}`,
+      `类型：${file.kind}`,
+      file.extractedText ? `内容：\n${file.extractedText}` : `摘要：${file.summary || "无可读文本"}`,
+      file.previewUrl ? `预览地址：${file.previewUrl}` : ""
+    ].filter(Boolean).join("\n\n");
+  };
+
+  const openFileDiscussionWindow = (file: DiscuzFile) => {
+    setSelectedId(file.id);
+    if (file.role === "generated" && (file.kind === "markdown" || file.kind === "text")) setGeneratedEditorId(file.id);
+    else setPreviewFileId(file.id);
+    notifyForegroundDiscussion(file.originalName, describeFileForDiscussion(file));
+  };
+
+  const openToolDiscussionWindow = (tool: ToolId) => {
+    setActiveTool(tool);
+    if (tool === "draft") notifyForegroundDiscussion("临时文档", draftText || "当前临时文档为空。");
+    if (tool === "whiteboard") notifyForegroundDiscussion("无限白板", boardToMarkdown());
+  };
+
+  const boardToMarkdown = () => {
+    const textItems = boardItems
+      .filter((item) => item.kind === "text" && item.value.trim())
+      .map((item, index) => `${index + 1}. ${item.value.trim()}`)
+      .join("\n");
+    const imageItems = boardItems
+      .filter((item) => item.kind === "image")
+      .map((item, index) => `![白板图片 ${index + 1}](${item.value})`)
+      .join("\n\n");
+    return [
+      "# 白板临时记录",
+      textItems ? `## 文本\n${textItems}` : "",
+      imageItems ? `## 图片\n${imageItems}` : "",
+      drawPoints.length ? `## 手绘轨迹\n已记录 ${drawPoints.length} 个手绘点。` : ""
+    ].filter(Boolean).join("\n\n");
+  };
+
+  const saveToolToGenerated = async (tool: ToolId) => {
+    if (tool === "draft") {
+      const text = draftText.trim() || "# 临时文档\n\n";
+      await createGeneratedFile(`临时文档-${shortTime(new Date().toISOString()).replace(":", "-")}.md`, text);
+      return;
+    }
+    if (tool === "whiteboard") {
+      await createGeneratedFile(`白板记录-${shortTime(new Date().toISOString()).replace(":", "-")}.md`, boardToMarkdown());
+    }
+  };
+
+  const clearToolContent = (tool: ToolId) => {
+    if (tool === "draft") setDraftText("");
+    if (tool === "whiteboard") {
+      setBoardItems([]);
+      setDrawPoints([]);
+    }
+  };
+
+  const promoteGeneratedFile = async (file: DiscuzFile) => {
+    await promoteFileToPrimary(file, true);
   };
 
   const sendDiscussionInput = async () => {
@@ -344,11 +693,40 @@ export function App() {
       output = { ok: true, layout: args };
     }
     if (message.name === "open_discussion_tool") {
-      setActiveTool((args.tool || "whiteboard") as ToolId);
+      const tool = (args.tool || "whiteboard") as ToolId;
+      openToolDiscussionWindow(tool);
       output = { ok: true, opened: args.tool };
     }
+    if (message.name === "save_discussion_tool") {
+      const tool = (args.tool === "whiteboard" || args.tool === "draft" ? args.tool : activeTool) as ToolId | null;
+      if (tool === "whiteboard" || tool === "draft") {
+        await saveToolToGenerated(tool);
+        output = { ok: true, saved: tool };
+      } else {
+        output = { ok: false, error: "No savable tool is open." };
+      }
+    }
+    if (message.name === "clear_discussion_tool") {
+      const tool = (args.tool === "whiteboard" || args.tool === "draft" ? args.tool : activeTool) as ToolId | null;
+      if (tool === "whiteboard" || tool === "draft") {
+        clearToolContent(tool);
+        output = { ok: true, cleared: tool };
+      } else {
+        output = { ok: false, error: "No clearable tool is open." };
+      }
+    }
+    if (message.name === "close_foreground_window") {
+      const target = String(args.target || "all");
+      if (target === "tool" || target === "all") setActiveTool(null);
+      if (target === "file" || target === "all") {
+        setPreviewFileId(null);
+        setGeneratedEditorId(null);
+      }
+      if (target === "record" || target === "all") setPreviewRecordId(null);
+      output = { ok: true, closed: target };
+    }
     if (message.name === "open_file_preview") {
-      const role = args.role === "primary" || args.role === "context" ? args.role : undefined;
+      const role = args.role === "primary" || args.role === "context" || args.role === "generated" ? args.role : undefined;
       const queryText = String(args.query || "").trim().toLowerCase();
       const candidate = state.files.find((file) => {
         const roleMatches = !role || file.role === role;
@@ -356,8 +734,7 @@ export function App() {
         return roleMatches && nameMatches;
       }) ?? state.files.find((file) => !role || file.role === role);
       if (candidate) {
-        setSelectedId(candidate.id);
-        setPreviewFileId(candidate.id);
+        openFileDiscussionWindow(candidate);
         output = { ok: true, opened: candidate.originalName };
       } else {
         output = { ok: false, error: "No matching file found." };
@@ -371,6 +748,78 @@ export function App() {
         output = { ok: true, saved: text };
       } else {
         output = { ok: false, error: "Missing note text." };
+      }
+    }
+    if (message.name === "create_generated_file") {
+      const title = String(args.title || "AI临时文案.md").trim();
+      const text = String(args.text || "").trim();
+      if (text) {
+        const file = await createGeneratedFile(title, text);
+        output = { ok: true, generated: file.originalName };
+      } else {
+        output = { ok: false, error: "Missing generated file text." };
+      }
+    }
+    if (message.name === "copy_file_to_generated") {
+      const role = args.role === "primary" || args.role === "context" || args.role === "generated" ? args.role : undefined;
+      const queryText = String(args.query || "").trim().toLowerCase();
+      const candidate = state.files.find((file) => {
+        const roleMatches = !role || file.role === role;
+        const nameMatches = !queryText || file.originalName.toLowerCase().includes(queryText);
+        return roleMatches && nameMatches;
+      });
+      if (candidate) {
+        const file = await copyFileToGenerated(candidate);
+        output = { ok: true, copied: file.originalName };
+      } else {
+        output = { ok: false, error: "No matching file found to copy." };
+      }
+    }
+    if (message.name === "add_file_to_topic") {
+      const queryText = String(args.query || "").trim().toLowerCase();
+      const candidates = state.files.filter((file) => file.role === "context" || file.role === "generated");
+      const file = (queryText
+        ? candidates.find((candidate) => candidate.originalName.toLowerCase().includes(queryText))
+        : candidates.length === 1 ? candidates[0] : undefined);
+      if (file) {
+        await promoteFileToPrimary(file);
+        output = { ok: true, added: file.originalName };
+      } else {
+        output = { ok: false, error: "No matching resource or AI generated file found." };
+      }
+    }
+    if (message.name === "move_file_to_area") {
+      const role = args.role === "primary" || args.role === "context" || args.role === "generated" ? args.role as DiscuzFile["role"] : undefined;
+      const queryText = String(args.query || "").trim().toLowerCase();
+      const candidate = state.files.find((file) => {
+        const nameMatches = !queryText || file.originalName.toLowerCase().includes(queryText);
+        return nameMatches;
+      });
+      if (candidate && role) {
+        if (role === "generated" && candidate.role !== "generated") {
+          const file = await copyFileToGenerated(candidate);
+          output = { ok: true, copied: file.originalName, target: role };
+        } else {
+          await moveFileToRole(candidate, role);
+          output = { ok: true, moved: candidate.originalName, target: role };
+        }
+      } else {
+        output = { ok: false, error: "No matching file or target area found." };
+      }
+    }
+    if (message.name === "update_generated_file") {
+      const queryText = String(args.query || "").trim().toLowerCase();
+      const text = String(args.text || "").trim();
+      const candidate = state.files.find((file) => {
+        const nameMatches = !queryText || file.originalName.toLowerCase().includes(queryText);
+        return file.role === "generated" && nameMatches && (file.kind === "markdown" || file.kind === "text");
+      });
+      if (candidate && text) {
+        await updateGeneratedFile(candidate, text);
+        setGeneratedEditorId(candidate.id);
+        output = { ok: true, updated: candidate.originalName };
+      } else {
+        output = { ok: false, error: "No editable generated text file or replacement text found." };
       }
     }
     if (message.name === "propose_discussion_topic") {
@@ -417,6 +866,62 @@ export function App() {
     }
   }, []);
 
+  const stopVoiceMeter = useCallback(() => {
+    const meter = voiceMeterRef.current;
+    if (!meter) return;
+    cancelAnimationFrame(meter.frameId);
+    meter.context.close().catch(() => undefined);
+    voiceMeterRef.current = null;
+    setVoiceLevel(0);
+  }, []);
+
+  const startVoiceMeter = useCallback((inputStream: MediaStream) => {
+    stopVoiceMeter();
+    const AudioContextClass = (window.AudioContext || (window as Window & { webkitAudioContext?: AudioContextConstructor }).webkitAudioContext);
+    if (!AudioContextClass) return;
+    const context = new AudioContextClass();
+    const inputAnalyser = context.createAnalyser();
+    inputAnalyser.fftSize = 256;
+    inputAnalyser.smoothingTimeConstant = 0.72;
+    const inputSource = context.createMediaStreamSource(inputStream);
+    inputSource.connect(inputAnalyser);
+
+    const meter: VoiceMeter = {
+      context,
+      inputAnalyser,
+      inputData: new Uint8Array(inputAnalyser.fftSize),
+      inputSource,
+      frameId: 0
+    };
+    voiceMeterRef.current = meter;
+
+    const tick = () => {
+      const current = voiceMeterRef.current;
+      if (!current) return;
+      const level = Math.max(
+        readAnalyserLevel(current.inputAnalyser, current.inputData),
+        readAnalyserLevel(current.outputAnalyser, current.outputData)
+      );
+      setVoiceLevel((previous) => previous * 0.68 + level * 0.32);
+      current.frameId = requestAnimationFrame(tick);
+    };
+    meter.frameId = requestAnimationFrame(tick);
+  }, [stopVoiceMeter]);
+
+  const addVoiceOutputMeter = useCallback((outputStream: MediaStream) => {
+    const meter = voiceMeterRef.current;
+    if (!meter) return;
+    meter.outputSource?.disconnect();
+    const outputAnalyser = meter.context.createAnalyser();
+    outputAnalyser.fftSize = 256;
+    outputAnalyser.smoothingTimeConstant = 0.72;
+    const outputSource = meter.context.createMediaStreamSource(outputStream);
+    outputSource.connect(outputAnalyser);
+    meter.outputAnalyser = outputAnalyser;
+    meter.outputData = new Uint8Array(outputAnalyser.fftSize);
+    meter.outputSource = outputSource;
+  }, []);
+
   const stopVoice = useCallback(() => {
     voiceSessionRef.current += 1;
     dataChannelRef.current = null;
@@ -424,25 +929,30 @@ export function App() {
     peerRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
+    stopVoiceMeter();
     setVoiceState("idle");
     setStatusText("Ready");
     finalizeDiscussionRecord().catch((err) => setError(err instanceof Error ? err.message : "Unable to archive discussion record"));
-  }, [finalizeDiscussionRecord]);
+  }, [finalizeDiscussionRecord, stopVoiceMeter]);
 
   const startVoice = async () => {
     setError("");
     const sessionId = voiceSessionRef.current + 1;
     voiceSessionRef.current = sessionId;
-    voiceSessionStartedAtRef.current = new Date().toISOString();
+    voiceSessionStartedAtRef.current = null;
     setVoiceState("connecting");
     setStatusText("Connecting");
     try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error("当前浏览器不支持麦克风访问。请使用支持麦克风权限的浏览器，并通过 localhost 或 HTTPS 打开应用。");
+      }
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       if (sessionId !== voiceSessionRef.current) {
         stream.getTracks().forEach((track) => track.stop());
         return;
       }
       streamRef.current = stream;
+      startVoiceMeter(stream);
       const peer = new RTCPeerConnection();
       peerRef.current = peer;
       stream.getTracks().forEach((track) => peer.addTrack(track, stream));
@@ -451,10 +961,12 @@ export function App() {
           audioRef.current.srcObject = event.streams[0];
           audioRef.current.play().catch(() => undefined);
         }
+        addVoiceOutputMeter(event.streams[0]);
       };
       peer.onconnectionstatechange = () => {
         if (sessionId !== voiceSessionRef.current) return;
         if (peer.connectionState === "connected") {
+          voiceSessionStartedAtRef.current ||= new Date().toISOString();
           setVoiceState("live");
           setStatusText("Live");
         }
@@ -507,15 +1019,67 @@ export function App() {
       stopVoice();
       setVoiceState("error");
       setStatusText("Error");
-      setError(err instanceof Error ? err.message : "Unable to start voice session");
+      setError(voiceStartErrorMessage(err));
     }
   };
 
-  const handleDrop = async (event: DragEvent<HTMLElement>, target: "primary" | "context") => {
+  const handleDrop = async (event: DragEvent<HTMLElement>, target: DiscuzFile["role"]) => {
     event.preventDefault();
+    event.stopPropagation();
     setDragTarget(null);
+    setDraggingFile(null);
+    const draggedFileId = event.dataTransfer.getData(fileDragType);
+    if (draggedFileId) {
+      const file = state.files.find((item) => item.id === draggedFileId);
+      if (file) {
+        if (target === "generated" && file.role !== "generated") await copyFileToGenerated(file);
+        else await moveFileToRole(file, target);
+      }
+      return;
+    }
     if (target === "primary") await setPrimary(event.dataTransfer.files);
-    else await addContext(event.dataTransfer.files);
+    else if (target === "context") await addContext(event.dataTransfer.files);
+    else if (target === "generated") await addGeneratedFiles(event.dataTransfer.files);
+  };
+
+  const reorderPrimaryFiles = async (draggedId: string, targetId: string, after: boolean) => {
+    if (draggedId === targetId) return;
+    const draggedFile = state.files.find((file) => file.id === draggedId);
+    const targetFile = state.files.find((file) => file.id === targetId);
+    if (!draggedFile || !targetFile || draggedFile.role !== "primary" || targetFile.role !== "primary") return;
+    const orderedPrimaryFiles = moveItemByDrop(primaryFiles, draggedId, targetId, after);
+    setState((current) => {
+      const reorderedPrimary = moveItemByDrop(current.files.filter((file) => file.role === "primary"), draggedId, targetId, after);
+      const queue = [...reorderedPrimary];
+      return {
+        ...current,
+        files: current.files.map((file) => file.role === "primary" ? queue.shift() ?? file : file)
+      };
+    });
+    const response = await fetch("/api/files/primary/reorder", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids: orderedPrimaryFiles.map((file) => file.id) })
+    });
+    if (!response.ok) throw new Error(await response.text());
+    const payload = await response.json();
+    setState((current) => ({ ...current, files: payload.files ?? current.files }));
+  };
+
+  const handlePrimaryCardDrop = async (event: DragEvent<HTMLElement>, targetFile: DiscuzFile) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setDragTarget(null);
+    setDraggingFile(null);
+    const draggedFileId = event.dataTransfer.getData(fileDragType);
+    if (!draggedFileId) return;
+    const draggedFile = state.files.find((file) => file.id === draggedFileId);
+    if (!draggedFile) return;
+    if (draggedFile.role === "primary") {
+      await reorderPrimaryFiles(draggedFileId, targetFile.id, shouldDropAfter(event));
+      return;
+    }
+    await moveFileToRole(draggedFile, "primary");
   };
 
   const onPrimaryChange = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -528,6 +1092,11 @@ export function App() {
     event.target.value = "";
   };
 
+  const onGeneratedChange = async (event: ChangeEvent<HTMLInputElement>) => {
+    await addGeneratedFiles(event.target.files || []);
+    event.target.value = "";
+  };
+
   const deleteFile = async (file: DiscuzFile) => {
     if (!window.confirm(`删除“${file.originalName}”？`)) return;
     const wasPrimary = file.role === "primary";
@@ -537,6 +1106,7 @@ export function App() {
     setState((current) => ({ ...current, files: payload.files, activities: payload.activities }));
     if (selectedId === file.id) setSelectedId(payload.files[0]?.id ?? null);
     if (previewFileId === file.id) setPreviewFileId(null);
+    if (generatedEditorId === file.id) setGeneratedEditorId(null);
     if (wasPrimary) notifyPrimaryFileDeleted(file);
     setError("");
   };
@@ -559,6 +1129,7 @@ export function App() {
     setSelectedId(null);
     setPreviewFileId(null);
     setPreviewRecordId(null);
+    setGeneratedEditorId(null);
     setTopicProposal(null);
     setDiscussionText("");
     setContextHits([]);
@@ -570,14 +1141,17 @@ export function App() {
     <main
       className="app-shell"
       style={{
-        gridTemplateColumns: `${leftWidth}% 10px minmax(280px, 1fr)`
-      }}
+        gridTemplateColumns: `${leftWidth}% 10px minmax(280px, 1fr)`,
+        "--wallpaper-url": `url("${state.settings?.wallpaperUrl || "/assets/cyberpunk-future-bg.png"}")`
+      } as CSSProperties}
     >
       <input ref={primaryInputRef} hidden type="file" multiple onChange={onPrimaryChange} />
       <input ref={contextInputRef} hidden type="file" multiple onChange={onContextChange} />
+      <input ref={generatedInputRef} hidden type="file" multiple onChange={onGeneratedChange} />
       <audio ref={audioRef} autoPlay />
       <div className="light-wash" />
       <div className="bottom-discussion-bar">
+        <StatusLogPanel ref={statusLogRef} entries={statusLog} transcript={transcript} />
         <form
           className="discussion-text-form"
           onSubmit={(event) => {
@@ -597,6 +1171,7 @@ export function App() {
         <div className="voice-dock">
           <VoiceButton state={voiceState} onStart={startVoice} onStop={stopVoice} />
         </div>
+        <VoiceLevelBars state={voiceState} level={voiceLevel} />
       </div>
 
       <section
@@ -610,8 +1185,8 @@ export function App() {
         onDrop={(event) => handleDrop(event, "primary")}
       >
         <PanelHeader
-          title="讨论主题"
-          meta={primaryFiles.length ? `${primaryFiles.length} 个主题文件` : "拖入主题文件"}
+          title="主题"
+          meta=""
           center={
             <TopicConfirmation
               currentTopic={state.discussionTopic}
@@ -627,7 +1202,7 @@ export function App() {
               </button>
               <button className="icon-button danger" title="Clear discussion" onClick={() => clearDiscussion().catch((err) => setError(err.message))}><Trash2 size={17} /></button>
               <button className="icon-button" title="Choose file" onClick={() => primaryInputRef.current?.click()}><FilePlus2 size={18} /></button>
-              <button ref={settingsButtonRef} className="icon-button" title="Settings" onClick={() => setSettingsOpen((value) => !value)}><Settings2 size={18} /></button>
+              <button ref={settingsButtonRef} className="icon-button" title="Settings" onClick={toggleSettingsPopover}><Settings2 size={18} /></button>
             </div>
           }
         />
@@ -637,24 +1212,53 @@ export function App() {
               {primaryFiles.map((file) => (
                 <article
                   key={file.id}
-                  className={`topic-file-card ${selectedId === file.id ? "selected" : ""}`}
+                  className={`topic-file-card ${selectedId === file.id ? "selected" : ""} ${draggingFile?.id === file.id ? "dragging-card" : ""}`}
+                  draggable
                   onClick={() => setSelectedId(file.id)}
-                  onDoubleClick={() => {
-                    setSelectedId(file.id);
-                    setPreviewFileId(file.id);
+                  onDoubleClick={() => openFileDiscussionWindow(file)}
+                  onDragStart={(event) => {
+                    setDraggingFile({ id: file.id, role: file.role });
+                    event.dataTransfer.setData(fileDragType, file.id);
+                    event.dataTransfer.effectAllowed = "move";
+                    setCardDragImage(event, "demote");
                   }}
+                  onDragOver={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                  }}
+                  onDrop={(event) => handlePrimaryCardDrop(event, file).catch((err) => setError(err.message))}
+                  onDragEnd={() => setDraggingFile(null)}
                 >
-                  <button
-                    className="card-delete"
-                    title="Delete topic file"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      deleteFile(file).catch((err) => setError(err.message));
-                    }}
-                    onDoubleClick={(event) => event.stopPropagation()}
-                  >
-                    <Trash2 size={14} />
-                  </button>
+                  {draggingFile?.id === file.id ? (
+                    <span className="transfer-badge demote"><Minus size={17} /></span>
+                  ) : (
+                    <div className="card-actions">
+                      {file.kind !== "image" && (
+                        <button
+                          className="card-copy"
+                          title="复制到临时文件区编辑"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            copyFileToGenerated(file).catch((err) => setError(err.message));
+                          }}
+                          onDoubleClick={(event) => event.stopPropagation()}
+                        >
+                          <Copy size={14} />
+                        </button>
+                      )}
+                      <button
+                        className="card-delete"
+                        title="Delete topic file"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          deleteFile(file).catch((err) => setError(err.message));
+                        }}
+                        onDoubleClick={(event) => event.stopPropagation()}
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  )}
                   <div className="topic-card-preview">
                     <FilePreview file={file} />
                   </div>
@@ -686,11 +1290,11 @@ export function App() {
         >
           <PanelHeader
             title="资源"
-            meta={`${contextFiles.length} 项`}
+            meta=""
             action={
               <div className="header-actions">
-                <button className="icon-button" title="Whiteboard" onClick={() => setActiveTool("whiteboard")}><PenLine size={17} /></button>
-                <button className="icon-button" title="Temporary draft" onClick={() => setActiveTool("draft")}><FileText size={17} /></button>
+                <button className="icon-button" title="Whiteboard" onClick={() => openToolDiscussionWindow("whiteboard")}><PenLine size={17} /></button>
+                <button className="icon-button" title="Temporary draft" onClick={() => openToolDiscussionWindow("draft")}><FileText size={17} /></button>
                 <button className="icon-button" title={fullscreenPanel === "resources" ? "Exit fullscreen resources" : "Fullscreen resources"} onClick={() => setFullscreenPanel(fullscreenPanel === "resources" ? null : "resources")}>
                   {fullscreenPanel === "resources" ? <Minimize2 size={17} /> : <Maximize2 size={17} />}
                 </button>
@@ -702,37 +1306,85 @@ export function App() {
             <Upload size={18} />
             <span>拖入资源</span>
           </button>
-          <div className="resource-grid">
-            {contextFiles.map((file) => (
-              <article
-                key={file.id}
-                className={`thumb ${selectedFile?.id === file.id ? "selected" : ""}`}
-                onClick={() => setSelectedId(file.id)}
-                onDoubleClick={() => {
-                  setSelectedId(file.id);
-                  setPreviewFileId(file.id);
-                }}
-              >
-                <button
-                  className="card-delete"
-                  title="Delete resource file"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    deleteFile(file).catch((err) => setError(err.message));
-                  }}
-                  onDoubleClick={(event) => event.stopPropagation()}
-                >
-                  <Trash2 size={13} />
-                </button>
-                <div className="thumb-preview">
-                  <FileMiniPreview file={file} />
-                </div>
-                <footer>
-                  <span>{file.kind}</span>
-                  <strong>{file.originalName}</strong>
-                </footer>
-              </article>
-            ))}
+          <div className="resource-split">
+            <section
+              className={`resource-zone ${dragTarget === "context" ? "zone-dragging" : ""}`}
+              onDragEnter={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                setDragTarget("context");
+              }}
+              onDragOver={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+              }}
+              onDragLeave={() => setDragTarget(null)}
+              onDrop={(event) => handleDrop(event, "context")}
+            >
+              <div className="resource-grid">
+                {contextFiles.map((file) => (
+                  <FileThumb
+                    key={file.id}
+                    file={file}
+                    selected={selectedFile?.id === file.id}
+                    onSelect={() => setSelectedId(file.id)}
+                    onOpen={() => openFileDiscussionWindow(file)}
+                    onDelete={() => deleteFile(file).catch((err) => setError(err.message))}
+                    onCopy={file.kind === "image" ? undefined : () => copyFileToGenerated(file).catch((err) => setError(err.message))}
+                    onDragStart={(event) => {
+                      setDraggingFile({ id: file.id, role: file.role });
+                      event.dataTransfer.setData(fileDragType, file.id);
+                      event.dataTransfer.effectAllowed = "move";
+                      setCardDragImage(event, "promote");
+                    }}
+                    onDragEnd={() => setDraggingFile(null)}
+                    dragMark={draggingFile?.id === file.id ? "add" : null}
+                  />
+                ))}
+              </div>
+            </section>
+            <section
+              className={`resource-zone generated-zone ${dragTarget === "generated" ? "zone-dragging" : ""}`}
+              onDragEnter={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                setDragTarget("generated");
+              }}
+              onDragOver={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+              }}
+              onDragLeave={() => setDragTarget(null)}
+              onDrop={(event) => handleDrop(event, "generated")}
+            >
+              <div className="resource-grid">
+                {generatedFiles.length ? (
+                  generatedFiles.map((file) => (
+                    <FileThumb
+                      key={file.id}
+                      file={file}
+                      selected={selectedFile?.id === file.id}
+                      onSelect={() => setSelectedId(file.id)}
+                      onOpen={() => openFileDiscussionWindow(file)}
+                      onDelete={() => deleteFile(file).catch((err) => setError(err.message))}
+                      onDragStart={(event) => {
+                        setDraggingFile({ id: file.id, role: file.role });
+                        event.dataTransfer.setData(fileDragType, file.id);
+                        event.dataTransfer.effectAllowed = "move";
+                        setCardDragImage(event, "promote");
+                      }}
+                      onDragEnd={() => setDraggingFile(null)}
+                      dragMark={draggingFile?.id === file.id ? "add" : null}
+                    />
+                  ))
+                ) : (
+                  <button className="thumb empty-generated" onClick={() => generatedInputRef.current?.click()}>
+                    <FileText size={22} />
+                    <span>添加临时文件</span>
+                  </button>
+                )}
+              </div>
+            </section>
           </div>
           <div className="search-card">
             <div className="search-line">
@@ -769,7 +1421,7 @@ export function App() {
         <section className={`panel record-panel ${fullscreenPanel === "record" ? "fullscreen-panel" : ""}`}>
           <PanelHeader
             title="记录"
-            meta={transcript || statusText}
+            meta=""
             action={
               <div className="header-actions">
                 <button className="icon-button" title={fullscreenPanel === "record" ? "Exit fullscreen record" : "Fullscreen record"} onClick={() => setFullscreenPanel(fullscreenPanel === "record" ? null : "record")}>
@@ -833,6 +1485,7 @@ export function App() {
           webEnabled={webEnabled}
           setWebEnabled={setWebEnabled}
           onSettingsSaved={(settings) => setState((current) => ({ ...current, settings }))}
+          style={settingsPopoverStyle}
         />
       )}
       {activeTool && (
@@ -848,22 +1501,31 @@ export function App() {
           boardRef={boardRef}
           drawing={drawing}
           setDrawing={setDrawing}
+          onSave={() => saveToolToGenerated(activeTool).catch((err) => setError(err.message))}
+          onClear={() => clearToolContent(activeTool)}
           onClose={() => setActiveTool(null)}
         />
       )}
       {previewFile && <FilePreviewWindow file={previewFile} onClose={() => setPreviewFileId(null)} />}
       {previewRecord && <RecordPreviewWindow record={previewRecord} onClose={() => setPreviewRecordId(null)} />}
-      {error && <div className="toast">{error}</div>}
+      {generatedEditorFile && (
+        <GeneratedFileEditor
+          file={generatedEditorFile}
+          onSave={(text) => updateGeneratedFile(generatedEditorFile, text)}
+          onPromote={() => promoteGeneratedFile(generatedEditorFile)}
+          onClose={() => setGeneratedEditorId(null)}
+        />
+      )}
     </main>
   );
 }
 
-function PanelHeader({ title, meta, center, action }: { title: string; meta: string; center?: ReactNode; action: ReactNode }) {
+function PanelHeader({ title, meta, center, action }: { title: string; meta?: string; center?: ReactNode; action: ReactNode }) {
   return (
     <header className="panel-head">
       <div className="panel-title">
         <h2>{title}</h2>
-        <p>{meta}</p>
+        {meta && <p>{meta}</p>}
       </div>
       {center}
       {action}
@@ -899,6 +1561,30 @@ function TopicConfirmation({
     </aside>
   );
 }
+
+const StatusLogPanel = forwardRef<HTMLDivElement, { entries: StatusLogEntry[]; transcript: string }>(function StatusLogPanel({
+  entries,
+  transcript
+}, ref) {
+  return (
+    <div className="status-log-panel" aria-live="polite">
+      <div className="status-log-scroll" ref={ref}>
+        {entries.map((entry) => (
+          <p key={entry.id} className={entry.kind === "error" ? "error" : ""}>
+            <span>{shortTime(entry.createdAt)}</span>
+            {entry.text}
+          </p>
+        ))}
+        {transcript.trim() && (
+          <p>
+            <span>{shortTime(new Date().toISOString())}</span>
+            {transcript}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+});
 
 function EmptyTopic({ onChoose }: { onChoose: () => void }) {
   return (
@@ -948,8 +1634,80 @@ function FileMiniPreview({ file }: { file: DiscuzFile }) {
   if ((file.kind === "doc" || file.kind === "docx") && file.renderedHtml) {
     return <div className="mini-document"><iframe title="" sandbox="" srcDoc={wordPreviewHtml(file.renderedHtml)} /></div>;
   }
+  const markdownImage = file.extractedText.match(/!\[[^\]]*]\(([^)\s]+)(?:\s+"[^"]*")?\)/);
+  if (markdownImage?.[1]) return <img src={markdownImage[1]} alt="" />;
   if (file.extractedText) return <pre>{file.extractedText.slice(0, 600)}</pre>;
   return <div className="mini-icon">{file.kind}</div>;
+}
+
+function FileThumb({
+  file,
+  selected,
+  onSelect,
+  onOpen,
+  onDelete,
+  onCopy,
+  onDragStart,
+  onDragEnd,
+  dragMark
+}: {
+  file: DiscuzFile;
+  selected: boolean;
+  onSelect: () => void;
+  onOpen: () => void;
+  onDelete: () => void;
+  onCopy?: () => void;
+  onDragStart?: (_event: DragEvent<HTMLElement>) => void;
+  onDragEnd?: () => void;
+  dragMark?: "add" | null;
+}) {
+  return (
+    <article
+      className={`thumb ${selected ? "selected" : ""} ${dragMark ? "dragging-card" : ""}`}
+      draggable={Boolean(onDragStart)}
+      onClick={onSelect}
+      onDoubleClick={onOpen}
+      onDragStart={onDragStart}
+      onDragEnd={onDragEnd}
+    >
+      {dragMark === "add" ? (
+        <span className="transfer-badge promote"><Plus size={17} /></span>
+      ) : (
+        <div className="card-actions">
+          {onCopy && (
+            <button
+              className="card-copy"
+              title="复制到临时文件区编辑"
+              onClick={(event) => {
+                event.stopPropagation();
+                onCopy();
+              }}
+              onDoubleClick={(event) => event.stopPropagation()}
+            >
+              <Copy size={13} />
+            </button>
+          )}
+          <button
+            className="card-delete"
+            title="删除文件"
+            onClick={(event) => {
+              event.stopPropagation();
+              onDelete();
+            }}
+            onDoubleClick={(event) => event.stopPropagation()}
+          >
+            <Trash2 size={13} />
+          </button>
+        </div>
+      )}
+      <div className="thumb-preview">
+        <FileMiniPreview file={file} />
+      </div>
+      <footer>
+        <strong>{file.originalName}</strong>
+      </footer>
+    </article>
+  );
 }
 
 function FilePreviewWindow({ file, onClose }: { file: DiscuzFile; onClose: () => void }) {
@@ -985,6 +1743,55 @@ function RecordPreviewWindow({ record, onClose }: { record: DiscussionRecord; on
   );
 }
 
+function GeneratedFileEditor({
+  file,
+  onSave,
+  onPromote,
+  onClose
+}: {
+  file: DiscuzFile;
+  onSave: (_text: string) => Promise<void>;
+  onPromote: () => Promise<void>;
+  onClose: () => void;
+}) {
+  const [text, setText] = useState(file.extractedText);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    setText(file.extractedText);
+  }, [file.id, file.extractedText]);
+
+  const saveEdit = async () => {
+    setSaving(true);
+    try {
+      await onSave(text);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <aside className="generated-editor-window">
+      <header className="tool-head">
+        <div>
+          <strong>{file.originalName}</strong>
+          <span>先保存编辑，确认无误后再确认为成果</span>
+        </div>
+        <div className="header-actions">
+          <button className="icon-button" title="保存编辑" disabled={saving} onClick={saveEdit}><Check size={16} /></button>
+          <button className="icon-button" title="确认为成果" disabled={saving} onClick={() => onPromote()}><FilePlus2 size={16} /></button>
+          <button className="icon-button" title="关闭编辑窗口" onClick={onClose}>×</button>
+        </div>
+      </header>
+      <textarea
+        value={text}
+        onChange={(event) => setText(event.target.value)}
+        spellCheck={false}
+      />
+    </aside>
+  );
+}
+
 function ToolWindow({
   tool,
   selectedFile,
@@ -997,6 +1804,8 @@ function ToolWindow({
   boardRef,
   drawing,
   setDrawing,
+  onSave,
+  onClear,
   onClose
 }: {
   tool: ToolId;
@@ -1010,6 +1819,8 @@ function ToolWindow({
   boardRef: RefObject<HTMLDivElement | null>;
   drawing: boolean;
   setDrawing: Dispatch<SetStateAction<boolean>>;
+  onSave: () => void;
+  onClear: () => void;
   onClose: () => void;
 }) {
   const title = {
@@ -1029,8 +1840,12 @@ function ToolWindow({
     setBoardItems((items) => [...items, { id: crypto.randomUUID(), kind: "image", value: selectedFile.previewUrl, x: 120, y: 120 }]);
   };
 
+  const updateBoardText = (id: string, value: string) => {
+    setBoardItems((items) => items.map((item) => item.id === id ? { ...item, value } : item));
+  };
+
   return (
-    <aside className={`tool-window ${tool === "whiteboard" ? "whiteboard-window" : ""}`}>
+    <aside className="tool-window">
       <header className="tool-head">
         <strong>{title}</strong>
         <div className="header-actions">
@@ -1039,7 +1854,12 @@ function ToolWindow({
               <button className="icon-button" title="Add text" onClick={addBoardText}><FileText size={16} /></button>
               <button className="icon-button" title="Add image" onClick={addBoardImage}><ImageIcon size={16} /></button>
               <button className={`icon-button ${drawing ? "active" : ""}`} title="Draw" onClick={() => setDrawing((value) => !value)}><PenLine size={16} /></button>
-              <button className="icon-button" title="Clear drawing" onClick={() => setDrawPoints([])}><Trash2 size={16} /></button>
+            </>
+          )}
+          {(tool === "whiteboard" || tool === "draft") && (
+            <>
+              <button className="icon-button" title="保存到临时文件区" onClick={onSave}><Check size={16} /></button>
+              <button className="icon-button" title="清空内容" onClick={onClear}><Trash2 size={16} /></button>
             </>
           )}
           <button className="icon-button" title="Close tool" onClick={onClose}>×</button>
@@ -1075,7 +1895,7 @@ function ToolWindow({
             {drawPoints.map((point) => <i key={point.id} className="draw-point" style={{ left: point.x, top: point.y }} />)}
             {boardItems.map((item) => (
               <div key={item.id} className={`board-item ${item.kind}`} style={{ left: item.x, top: item.y }}>
-                {item.kind === "image" ? <img src={item.value} alt="" /> : <textarea defaultValue={item.value} />}
+                {item.kind === "image" ? <img src={item.value} alt="" /> : <textarea value={item.value} onChange={(event) => updateBoardText(item.id, event.target.value)} />}
               </div>
             ))}
           </div>
@@ -1119,18 +1939,36 @@ function VoiceButton({
   );
 }
 
+function VoiceLevelBars({ state, level }: { state: VoiceState; level: number }) {
+  const live = state === "live" || state === "thinking";
+  const connecting = state === "connecting";
+  const multipliers = [0.32, 0.52, 0.82, 0.58, 1, 0.72, 0.44, 0.88, 0.64, 0.38, 0.76, 0.48];
+  return (
+    <div className={`voice-level-bars ${connecting ? "connecting" : ""} ${live ? "live" : ""}`} aria-hidden="true">
+      {multipliers.map((multiplier, index) => {
+        const activeLevel = live || connecting ? level : 0;
+        const height = 5 + Math.min(1, activeLevel * (0.5 + multiplier)) * 33;
+        return <span key={index} style={{ height: `${height}px` }} />;
+      })}
+    </div>
+  );
+}
+
 const SettingsPopover = forwardRef<HTMLElement, {
   settings: SettingsState;
   webEnabled: boolean;
   setWebEnabled: (_next: boolean) => void;
   onSettingsSaved: (_settings: SettingsState) => void;
+  style?: CSSProperties;
 }>(function SettingsPopover({
   settings,
   webEnabled,
   setWebEnabled,
-  onSettingsSaved
+  onSettingsSaved,
+  style
 }, ref) {
   const [apiKey, setApiKey] = useState("");
+  const wallpaperInputRef = useRef<HTMLInputElement | null>(null);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
 
@@ -1155,8 +1993,45 @@ const SettingsPopover = forwardRef<HTMLElement, {
     }
   };
 
+  const uploadWallpaper = async (files: FileList | null) => {
+    const file = files?.[0];
+    if (!file) return;
+    setSaving(true);
+    setMessage("");
+    try {
+      const form = new FormData();
+      form.append("wallpaper", file);
+      const response = await fetch("/api/settings/wallpaper", { method: "POST", body: form });
+      if (!response.ok) throw new Error(await response.text());
+      const nextSettings = await response.json();
+      onSettingsSaved(nextSettings);
+      setMessage("壁纸已更换");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "壁纸更换失败");
+    } finally {
+      setSaving(false);
+      if (wallpaperInputRef.current) wallpaperInputRef.current.value = "";
+    }
+  };
+
+  const resetWallpaper = async () => {
+    setSaving(true);
+    setMessage("");
+    try {
+      const response = await fetch("/api/settings/wallpaper", { method: "DELETE" });
+      if (!response.ok) throw new Error(await response.text());
+      const nextSettings = await response.json();
+      onSettingsSaved(nextSettings);
+      setMessage("已恢复默认壁纸");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "恢复失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+
   return (
-    <aside ref={ref} className="settings-popover">
+    <aside ref={ref} className="settings-popover" style={style}>
       <header className="settings-head">
         <strong>设置</strong>
         <span className={settings.openaiApiKeyConfigured ? "status-pill ready" : "status-pill"}>
@@ -1195,6 +2070,26 @@ const SettingsPopover = forwardRef<HTMLElement, {
           </button>
         </div>
         <p>AI 可按需查阅互联网，但回答必须回到当前主题。</p>
+      </section>
+
+      <section className="settings-section">
+        <label>壁纸</label>
+        <input
+          ref={wallpaperInputRef}
+          hidden
+          type="file"
+          accept="image/*"
+          onChange={(event) => uploadWallpaper(event.target.files)}
+        />
+        <div className="wallpaper-row">
+          <button disabled={saving} onClick={() => wallpaperInputRef.current?.click()}>
+            更换壁纸
+          </button>
+          <button disabled={saving || !settings.wallpaperUrl} onClick={resetWallpaper}>
+            恢复默认
+          </button>
+        </div>
+        <p>{settings.wallpaperUrl ? "当前使用自定义壁纸。" : "当前使用默认壁纸。"}</p>
       </section>
     </aside>
   );
