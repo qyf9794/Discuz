@@ -488,6 +488,8 @@ export function App() {
   const voiceSessionStartedAtRef = useRef<string | null>(null);
   const voiceReconnectTimerRef = useRef<number | null>(null);
   const voiceMeterRef = useRef<VoiceMeter | null>(null);
+  const pendingTaskCountRef = useRef(0);
+  const activeTaskLabelRef = useRef("");
   const lastStatusLogRef = useRef("Ready");
   const lastErrorLogRef = useRef("");
   const assistantTranscriptRef = useRef("");
@@ -826,14 +828,22 @@ export function App() {
   const beginTask = useCallback((label: string) => {
     const id = crypto.randomUUID();
     const startedAt = new Date().toISOString();
+    pendingTaskCountRef.current += 1;
+    activeTaskLabelRef.current = label;
     setPendingTasks((current) => [...current, { id, label, startedAt }].slice(-6));
-    setStatusText(`${label}中`);
+    setStatusText(`AI正在执行：${label}，请稍等`);
     let finished = false;
     return () => {
       if (finished) return;
       finished = true;
+      pendingTaskCountRef.current = Math.max(0, pendingTaskCountRef.current - 1);
       setPendingTasks((current) => current.filter((task) => task.id !== id));
-      setStatusText(`${label}完成`);
+      if (pendingTaskCountRef.current > 0) {
+        setStatusText(`AI正在执行：${activeTaskLabelRef.current || "任务"}，请稍等`);
+      } else {
+        activeTaskLabelRef.current = "";
+        setStatusText(`${label}完成`);
+      }
     };
   }, []);
 
@@ -1061,7 +1071,7 @@ export function App() {
     if (!channel || channel.readyState !== "open") return false;
     if (responseActiveRef.current) {
       responsePendingRef.current = true;
-      setStatusText("等待上一轮回复完成");
+      setStatusText("AI仍在处理上一轮，稍等");
       return false;
     }
     responseActiveRef.current = true;
@@ -2173,7 +2183,7 @@ export function App() {
           if (message.type === "response.done") {
             responseActiveRef.current = false;
             setVoiceState("live");
-            setStatusText("Live");
+            if (pendingTaskCountRef.current === 0) setStatusText("Live");
             window.setTimeout(() => flushRealtimeResponse(), 0);
           }
           if (message.type === "response.output_audio_transcript.delta") {
@@ -3003,7 +3013,7 @@ function TaskIndicator({ tasks }: { tasks: TaskItem[] }) {
   return (
     <div className="task-indicator" title={tasks.map((task) => task.label).join(" / ")}>
       <Sparkles size={14} />
-      <span>{tasks.length > 1 ? `${tasks.length} 个任务` : active.label}</span>
+      <span>{tasks.length > 1 ? `AI正在执行 ${tasks.length} 个任务` : `AI正在执行：${active.label}`}</span>
     </div>
   );
 }
