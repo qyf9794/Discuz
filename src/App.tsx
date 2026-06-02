@@ -1,10 +1,12 @@
 import {
+  ChartNoAxesColumn,
   Check,
   CheckCircle2,
   Copy,
+  Download,
+  ExternalLink,
   FileText,
   FilePlus2,
-  Globe2,
   Image as ImageIcon,
   Maximize2,
   Minimize2,
@@ -13,12 +15,10 @@ import {
   Music,
   PenLine,
   Plus,
-  Search,
   Send,
   Settings2,
   Sparkles,
   Trash2,
-  Upload,
   X
 } from "lucide-react";
 import { ChangeEvent, DragEvent, forwardRef, useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -42,12 +42,18 @@ type TopicProposal = { title: string; reason: string; intent: "confirm" | "drift
 type DirectionProposal = { directions: string[]; reason: string };
 type SettingsState = NonNullable<AppState["settings"]>;
 type VoiceState = "idle" | "connecting" | "live" | "thinking" | "error";
-type SearchResult = { title: string; url: string; snippet: string; source: string };
-type PanelId = "topic" | "resources" | "record";
+type WebPreview = { url: string; title: string };
+type PanelId = "topic" | "resources" | "generated" | "record";
 type ToolId = "whiteboard" | "draft" | "image" | "video" | "audio";
 type StatusLogEntry = { id: string; kind: "status" | "error"; text: string; createdAt: string };
 type TaskItem = { id: string; label: string; startedAt: string };
 type RealtimeToolCall = { name?: string; arguments?: string; call_id?: string };
+type BoardItem = { id: string; kind: "text" | "image"; value: string; x: number; y: number };
+type BoardLink = { id: string; from: string; to: string };
+type DiscussionContract = { goal: string; boundaries: string[]; outputFormat: string; responseLength: "short" | "medium" | "long"; updatedAt: string };
+type DiscussionAgendaItem = { title: string; objective: string; output: string; status: "pending" | "active" | "done" };
+type ResponseScope = { maxSentences: number; onePointOnly: boolean; mustAskFirst: boolean };
+type CognitiveLoad = "simple" | "normal" | "detailed" | "step_by_step";
 const fileDragType = "application/x-discuz-file-id";
 type AudioContextConstructor = typeof AudioContext;
 type VoiceMeter = {
@@ -157,6 +163,39 @@ function toolCallLabel(name = "任务") {
   return ({
     search_context: "检索本地材料",
     web_search: "联网搜索",
+    open_web_page: "打开网页",
+    analyze_word_file: "分析Word文件",
+    analyze_spreadsheet_file: "分析Excel表格",
+    analyze_presentation_file: "分析PPT文件",
+    analyze_image_file: "分析图片",
+    read_current_focus: "读取当前焦点",
+    get_discussion_state: "读取讨论状态",
+    ask_user_confirmation: "请求用户确认",
+    queue_task: "加入任务队列",
+    edit_spreadsheet_file: "编辑表格请求",
+    create_outline: "生成大纲",
+    compare_files: "比较文件",
+    extract_action_items: "提取行动项",
+    create_table_summary: "生成表格总结",
+    export_discussion_record: "导出讨论记录",
+    download_file: "下载文件",
+    create_diagram: "生成图表",
+    schedule_followup: "安排跟进",
+    set_response_style: "设置回答风格",
+    set_discussion_contract: "设置讨论契约",
+    check_topic_alignment: "检查主题对齐",
+    advance_discussion_step: "推进讨论步骤",
+    mark_uncertainty: "标记不确定性",
+    limit_response_scope: "限制回答范围",
+    create_discussion_agenda: "生成讨论议程",
+    lock_discussion_agenda: "锁定讨论议程",
+    request_agenda_change: "请求议程变更",
+    score_discussion_progress: "评估讨论进度",
+    summarize_current_step: "总结当前步骤",
+    detect_overlong_answer: "检查回答过长",
+    set_user_cognitive_load: "设置理解负荷",
+    pause_and_wait: "暂停等待",
+    define_output_rubric: "定义产出标准",
     set_layout: "调整布局",
     open_discussion_tool: "打开工具窗口",
     save_discussion_tool: "保存工具内容",
@@ -177,14 +216,199 @@ function toolCallLabel(name = "任务") {
   } as Record<string, string>)[name] || name;
 }
 
+type OfficeAnalysisKind = "word" | "spreadsheet" | "presentation";
+
+function selectOfficeFile(files: DiscuzFile[], kind: OfficeAnalysisKind, role?: DiscuzFile["role"], query = "") {
+  const queryText = query.trim().toLowerCase();
+  const allowedKinds: Record<OfficeAnalysisKind, DiscuzFile["kind"][]> = {
+    word: ["doc", "docx"],
+    spreadsheet: ["spreadsheet"],
+    presentation: ["pptx"]
+  };
+  const candidates = files.filter((file) => {
+    const roleMatches = !role || file.role === role;
+    const kindMatches = allowedKinds[kind].includes(file.kind);
+    const nameMatches = !queryText || file.originalName.toLowerCase().includes(queryText);
+    return roleMatches && kindMatches && nameMatches;
+  });
+  if (candidates.length) return candidates[0];
+  return files.find((file) => {
+    const roleMatches = !role || file.role === role;
+    return roleMatches && allowedKinds[kind].includes(file.kind);
+  }) ?? null;
+}
+
+function compactText(value: string, maxChars = 18000) {
+  const text = value.trim();
+  return text.length > maxChars ? `${text.slice(0, maxChars)}\n\n... 已截断，以上为前 ${maxChars} 字。` : text;
+}
+
+function buildWordAnalysisPayload(file: DiscuzFile, focus: string) {
+  const paragraphs = file.extractedText
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const possibleHeadings = paragraphs.filter((line) => line.length <= 80 && !/[。！？!?；;]$/.test(line)).slice(0, 12);
+  return {
+    ok: true,
+    mode: "word",
+    file: { id: file.id, name: file.originalName, role: file.role, kind: file.kind, summary: file.summary },
+    focus,
+    structure: {
+      paragraphCount: paragraphs.length,
+      possibleHeadings,
+      openingParagraphs: paragraphs.slice(0, 8)
+    },
+    instructions: [
+      "Use the Documents skill discussion bridge: review structure, argument, clarity, gaps, risks, and possible edits.",
+      "Do not claim visual DOCX layout verification unless a separate render-and-review workflow is run."
+    ],
+    content: compactText(file.extractedText || file.summary || "")
+  };
+}
+
+function buildSpreadsheetAnalysisPayload(file: DiscuzFile, focus: string) {
+  const sections = (file.extractedText || "")
+    .split(/\n\n(?=工作表：|CSV 表格|TSV 表格)/)
+    .map((section) => section.trim())
+    .filter(Boolean);
+  const sheets = sections.map((section) => {
+    const lines = section.split("\n").map((line) => line.trim()).filter(Boolean);
+    const name = lines[0]?.replace(/^工作表：/, "") || file.originalName;
+    const dataRows = lines.slice(1).filter((line) => !line.startsWith("... 已截取"));
+    return {
+      name,
+      visibleRowCount: dataRows.length,
+      firstRows: dataRows.slice(0, 12),
+      truncatedNote: lines.find((line) => line.startsWith("... 已截取")) || ""
+    };
+  });
+  return {
+    ok: true,
+    mode: "spreadsheet",
+    file: { id: file.id, name: file.originalName, role: file.role, kind: file.kind, summary: file.summary },
+    focus,
+    structure: {
+      sheetCount: sheets.length,
+      sheets
+    },
+    instructions: [
+      "Use the Spreadsheets skill discussion bridge: inspect sheets, fields, row patterns, formulas if visible, anomalies, trends, missing columns, and next analysis steps.",
+      "If exact calculations are needed, ask the user to confirm the target sheet/range or request a generated analysis workbook."
+    ],
+    content: compactText(file.extractedText || file.summary || "")
+  };
+}
+
+function buildPresentationAnalysisPayload(file: DiscuzFile, focus: string) {
+  const slides = (file.extractedText || "")
+    .split(/\n\n(?=Slide \d+)/)
+    .map((section) => section.trim())
+    .filter(Boolean)
+    .map((section, index) => {
+      const lines = section.split("\n").map((line) => line.trim()).filter(Boolean);
+      return {
+        number: Number(lines[0]?.match(/\d+/)?.[0] || index + 1),
+        title: lines[1] || `Slide ${index + 1}`,
+        text: lines.slice(1, 12)
+      };
+    });
+  return {
+    ok: true,
+    mode: "presentation",
+    file: { id: file.id, name: file.originalName, role: file.role, kind: file.kind, summary: file.summary },
+    focus,
+    structure: {
+      slideCount: slides.length,
+      slides: slides.slice(0, 30)
+    },
+    instructions: [
+      "Use the Presentations skill discussion bridge: review narrative spine, slide claims, proof objects, flow, audience fit, missing evidence, and improvement opportunities.",
+      "Do not claim visual slide QA unless the deck is rendered and inspected separately."
+    ],
+    content: compactText(file.extractedText || file.summary || "")
+  };
+}
+
+function fileBrief(file: DiscuzFile) {
+  return {
+    id: file.id,
+    name: file.originalName,
+    role: file.role,
+    kind: file.kind,
+    summary: file.summary,
+    previewUrl: file.previewUrl
+  };
+}
+
+function selectFileByQuery(files: DiscuzFile[], query = "", role?: DiscuzFile["role"], kinds?: DiscuzFile["kind"][]) {
+  const queryText = query.trim().toLowerCase();
+  return files.find((file) => {
+    const roleMatches = !role || file.role === role;
+    const kindMatches = !kinds || kinds.includes(file.kind);
+    const nameMatches = !queryText || file.originalName.toLowerCase().includes(queryText);
+    return roleMatches && kindMatches && nameMatches;
+  }) ?? files.find((file) => (!role || file.role === role) && (!kinds || kinds.includes(file.kind))) ?? null;
+}
+
+function markdownTable(headers: string[], rows: string[][]) {
+  const safeHeaders = headers.map((header) => header.trim() || "列");
+  const safeRows = rows.map((row) => safeHeaders.map((_, index) => String(row[index] || "").replace(/\n/g, " ").trim()));
+  return [
+    `| ${safeHeaders.join(" | ")} |`,
+    `| ${safeHeaders.map(() => "---").join(" | ")} |`,
+    ...safeRows.map((row) => `| ${row.join(" | ")} |`)
+  ].join("\n");
+}
+
+function exportFileName(title: string) {
+  const safeTitle = title
+    .replace(/[\\/:*?"<>|]+/g, "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80) || "讨论记录";
+  const stamp = new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  }).format(new Date()).replace(/[/:]/g, "-").replace(/\s+/g, "");
+  return `${safeTitle}-${stamp}.md`;
+}
+
+function downloadMarkdown(filename: string, content: string) {
+  const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function downloadUploadedFile(file: DiscuzFile) {
+  const anchor = document.createElement("a");
+  anchor.href = file.previewUrl;
+  anchor.download = file.originalName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+}
+
+function normalizeLines(value: unknown) {
+  return (Array.isArray(value) ? value : [])
+    .map((item) => String(item || "").trim())
+    .filter(Boolean);
+}
+
 export function App() {
   const [state, setState] = useState<AppState>(emptyState);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [dragTarget, setDragTarget] = useState<DiscuzFile["role"] | null>(null);
   const [draggingFile, setDraggingFile] = useState<{ id: string; role: DiscuzFile["role"] } | null>(null);
-  const [query, setQuery] = useState("");
-  const [contextHits, setContextHits] = useState<Array<{ file: DiscuzFile; snippet: string }>>([]);
-  const [webHits, setWebHits] = useState<SearchResult[]>([]);
   const [webEnabled, setWebEnabled] = useState(true);
   const [meetingRecordEnabled, setMeetingRecordEnabled] = useState(() => localStorage.getItem("discuz-meeting-record-enabled") !== "false");
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -195,18 +419,40 @@ export function App() {
   const [audioInputDevices, setAudioInputDevices] = useState<MediaDeviceInfo[]>([]);
   const [selectedAudioInputId, setSelectedAudioInputId] = useState(() => localStorage.getItem("discuz-audio-input-id") || "");
   const [leftWidth, setLeftWidth] = useState(63);
-  const [topHeight, setTopHeight] = useState(75);
+  const [topHeight, setTopHeight] = useState(70);
+  const [generatedHeight, setGeneratedHeight] = useState(40);
   const [layoutScale, setLayoutScale] = useState(1);
   const [fullscreenPanel, setFullscreenPanel] = useState<PanelId | null>(null);
   const [activeTool, setActiveTool] = useState<ToolId | null>(null);
   const [previewFileId, setPreviewFileId] = useState<string | null>(null);
   const [previewRecordId, setPreviewRecordId] = useState<string | null>(null);
   const [generatedEditorId, setGeneratedEditorId] = useState<string | null>(null);
+  const [webPreview, setWebPreview] = useState<WebPreview | null>(null);
   const [discussionText, setDiscussionText] = useState("");
   const [topicProposal, setTopicProposal] = useState<TopicProposal | null>(null);
   const [draftText, setDraftText] = useState(() => localStorage.getItem("discuz-draft") || "");
-  const [boardItems, setBoardItems] = useState<Array<{ id: string; kind: "text" | "image"; value: string; x: number; y: number }>>(
+  const [boardItems, setBoardItems] = useState<BoardItem[]>(
     () => loadStoredJson("discuz-board-items", [])
+  );
+  const [boardLinks, setBoardLinks] = useState<BoardLink[]>(
+    () => loadStoredJson("discuz-board-links", [])
+  );
+  const [discussionContract, setDiscussionContract] = useState<DiscussionContract | null>(
+    () => loadStoredJson("discuz-discussion-contract", null)
+  );
+  const [discussionAgenda, setDiscussionAgenda] = useState<DiscussionAgendaItem[]>(
+    () => loadStoredJson("discuz-discussion-agenda", [])
+  );
+  const [agendaLocked, setAgendaLocked] = useState(() => localStorage.getItem("discuz-agenda-locked") === "true");
+  const [currentAgendaIndex, setCurrentAgendaIndex] = useState(() => Number(localStorage.getItem("discuz-current-agenda-index") || 0));
+  const [responseScope, setResponseScope] = useState<ResponseScope>(
+    () => loadStoredJson("discuz-response-scope", { maxSentences: 2, onePointOnly: true, mustAskFirst: false })
+  );
+  const [userCognitiveLoad, setUserCognitiveLoad] = useState<CognitiveLoad>(
+    () => (localStorage.getItem("discuz-user-cognitive-load") as CognitiveLoad) || "step_by_step"
+  );
+  const [outputRubric, setOutputRubric] = useState<string[]>(
+    () => loadStoredJson("discuz-output-rubric", [])
   );
   const [drawPoints, setDrawPoints] = useState<Array<{ id: string; x: number; y: number }>>(
     () => loadStoredJson("discuz-board-points", [])
@@ -237,6 +483,7 @@ export function App() {
   const handleToolCallRef = useRef<((_message: RealtimeToolCall) => Promise<void>) | null>(null);
   const responseActiveRef = useRef(false);
   const responsePendingRef = useRef(false);
+  const topicFileChangeBlocksTopicProposalRef = useRef(false);
   const voiceSessionRef = useRef(0);
   const voiceSessionStartedAtRef = useRef<string | null>(null);
   const voiceReconnectTimerRef = useRef<number | null>(null);
@@ -251,6 +498,10 @@ export function App() {
   const primaryFiles = useMemo(() => state.files.filter((file) => file.role === "primary"), [state.files]);
   const contextFiles = useMemo(() => state.files.filter((file) => file.role === "context"), [state.files]);
   const generatedFiles = useMemo(() => state.files.filter((file) => file.role === "generated"), [state.files]);
+  const hasParsingFiles = useMemo(
+    () => state.files.some((file) => file.extractionStatus === "pending" || file.extractionStatus === "processing"),
+    [state.files]
+  );
   const selectedFile = useMemo(
     () => state.files.find((file) => file.id === selectedId) ?? primaryFiles[0] ?? null,
     [state.files, selectedId, primaryFiles]
@@ -269,8 +520,51 @@ export function App() {
   );
   const currentNotes = useMemo(() => [...state.notes].reverse(), [state.notes]);
   const meetingMessages = useMemo(() => [...(state.meetingMessages ?? [])].reverse(), [state.meetingMessages]);
-  const compactViewport = layoutScale < 0.95;
-  const effectiveTopHeight = compactViewport ? Math.min(topHeight, 62) : topHeight;
+  const rightResourceHeight = Math.max(22, Math.min(52, topHeight - 30));
+
+  const buildMeetingRecordMarkdown = useCallback(() => [
+    `# ${state.discussionTopic ? `${state.discussionTopic} - 会议记录` : "会议记录"}`,
+    "",
+    `导出时间：${new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date())}`,
+    "",
+    ...(meetingMessages.length
+      ? meetingMessages.map((message) => `- ${message.role === "assistant" ? "AI" : "用户"}｜${shortTime(message.createdAt)}：${message.text}`)
+      : ["暂无会议记录"])
+  ].join("\n"), [meetingMessages, state.discussionTopic]);
+
+  const buildNotesMarkdown = useCallback(() => [
+    `# ${state.discussionTopic ? `${state.discussionTopic} - 要点` : "讨论要点"}`,
+    "",
+    `导出时间：${new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date())}`,
+    "",
+    ...(currentNotes.length
+      ? currentNotes.map((note) => `- ${noteLabel(note.kind)}｜${shortTime(note.createdAt)}｜${note.source || "AI summary"}：${note.text}`)
+      : ["暂无要点"])
+  ].join("\n"), [currentNotes, state.discussionTopic]);
+
+  const buildDiscussionRecordMarkdown = useCallback((title = "讨论记录") => [
+    `# ${title.replace(/\.md$/i, "")}`,
+    state.discussionTopic ? `主题：${state.discussionTopic}` : "",
+    "",
+    "## 会议记录",
+    ...(state.meetingMessages.length ? state.meetingMessages.map((message) => `- ${message.role === "user" ? "用户" : "AI"}｜${shortTime(message.createdAt)}：${message.text}`) : ["暂无会议记录"]),
+    "",
+    "## 要点",
+    ...(state.notes.length ? state.notes.map((note) => `- ${noteLabel(note.kind)}｜${shortTime(note.createdAt)}：${note.text}`) : ["暂无要点"]),
+    "",
+    "## 讨论方向",
+    ...(state.directions.length ? state.directions.map((direction) => `- ${direction.completed ? "[x]" : "[ ]"} ${direction.text}`) : ["暂无讨论方向"])
+  ].filter(Boolean).join("\n"), [state.directions, state.discussionTopic, state.meetingMessages, state.notes]);
+
+  const exportMeetingRecord = useCallback(() => {
+    downloadMarkdown(exportFileName(`${state.discussionTopic || "当前讨论"}-会议记录`), buildMeetingRecordMarkdown());
+    setStatusText("会议记录已导出");
+  }, [buildMeetingRecordMarkdown, state.discussionTopic]);
+
+  const exportNotes = useCallback(() => {
+    downloadMarkdown(exportFileName(`${state.discussionTopic || "当前讨论"}-要点`), buildNotesMarkdown());
+    setStatusText("要点已导出");
+  }, [buildNotesMarkdown, state.discussionTopic]);
 
   const loadState = useCallback(async () => {
     const response = await fetch("/api/state");
@@ -285,6 +579,14 @@ export function App() {
   useEffect(() => {
     loadState().catch((err) => setError(err.message));
   }, [loadState]);
+
+  useEffect(() => {
+    if (!hasParsingFiles) return;
+    const timer = window.setInterval(() => {
+      loadState().catch((err) => setError(err.message));
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [hasParsingFiles, loadState]);
 
   useEffect(() => {
     localStorage.setItem("discuz-draft", draftText);
@@ -315,8 +617,40 @@ export function App() {
   }, [boardItems]);
 
   useEffect(() => {
+    localStorage.setItem("discuz-board-links", JSON.stringify(boardLinks));
+  }, [boardLinks]);
+
+  useEffect(() => {
     localStorage.setItem("discuz-board-points", JSON.stringify(drawPoints));
   }, [drawPoints]);
+
+  useEffect(() => {
+    localStorage.setItem("discuz-discussion-contract", JSON.stringify(discussionContract));
+  }, [discussionContract]);
+
+  useEffect(() => {
+    localStorage.setItem("discuz-discussion-agenda", JSON.stringify(discussionAgenda));
+  }, [discussionAgenda]);
+
+  useEffect(() => {
+    localStorage.setItem("discuz-agenda-locked", String(agendaLocked));
+  }, [agendaLocked]);
+
+  useEffect(() => {
+    localStorage.setItem("discuz-current-agenda-index", String(currentAgendaIndex));
+  }, [currentAgendaIndex]);
+
+  useEffect(() => {
+    localStorage.setItem("discuz-response-scope", JSON.stringify(responseScope));
+  }, [responseScope]);
+
+  useEffect(() => {
+    localStorage.setItem("discuz-user-cognitive-load", userCognitiveLoad);
+  }, [userCognitiveLoad]);
+
+  useEffect(() => {
+    localStorage.setItem("discuz-output-rubric", JSON.stringify(outputRubric));
+  }, [outputRubric]);
 
   useEffect(() => {
     if (!settingsOpen) return;
@@ -443,10 +777,27 @@ export function App() {
     window.addEventListener("pointerup", onUp);
   };
 
+  const startGeneratedRecordResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const startY = event.clientY;
+    const startHeight = generatedHeight;
+    const onMove = (moveEvent: PointerEvent) => {
+      const delta = ((moveEvent.clientY - startY) / window.innerHeight) * 100;
+      setGeneratedHeight(Math.min(48, Math.max(14, startHeight + delta)));
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  };
+
   const applyLayoutCommand = (target: PanelId | "reset", mode: string) => {
     if (target === "reset" || mode === "reset") {
       setLeftWidth(63);
-      setTopHeight(75);
+      setTopHeight(70);
+      setGeneratedHeight(40);
       setFullscreenPanel(null);
       return;
     }
@@ -457,10 +808,17 @@ export function App() {
       if (target === "resources") {
         setLeftWidth(50);
         setTopHeight(78);
+        setGeneratedHeight(18);
+      }
+      if (target === "generated") {
+        setLeftWidth(50);
+        setTopHeight(54);
+        setGeneratedHeight(42);
       }
       if (target === "record") {
         setLeftWidth(50);
         setTopHeight(32);
+        setGeneratedHeight(16);
       }
     }
   };
@@ -487,6 +845,7 @@ export function App() {
       const payload = await uploadFiles("/api/files/primary", "files", list);
       setState((current) => ({ ...current, files: payload.files, activities: payload.activities }));
       setSelectedId(payload.uploaded?.[0]?.id ?? payload.file?.id ?? selectedId);
+      notifyPrimaryFilesAdded((payload.uploaded ?? (payload.file ? [payload.file] : [])) as DiscuzFile[]);
       setError("");
     } finally {
       finishTask();
@@ -513,8 +872,8 @@ export function App() {
     try {
       const payload = await uploadFiles("/api/files/generated/upload", "files", list);
       setState((current) => ({ ...current, files: payload.files, activities: payload.activities }));
-      setGeneratedEditorId(payload.uploaded?.[0]?.id ?? payload.file?.id ?? null);
-      setSelectedId(payload.uploaded?.[0]?.id ?? payload.file?.id ?? selectedId);
+      setGeneratedEditorId(null);
+      setWebPreview(null);
       setError("");
     } finally {
       finishTask();
@@ -598,6 +957,7 @@ export function App() {
         setGeneratedEditorId(null);
         setPreviewRecordId(null);
         setActiveTool(null);
+        setWebPreview(null);
       }
       return file;
     } finally {
@@ -640,6 +1000,7 @@ export function App() {
       }));
       setSelectedId(file.id);
       setGeneratedEditorId(null);
+      notifyPrimaryFilesAdded(payload.file ? [payload.file as DiscuzFile] : [file]);
       setError("");
       return payload.file as DiscuzFile;
     } finally {
@@ -666,6 +1027,7 @@ export function App() {
       setSelectedId(file.id);
       if (role !== "generated") setGeneratedEditorId(null);
       if (previewFileId === file.id && role === "generated") setPreviewFileId(null);
+      if (role === "primary") notifyPrimaryFilesAdded(payload.file ? [payload.file as DiscuzFile] : [file]);
       setError("");
       return payload.file as DiscuzFile;
     } finally {
@@ -708,6 +1070,26 @@ export function App() {
     return true;
   }, []);
 
+  const sendRealtimeSystemEvent = (text: string, options: { blockTopicProposal?: boolean } = {}) => {
+    const channel = dataChannelRef.current;
+    if (!channel || channel.readyState !== "open") return false;
+    if (options.blockTopicProposal) {
+      topicFileChangeBlocksTopicProposalRef.current = true;
+      window.setTimeout(() => {
+        topicFileChangeBlocksTopicProposalRef.current = false;
+      }, 18000);
+    }
+    channel.send(JSON.stringify({
+      type: "conversation.item.create",
+      item: {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text }]
+      }
+    }));
+    return requestRealtimeResponse();
+  };
+
   const flushRealtimeResponse = useCallback(() => {
     if (!responsePendingRef.current) return;
     requestRealtimeResponse();
@@ -740,10 +1122,36 @@ export function App() {
     ].filter(Boolean).join("\n\n");
   };
 
+  const primaryFileChangeNames = (files: DiscuzFile[]) => files.map((file) => `《${file.originalName}》`).join("、");
+
+  const notifyPrimaryFilesAdded = (files: DiscuzFile[]) => {
+    if (!files.length) return;
+    sendRealtimeSystemEvent(
+      [
+        `系统事件：用户刚刚在主题区添加了主题文件：${primaryFileChangeNames(files)}。`,
+        "请立即用 1 句中文询问用户接下来想怎么讨论，例如先看哪份、想解决什么问题或是否需要你先粗看一遍。",
+        "重要约束：不要调用 propose_discussion_topic、propose_discussion_directions 或 update_discussion_directions；不要修改、重命名、清空或重新确认当前讨论主题；除非用户下一句明确要求修改主题或重新确认主题。"
+      ].join("\n"),
+      { blockTopicProposal: true }
+    );
+  };
+
+  const notifyPrimaryFileDeleted = (file: DiscuzFile) => {
+    sendRealtimeSystemEvent(
+      [
+        `系统事件：用户刚刚从主题区删除了主题文件《${file.originalName}》。`,
+        "请立即用 1 句中文询问用户下一步要继续用剩余主题文件讨论、上传新的主题文件，还是暂停这个主题。",
+        "重要约束：不要调用 propose_discussion_topic、propose_discussion_directions 或 update_discussion_directions；不要修改、重命名、清空或重新确认当前讨论主题；除非用户下一句明确要求修改主题或重新确认主题。"
+      ].join("\n"),
+      { blockTopicProposal: true }
+    );
+  };
+
   const openFileDiscussionWindow = (file: DiscuzFile) => {
     setSelectedId(file.id);
     setActiveTool(null);
     setPreviewRecordId(null);
+    setWebPreview(null);
     if (file.role === "generated" && (file.kind === "markdown" || file.kind === "text")) {
       setPreviewFileId(null);
       setGeneratedEditorId(file.id);
@@ -758,6 +1166,7 @@ export function App() {
     setPreviewFileId(null);
     setPreviewRecordId(null);
     setGeneratedEditorId(null);
+    setWebPreview(null);
     setActiveTool(tool);
     if (tool === "draft") notifyForegroundDiscussion("临时文档", draftText || "当前临时文档为空。");
     if (tool === "whiteboard") notifyForegroundDiscussion("无限白板", boardToMarkdown());
@@ -772,9 +1181,19 @@ export function App() {
       .filter((item) => item.kind === "image")
       .map((item, index) => `![白板图片 ${index + 1}](${item.value})`)
       .join("\n\n");
+    const itemMap = new Map(boardItems.map((item) => [item.id, item.value.trim() || "未命名节点"]));
+    const mindMapLinks = boardLinks
+      .map((link) => {
+        const from = itemMap.get(link.from);
+        const to = itemMap.get(link.to);
+        return from && to ? `- ${from} -> ${to}` : "";
+      })
+      .filter(Boolean)
+      .join("\n");
     return [
       "# 白板临时记录",
       textItems ? `## 文本\n${textItems}` : "",
+      mindMapLinks ? `## 思维导图关系\n${mindMapLinks}` : "",
       imageItems ? `## 图片\n${imageItems}` : "",
       drawPoints.length ? `## 手绘轨迹\n已记录 ${drawPoints.length} 个手绘点。` : ""
     ].filter(Boolean).join("\n\n");
@@ -791,6 +1210,7 @@ export function App() {
     if (tool === "whiteboard") {
       await createGeneratedFile(`白板记录-${shortTime(new Date().toISOString()).replace(":", "-")}.md`, boardToMarkdown());
       setBoardItems([]);
+      setBoardLinks([]);
       setDrawPoints([]);
       setStatusText("白板已保存，已新建空白页");
     }
@@ -800,6 +1220,7 @@ export function App() {
     if (tool === "draft") setDraftText("");
     if (tool === "whiteboard") {
       setBoardItems([]);
+      setBoardLinks([]);
       setDrawPoints([]);
     }
   };
@@ -928,48 +1349,6 @@ export function App() {
     }));
   };
 
-  const notifyPrimaryFileDeleted = (file: DiscuzFile) => {
-    setTopicProposal({
-      title: state.discussionTopic || "主题文件已删除",
-      reason: `主题文件“${file.originalName}”已删除。请确认是停止当前主题讨论，还是更换/上传新的讨论主题文件。`,
-      intent: "drift"
-    });
-    const channel = dataChannelRef.current;
-    if (channel?.readyState === "open") {
-      channel.send(JSON.stringify({
-        type: "conversation.item.create",
-        item: {
-          type: "message",
-          role: "user",
-          content: [{
-            type: "input_text",
-            text: `系统事件：用户刚刚删除了当前讨论主题文件《${file.originalName}》。请立即提醒用户不要继续基于已删除文件讨论，并询问用户：是停止此主题的讨论，还是更换新的讨论主题/上传新的主题文件？`
-          }]
-        }
-      }));
-      requestRealtimeResponse();
-    }
-  };
-
-  const searchAll = async (value = query) => {
-    const trimmed = value.trim();
-    if (!trimmed) {
-      setContextHits([]);
-      setWebHits([]);
-      return;
-    }
-    const [contextResponse, webResponse] = await Promise.all([
-      fetch(`/api/context/search?q=${encodeURIComponent(trimmed)}`),
-      webEnabled ? fetch(`/api/web/search?q=${encodeURIComponent(trimmed)}`) : Promise.resolve(null)
-    ]);
-    const contextPayload = await contextResponse.json();
-    setContextHits(contextPayload.results);
-    if (webResponse) {
-      const webPayload = await webResponse.json();
-      setWebHits(webPayload.results);
-    }
-  };
-
   const handleToolCall = async (message: RealtimeToolCall) => {
     const channel = dataChannelRef.current;
     if (!channel || channel.readyState !== "open" || !message.call_id || !message.name) return;
@@ -986,6 +1365,22 @@ export function App() {
         else {
           const response = await fetch(`/api/web/search?q=${encodeURIComponent(args.query || "")}`);
           output = await response.json();
+        }
+      }
+      if (message.name === "open_web_page") {
+        const rawUrl = String(args.url || "").trim();
+        const url = rawUrl && !/^https?:\/\//i.test(rawUrl) ? `https://${rawUrl}` : rawUrl;
+        try {
+          const parsed = new URL(url);
+          if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("Unsupported protocol");
+          setWebPreview({ url: parsed.toString(), title: String(args.title || parsed.hostname || "网页").trim() });
+          setActiveTool(null);
+          setPreviewFileId(null);
+          setPreviewRecordId(null);
+          setGeneratedEditorId(null);
+          output = { ok: true, opened: parsed.toString() };
+        } catch {
+          output = { ok: false, error: "Invalid web URL. Use an http or https URL." };
         }
       }
       if (message.name === "set_layout") {
@@ -1018,6 +1413,7 @@ export function App() {
       if (message.name === "close_foreground_window") {
         const target = String(args.target || "all");
         if (target === "tool" || target === "all") setActiveTool(null);
+        if (target === "web" || target === "all") setWebPreview(null);
         if (target === "file" || target === "all") {
           setPreviewFileId(null);
           setGeneratedEditorId(null);
@@ -1038,6 +1434,379 @@ export function App() {
           output = { ok: true, opened: candidate.originalName };
         } else {
           output = { ok: false, error: "No matching file found." };
+        }
+      }
+      if (message.name === "analyze_word_file" || message.name === "analyze_spreadsheet_file" || message.name === "analyze_presentation_file") {
+        const role = args.role === "primary" || args.role === "context" || args.role === "generated" ? args.role as DiscuzFile["role"] : undefined;
+        const queryText = String(args.query || "").trim();
+        const focus = String(args.focus || "").trim();
+        const analysisKind: OfficeAnalysisKind =
+          message.name === "analyze_word_file" ? "word" :
+            message.name === "analyze_spreadsheet_file" ? "spreadsheet" :
+              "presentation";
+        const candidate = selectOfficeFile(state.files, analysisKind, role, queryText);
+        if (!candidate) {
+          output = {
+            ok: false,
+            error: `No matching ${analysisKind} file found. Ask the user to upload one or specify the filename.`
+          };
+        } else if (analysisKind === "word") {
+          output = buildWordAnalysisPayload(candidate, focus);
+        } else if (analysisKind === "spreadsheet") {
+          output = buildSpreadsheetAnalysisPayload(candidate, focus);
+        } else {
+          output = buildPresentationAnalysisPayload(candidate, focus);
+        }
+      }
+      if (message.name === "analyze_image_file") {
+        const role = args.role === "primary" || args.role === "context" || args.role === "generated" ? args.role as DiscuzFile["role"] : undefined;
+        const candidate = selectFileByQuery(state.files, String(args.query || ""), role, ["image"]);
+        if (!candidate) {
+          output = { ok: false, error: "No matching image file found. Ask the user to upload or specify an image." };
+        } else {
+          const response = await fetch(`/api/files/${encodeURIComponent(candidate.id)}/analyze-image`, { method: "POST" });
+          const payload = await response.json();
+          if (!response.ok) throw new Error(payload.error || "Image analysis failed");
+          setState((current) => ({
+            ...current,
+            files: payload.files ?? current.files,
+            activities: payload.activities ?? current.activities
+          }));
+          output = {
+            ok: true,
+            file: fileBrief(payload.file ?? candidate),
+            focus: String(args.focus || "").trim(),
+            analysis: payload.file?.extractedText || candidate.extractedText || candidate.summary
+          };
+        }
+      }
+      if (message.name === "read_current_focus") {
+        output = {
+          ok: true,
+          activeTool,
+          foreground: {
+            tool: activeTool,
+            file: previewFile ? fileBrief(previewFile) : null,
+            record: previewRecord ? { id: previewRecord.id, title: previewRecord.title, noteCount: previewRecord.noteCount } : null,
+            generatedEditor: generatedEditorFile ? fileBrief(generatedEditorFile) : null,
+            web: webPreview
+          },
+          selectedFile: selectedFile ? fileBrief(selectedFile) : null,
+          topic: state.discussionTopic || state.topics.find((topic) => topic.active)?.title || ""
+        };
+      }
+      if (message.name === "get_discussion_state") {
+        output = {
+          ok: true,
+          topic: state.discussionTopic,
+          activeTopicId: state.activeTopicId,
+          files: state.files.map(fileBrief),
+          directions: state.directions,
+          notes: state.notes.slice(-20),
+          meetingMessages: state.meetingMessages.slice(-40),
+          records: state.records.slice(-10),
+          pendingTasks,
+          statusText,
+          foreground: { activeTool, previewFile: previewFile ? fileBrief(previewFile) : null, webPreview },
+          governance: {
+            discussionContract,
+            discussionAgenda,
+            agendaLocked,
+            currentAgendaIndex,
+            responseScope,
+            userCognitiveLoad,
+            outputRubric
+          }
+        };
+      }
+      if (message.name === "ask_user_confirmation") {
+        const prompt = String(args.prompt || "").trim();
+        const options = normalizeLines(args.options).slice(0, 4);
+        setStatusText(prompt ? `等待用户确认：${prompt}` : "等待用户确认");
+        output = { ok: true, needsConfirmation: true, prompt, options };
+      }
+      if (message.name === "queue_task") {
+        const title = String(args.title || "待处理任务").trim();
+        const detail = String(args.detail || "").trim();
+        setStatusLog((items) => [...items, {
+          id: crypto.randomUUID(),
+          kind: "status",
+          text: `已加入待办：${title}${detail ? `｜${detail}` : ""}`,
+          createdAt: new Date().toISOString()
+        }]);
+        output = { ok: true, queued: title, detail };
+      }
+      if (message.name === "edit_spreadsheet_file") {
+        const role = args.role === "primary" || args.role === "context" || args.role === "generated" ? args.role as DiscuzFile["role"] : "generated";
+        const candidate = selectFileByQuery(state.files, String(args.query || ""), role, ["spreadsheet"]);
+        const editPlan = String(args.editPlan || args.instructions || "").trim();
+        if (!candidate) {
+          output = { ok: false, error: "No matching spreadsheet file found in the requested area." };
+        } else if (!editPlan) {
+          output = { ok: false, error: "Missing spreadsheet edit plan." };
+        } else {
+          const file = await createGeneratedFile(
+            `表格修改方案-${candidate.originalName}.md`,
+            [
+              `# 表格修改方案：${candidate.originalName}`,
+              `目标文件：${candidate.originalName}`,
+              `安全说明：当前工具先生成可审核的修改方案，不直接覆盖原 Excel。`,
+              "",
+              "## 修改要求",
+              editPlan,
+              "",
+              "## 原表格摘录",
+              compactText(candidate.extractedText || candidate.summary || "", 12000)
+            ].join("\n")
+          );
+          output = { ok: true, generated: file.originalName, sourceFile: fileBrief(candidate) };
+        }
+      }
+      if (message.name === "create_outline") {
+        const title = String(args.title || "讨论大纲.md").trim();
+        const sections = normalizeLines(args.sections);
+        const text = String(args.text || "").trim() || sections.map((section, index) => `${index + 1}. ${section}`).join("\n");
+        if (!text) output = { ok: false, error: "Missing outline content." };
+        else {
+          const file = await createGeneratedFile(title, `# ${title.replace(/\.md$/i, "")}\n\n${text}`);
+          output = { ok: true, generated: file.originalName };
+        }
+      }
+      if (message.name === "compare_files") {
+        const firstRole = args.firstRole === "primary" || args.firstRole === "context" || args.firstRole === "generated" ? args.firstRole as DiscuzFile["role"] : undefined;
+        const secondRole = args.secondRole === "primary" || args.secondRole === "context" || args.secondRole === "generated" ? args.secondRole as DiscuzFile["role"] : undefined;
+        const first = selectFileByQuery(state.files, String(args.firstQuery || ""), firstRole, undefined);
+        const second = selectFileByQuery(state.files, String(args.secondQuery || ""), secondRole, undefined);
+        if (!first || !second) {
+          output = { ok: false, error: "Need two matching files to compare." };
+        } else {
+          output = {
+            ok: true,
+            files: [fileBrief(first), fileBrief(second)],
+            firstContent: compactText(first.extractedText || first.summary || "", 10000),
+            secondContent: compactText(second.extractedText || second.summary || "", 10000),
+            instruction: "Compare these two files and summarize differences, risks, and suggested next edits."
+          };
+        }
+      }
+      if (message.name === "extract_action_items") {
+        const items = (Array.isArray(args.items) ? args.items : []).map((item: unknown) => {
+          const value = item as { task?: unknown; owner?: unknown; due?: unknown };
+          return [String(value.task || "").trim(), String(value.owner || "").trim(), String(value.due || "").trim()];
+        }).filter((row: string[]) => row[0]);
+        const source = String(args.source || "会议记录").trim();
+        if (!items.length) output = { ok: false, error: "Missing action items." };
+        else {
+          const file = await createGeneratedFile(`行动项-${shortTime(new Date().toISOString()).replace(":", "-")}.md`, [
+            `# 行动项`,
+            `来源：${source}`,
+            "",
+            markdownTable(["任务", "负责人", "截止时间"], items)
+          ].join("\n"));
+          output = { ok: true, generated: file.originalName, count: items.length };
+        }
+      }
+      if (message.name === "create_table_summary") {
+        const headers = normalizeLines(args.headers).slice(0, 8);
+        const rows = (Array.isArray(args.rows) ? args.rows : []).map((row: unknown) => Array.isArray(row) ? row.map((cell) => String(cell || "")) : []);
+        const title = String(args.title || "讨论表格总结.md").trim();
+        if (!headers.length || !rows.length) output = { ok: false, error: "Missing table headers or rows." };
+        else {
+          const file = await createGeneratedFile(title, `# ${title.replace(/\.md$/i, "")}\n\n${markdownTable(headers, rows)}`);
+          output = { ok: true, generated: file.originalName, rows: rows.length };
+        }
+      }
+      if (message.name === "export_discussion_record") {
+        const title = String(args.title || `讨论记录-${shortTime(new Date().toISOString()).replace(":", "-")}.md`).trim();
+        const file = await createGeneratedFile(title, buildDiscussionRecordMarkdown(title));
+        output = { ok: true, generated: file.originalName };
+      }
+      if (message.name === "download_file") {
+        const target = ["selected_file", "foreground_file", "file", "meeting_record", "notes", "discussion_record"].includes(args.target) ? String(args.target) : "selected_file";
+        const title = String(args.title || "").trim();
+        if (target === "meeting_record") {
+          downloadMarkdown(exportFileName(title || `${state.discussionTopic || "当前讨论"}-会议记录`), buildMeetingRecordMarkdown());
+          setStatusText("会议记录已下载");
+          output = { ok: true, downloaded: "meeting_record" };
+        } else if (target === "notes") {
+          downloadMarkdown(exportFileName(title || `${state.discussionTopic || "当前讨论"}-要点`), buildNotesMarkdown());
+          setStatusText("要点已下载");
+          output = { ok: true, downloaded: "notes" };
+        } else if (target === "discussion_record") {
+          const filename = title || `${state.discussionTopic || "当前讨论"}-讨论记录`;
+          downloadMarkdown(exportFileName(filename), buildDiscussionRecordMarkdown(filename));
+          setStatusText("讨论记录已下载");
+          output = { ok: true, downloaded: "discussion_record" };
+        } else {
+          const role = args.role === "primary" || args.role === "context" || args.role === "generated" ? args.role as DiscuzFile["role"] : undefined;
+          const queryText = String(args.query || "").trim();
+          const candidate =
+            target === "foreground_file" ? generatedEditorFile ?? previewFile :
+              target === "file" ? selectFileByQuery(state.files, queryText, role, undefined) :
+                selectedFile;
+          if (!candidate) {
+            output = { ok: false, error: "No matching file found to download." };
+          } else {
+            downloadUploadedFile(candidate);
+            setStatusText("文件已下载");
+            output = { ok: true, downloaded: candidate.originalName, file: fileBrief(candidate) };
+          }
+        }
+      }
+      if (message.name === "create_diagram") {
+        const title = String(args.title || "讨论图表.md").trim();
+        const diagramType = String(args.diagramType || "mermaid").trim();
+        const content = String(args.content || "").trim();
+        if (!content) output = { ok: false, error: "Missing diagram content." };
+        else {
+          const fenced = diagramType === "mermaid" || content.startsWith("graph ") || content.startsWith("flowchart ")
+            ? `\`\`\`mermaid\n${content}\n\`\`\``
+            : content;
+          const file = await createGeneratedFile(title, `# ${title.replace(/\.md$/i, "")}\n\n${fenced}`);
+          output = { ok: true, generated: file.originalName, diagramType };
+        }
+      }
+      if (message.name === "schedule_followup") {
+        const title = String(args.title || "后续跟进").trim();
+        const when = String(args.when || "").trim();
+        const detail = String(args.detail || "").trim();
+        await saveNote(`${title}${when ? `｜时间：${when}` : ""}${detail ? `｜${detail}` : ""}`, "action", "AI follow-up");
+        output = { ok: true, scheduled: title, when, detail, noteSaved: true };
+      }
+      if (message.name === "set_response_style") {
+        const length = ["short", "medium", "long"].includes(args.length) ? args.length : "short";
+        const tone = String(args.tone || "活泼、简洁").trim();
+        const askFirst = args.askFirst !== false;
+        localStorage.setItem("discuz-response-style", JSON.stringify({ length, tone, askFirst }));
+        output = { ok: true, style: { length, tone, askFirst }, note: "Style is saved locally and should be followed by the assistant in future responses." };
+      }
+      if (message.name === "set_discussion_contract") {
+        const goal = String(args.goal || "").trim();
+        const boundaries = normalizeLines(args.boundaries).slice(0, 8);
+        const outputFormat = String(args.outputFormat || "阶段性结论 + 下一步").trim();
+        const responseLength = ["short", "medium", "long"].includes(args.responseLength) ? args.responseLength as DiscussionContract["responseLength"] : "short";
+        if (!goal) output = { ok: false, error: "Missing discussion goal." };
+        else {
+          const contract = { goal, boundaries, outputFormat, responseLength, updatedAt: new Date().toISOString() };
+          setDiscussionContract(contract);
+          setResponseScope((scope) => ({ ...scope, maxSentences: responseLength === "long" ? 6 : responseLength === "medium" ? 4 : 2 }));
+          await saveNote(`讨论契约：目标是“${goal}”；边界：${boundaries.join("、") || "暂无"}；输出形式：${outputFormat}`, "point", "Discussion contract");
+          output = { ok: true, contract };
+        }
+      }
+      if (message.name === "check_topic_alignment") {
+        const aligned = args.aligned !== false;
+        const score = Math.max(0, Math.min(100, Number(args.score ?? (aligned ? 90 : 45))));
+        const issue = String(args.issue || "").trim();
+        const recommendation = String(args.recommendation || "").trim();
+        if (!aligned || score < 70) setStatusText(`主题偏离提醒：${recommendation || issue || "请回到当前主题"}`);
+        output = { ok: true, aligned, score, issue, recommendation, topic: state.discussionTopic };
+      }
+      if (message.name === "advance_discussion_step") {
+        const nextIndex = Number.isFinite(Number(args.stepIndex)) ? Number(args.stepIndex) : currentAgendaIndex + 1;
+        const note = String(args.note || "").trim();
+        setCurrentAgendaIndex(Math.max(0, nextIndex));
+        setDiscussionAgenda((items) => items.map((item, index) => ({
+          ...item,
+          status: index < nextIndex ? "done" : index === nextIndex ? "active" : "pending"
+        })));
+        if (note) await saveNote(note, "point", "Discussion step");
+        output = { ok: true, currentAgendaIndex: Math.max(0, nextIndex), note };
+      }
+      if (message.name === "mark_uncertainty") {
+        const text = String(args.text || "").trim();
+        const reason = String(args.reason || "").trim();
+        const needed = normalizeLines(args.needed).slice(0, 5);
+        if (!text) output = { ok: false, error: "Missing uncertainty text." };
+        else {
+          await saveNote(`不确定：${text}${reason ? `；原因：${reason}` : ""}${needed.length ? `；需要补充：${needed.join("、")}` : ""}`, "question", "Uncertainty");
+          output = { ok: true, text, reason, needed };
+        }
+      }
+      if (message.name === "limit_response_scope") {
+        const maxSentences = Math.max(1, Math.min(8, Number(args.maxSentences || 2)));
+        const onePointOnly = args.onePointOnly !== false;
+        const mustAskFirst = args.mustAskFirst === true;
+        const scope = { maxSentences, onePointOnly, mustAskFirst };
+        setResponseScope(scope);
+        output = { ok: true, scope };
+      }
+      if (message.name === "create_discussion_agenda") {
+        const items = (Array.isArray(args.items) ? args.items : []).map((item: unknown) => {
+          const value = item as { title?: unknown; objective?: unknown; output?: unknown };
+          return {
+            title: String(value.title || "").trim(),
+            objective: String(value.objective || "").trim(),
+            output: String(value.output || "").trim(),
+            status: "pending" as const
+          };
+        }).filter((item: DiscussionAgendaItem) => item.title).slice(0, 8);
+        if (!items.length) output = { ok: false, error: "Missing agenda items." };
+        else {
+          const agenda = items.map((item: DiscussionAgendaItem, index: number) => ({ ...item, status: index === 0 ? "active" as const : "pending" as const }));
+          setDiscussionAgenda(agenda);
+          setCurrentAgendaIndex(0);
+          setAgendaLocked(false);
+          output = { ok: true, agenda, locked: false };
+        }
+      }
+      if (message.name === "lock_discussion_agenda") {
+        setAgendaLocked(true);
+        const reason = String(args.reason || "").trim();
+        await saveNote(`讨论议程已锁定${reason ? `：${reason}` : "。"}`, "decision", "Agenda");
+        output = { ok: true, locked: true, agenda: discussionAgenda };
+      }
+      if (message.name === "request_agenda_change") {
+        const change = String(args.change || "").trim();
+        const reason = String(args.reason || "").trim();
+        setStatusText(change ? `等待议程变更确认：${change}` : "等待议程变更确认");
+        output = { ok: true, needsConfirmation: true, change, reason, locked: agendaLocked };
+      }
+      if (message.name === "score_discussion_progress") {
+        const score = Math.max(0, Math.min(100, Number(args.score || 0)));
+        const completed = normalizeLines(args.completed).slice(0, 8);
+        const blocked = normalizeLines(args.blocked).slice(0, 8);
+        const next = normalizeLines(args.next).slice(0, 8);
+        output = { ok: true, score, completed, blocked, next };
+      }
+      if (message.name === "summarize_current_step") {
+        const summary = String(args.summary || "").trim();
+        const next = String(args.next || "").trim();
+        if (!summary) output = { ok: false, error: "Missing step summary." };
+        else {
+          await saveNote(`${summary}${next ? ` 下一步：${next}` : ""}`, "point", "Step summary");
+          output = { ok: true, summary, next };
+        }
+      }
+      if (message.name === "detect_overlong_answer") {
+        const original = String(args.original || "").trim();
+        const compressed = String(args.compressed || "").trim();
+        const maxSentences = Math.max(1, Math.min(8, Number(args.maxSentences || responseScope.maxSentences)));
+        output = {
+          ok: true,
+          overlong: original ? original.split(/[。！？!?]/).filter(Boolean).length > maxSentences : false,
+          maxSentences,
+          compressed
+        };
+      }
+      if (message.name === "set_user_cognitive_load") {
+        const level = ["simple", "normal", "detailed", "step_by_step"].includes(args.level) ? args.level as CognitiveLoad : "step_by_step";
+        setUserCognitiveLoad(level);
+        if (level === "simple" || level === "step_by_step") setResponseScope((scope) => ({ ...scope, maxSentences: 2, onePointOnly: true }));
+        output = { ok: true, level };
+      }
+      if (message.name === "pause_and_wait") {
+        const reason = String(args.reason || "等待用户继续").trim();
+        setStatusText(reason);
+        output = { ok: true, paused: true, reason };
+      }
+      if (message.name === "define_output_rubric") {
+        const criteria = normalizeLines(args.criteria).slice(0, 10);
+        if (!criteria.length) output = { ok: false, error: "Missing rubric criteria." };
+        else {
+          setOutputRubric(criteria);
+          const file = await createGeneratedFile("产出评价标准.md", `# 产出评价标准\n\n${criteria.map((item, index) => `${index + 1}. ${item}`).join("\n")}`);
+          output = { ok: true, criteria, generated: file.originalName };
         }
       }
       if (message.name === "save_discussion_note") {
@@ -1129,6 +1898,7 @@ export function App() {
         if (candidate && text) {
           await updateGeneratedFile(candidate, text);
           setGeneratedEditorId(candidate.id);
+          setWebPreview(null);
           output = { ok: true, updated: candidate.originalName };
         } else {
           output = { ok: false, error: "No editable generated text file or replacement text found." };
@@ -1174,7 +1944,13 @@ export function App() {
         const title = String(args.title || "").trim();
         const reason = String(args.reason || "").trim();
         const intent = args.intent === "drift" ? "drift" : "confirm";
-        if (title) {
+        if (topicFileChangeBlocksTopicProposalRef.current) {
+          setStatusText("已阻止自动修改主题");
+          output = {
+            ok: false,
+            error: "刚刚发生主题区文件增删。此时只能询问用户下一步，不允许拟确认或修改讨论主题，除非用户明确要求。"
+          };
+        } else if (title) {
           setTopicProposal({ title, reason, intent });
           output = { ok: true, proposed: title };
         } else {
@@ -1583,11 +2359,10 @@ export function App() {
     setPreviewRecordId(null);
     setGeneratedEditorId(null);
     setActiveTool(null);
+    setWebPreview(null);
     setTopicProposal(null);
     setDirectionProposal(null);
     setDiscussionText("");
-    setContextHits([]);
-    setWebHits([]);
     setError("");
     setTranscript("");
     setPendingTasks([]);
@@ -1750,6 +2525,18 @@ export function App() {
                     <span className="transfer-badge demote"><Minus size={17} /></span>
                   ) : (
                     <div className="card-actions">
+                      <button
+                        className="card-export"
+                        title="导出文件"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          downloadUploadedFile(file);
+                          setStatusText("文件已导出");
+                        }}
+                        onDoubleClick={(event) => event.stopPropagation()}
+                      >
+                        <Download size={14} />
+                      </button>
                       {file.kind !== "image" && (
                         <button
                           className="card-copy"
@@ -1794,7 +2581,10 @@ export function App() {
 
       <div className="column-resizer" onPointerDown={startColumnResize} />
 
-      <section className="right-stack" style={{ gridTemplateRows: `${effectiveTopHeight}% 10px minmax(220px, 1fr)` }}>
+      <section
+        className="right-stack"
+        style={{ gridTemplateRows: `${rightResourceHeight}% 10px ${generatedHeight}% 10px minmax(220px, 1fr)` }}
+      >
         <section
           className={`panel resource-panel ${dragTarget === "context" ? "dragging" : ""} ${fullscreenPanel === "resources" ? "fullscreen-panel" : ""}`}
           onDragEnter={(event) => {
@@ -1810,130 +2600,135 @@ export function App() {
             meta=""
             action={
               <div className="header-actions">
-                <button className="icon-button" title="Whiteboard" onClick={() => openToolDiscussionWindow("whiteboard")}><PenLine size={17} /></button>
-                <button className="icon-button" title="Temporary draft" onClick={() => openToolDiscussionWindow("draft")}><FileText size={17} /></button>
                 <button className="icon-button" title={fullscreenPanel === "resources" ? "Exit fullscreen resources" : "Fullscreen resources"} onClick={() => setFullscreenPanel(fullscreenPanel === "resources" ? null : "resources")}>
                   {fullscreenPanel === "resources" ? <Minimize2 size={17} /> : <Maximize2 size={17} />}
                 </button>
-                <button className="icon-button" title="Add resources" onClick={() => contextInputRef.current?.click()}><Upload size={18} /></button>
+                <button className="icon-button" title="Add resources" onClick={() => contextInputRef.current?.click()}><FilePlus2 size={18} /></button>
               </div>
             }
           />
-          <button className="resource-drop" onClick={() => contextInputRef.current?.click()}>
-            <Upload size={18} />
-            <span>拖入资源</span>
-          </button>
-          <div className="resource-split">
-            <section
-              className={`resource-zone ${dragTarget === "context" ? "zone-dragging" : ""}`}
-              onDragEnter={(event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                setDragTarget("context");
-              }}
-              onDragOver={(event) => {
-                event.preventDefault();
-                event.stopPropagation();
-              }}
-              onDragLeave={() => setDragTarget(null)}
-              onDrop={(event) => handleDrop(event, "context")}
-            >
-              <div className="resource-grid">
-                {contextFiles.map((file) => (
-                  <FileThumb
-                    key={file.id}
-                    file={file}
-                    selected={selectedFile?.id === file.id}
-                    onSelect={() => setSelectedId(file.id)}
-                    onOpen={() => openFileDiscussionWindow(file)}
-                    onDelete={() => deleteFile(file).catch((err) => setError(err.message))}
-                    onCopy={file.kind === "image" ? undefined : () => copyFileToGenerated(file).catch((err) => setError(err.message))}
-                    onDragStart={(event) => {
-                      setDraggingFile({ id: file.id, role: file.role });
-                      event.dataTransfer.setData(fileDragType, file.id);
-                      event.dataTransfer.effectAllowed = "move";
-                      setCardDragImage(event);
-                    }}
-                    onDragEnd={() => setDraggingFile(null)}
-                    dragMark={draggingFile?.id === file.id ? "add" : null}
-                  />
-                ))}
-              </div>
-            </section>
-            <section
-              className={`resource-zone generated-zone ${dragTarget === "generated" ? "zone-dragging" : ""}`}
-              onDragEnter={(event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                setDragTarget("generated");
-              }}
-              onDragOver={(event) => {
-                event.preventDefault();
-                event.stopPropagation();
-              }}
-              onDragLeave={() => setDragTarget(null)}
-              onDrop={(event) => handleDrop(event, "generated")}
-            >
-              <div className="resource-grid">
-                {generatedFiles.length ? (
-                  generatedFiles.map((file) => (
-                    <FileThumb
-                      key={file.id}
-                      file={file}
-                      selected={selectedFile?.id === file.id}
-                      onSelect={() => setSelectedId(file.id)}
-                      onOpen={() => openFileDiscussionWindow(file)}
-                      onDelete={() => deleteFile(file).catch((err) => setError(err.message))}
-                      onDragStart={(event) => {
-                        setDraggingFile({ id: file.id, role: file.role });
-                        event.dataTransfer.setData(fileDragType, file.id);
-                        event.dataTransfer.effectAllowed = "move";
-                        setCardDragImage(event);
-                      }}
-                      onDragEnd={() => setDraggingFile(null)}
-                      dragMark={draggingFile?.id === file.id ? "add" : null}
-                    />
-                  ))
-                ) : (
-                  <button className="thumb empty-generated" onClick={() => generatedInputRef.current?.click()}>
-                    <FileText size={22} />
-                    <span>添加临时文件</span>
-                  </button>
-                )}
-              </div>
-            </section>
-          </div>
-          <div className="search-card">
-            <div className="search-line">
-              <Search size={15} />
-              <input
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-                onKeyDown={(event) => event.key === "Enter" && searchAll()}
-                placeholder="Search"
-              />
-              <button title="Web search" className={webEnabled ? "web-on" : ""} onClick={() => setWebEnabled((value) => !value)}>
-                <Globe2 size={15} />
-              </button>
-            </div>
-            <div className="hit-list">
-              {contextHits.map((hit) => (
-                <button key={hit.file.id} onClick={() => setSelectedId(hit.file.id)}>
-                  <span>{hit.file.originalName}</span>
-                  <p>{hit.snippet}</p>
+          <section
+            className={`resource-zone ${dragTarget === "context" ? "zone-dragging" : ""}`}
+            onDragEnter={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              setDragTarget("context");
+            }}
+            onDragOver={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+            }}
+            onDragLeave={() => setDragTarget(null)}
+            onDrop={(event) => handleDrop(event, "context")}
+          >
+            <div className="resource-grid">
+              {contextFiles.map((file) => (
+                <FileThumb
+                  key={file.id}
+                  file={file}
+                  selected={selectedFile?.id === file.id}
+                  onSelect={() => setSelectedId(file.id)}
+                  onOpen={() => openFileDiscussionWindow(file)}
+                  onDelete={() => deleteFile(file).catch((err) => setError(err.message))}
+                  onDownload={() => {
+                    downloadUploadedFile(file);
+                    setStatusText("文件已导出");
+                  }}
+                  onCopy={file.kind === "image" ? undefined : () => copyFileToGenerated(file).catch((err) => setError(err.message))}
+                  onDragStart={(event) => {
+                    setDraggingFile({ id: file.id, role: file.role });
+                    event.dataTransfer.setData(fileDragType, file.id);
+                    event.dataTransfer.effectAllowed = "move";
+                    setCardDragImage(event);
+                  }}
+                  onDragEnd={() => setDraggingFile(null)}
+                  dragMark={draggingFile?.id === file.id ? "add" : null}
+                />
+              ))}
+              {!contextFiles.length && (
+                <button className="thumb add-file-card" onClick={() => contextInputRef.current?.click()}>
+                  <FileText size={24} />
+                  <span>添加资源文件</span>
                 </button>
-              ))}
-              {webHits.map((hit) => (
-                <a key={hit.url} href={hit.url} target="_blank" rel="noreferrer">
-                  <span>{hit.title}</span>
-                  <p>{hit.snippet}</p>
-                </a>
-              ))}
+              )}
             </div>
-          </div>
+          </section>
         </section>
 
         <div className="row-resizer" onPointerDown={startRowResize} />
+
+        <section
+          className={`panel generated-panel ${dragTarget === "generated" ? "dragging" : ""} ${fullscreenPanel === "generated" ? "fullscreen-panel" : ""}`}
+          onDragEnter={(event) => {
+            event.preventDefault();
+            setDragTarget("generated");
+          }}
+          onDragOver={(event) => event.preventDefault()}
+          onDragLeave={() => setDragTarget(null)}
+          onDrop={(event) => handleDrop(event, "generated")}
+        >
+          <PanelHeader
+            title="临时文件"
+            meta="AI 生成与可编辑副本"
+            action={
+              <div className="header-actions">
+                <button className="icon-button" title="Whiteboard" onClick={() => openToolDiscussionWindow("whiteboard")}><PenLine size={17} /></button>
+                <button className="icon-button" title="Temporary draft" onClick={() => openToolDiscussionWindow("draft")}><FileText size={17} /></button>
+                <button className="icon-button" title={fullscreenPanel === "generated" ? "Exit fullscreen temporary files" : "Fullscreen temporary files"} onClick={() => setFullscreenPanel(fullscreenPanel === "generated" ? null : "generated")}>
+                  {fullscreenPanel === "generated" ? <Minimize2 size={17} /> : <Maximize2 size={17} />}
+                </button>
+                <button className="icon-button" title="Add temporary files" onClick={() => generatedInputRef.current?.click()}><FilePlus2 size={18} /></button>
+              </div>
+            }
+          />
+          <section
+            className={`resource-zone ${dragTarget === "generated" ? "zone-dragging" : ""}`}
+            onDragEnter={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              setDragTarget("generated");
+            }}
+            onDragOver={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+            }}
+            onDragLeave={() => setDragTarget(null)}
+            onDrop={(event) => handleDrop(event, "generated")}
+          >
+            <div className="resource-grid">
+              {generatedFiles.map((file) => (
+                <FileThumb
+                  key={file.id}
+                  file={file}
+                  selected={selectedFile?.id === file.id}
+                  onSelect={() => setSelectedId(file.id)}
+                  onOpen={() => openFileDiscussionWindow(file)}
+                  onDelete={() => deleteFile(file).catch((err) => setError(err.message))}
+                  onDownload={() => {
+                    downloadUploadedFile(file);
+                    setStatusText("文件已导出");
+                  }}
+                  onDragStart={(event) => {
+                    setDraggingFile({ id: file.id, role: file.role });
+                    event.dataTransfer.setData(fileDragType, file.id);
+                    event.dataTransfer.effectAllowed = "move";
+                    setCardDragImage(event);
+                  }}
+                  onDragEnd={() => setDraggingFile(null)}
+                  dragMark={draggingFile?.id === file.id ? "add" : null}
+                />
+              ))}
+              {!generatedFiles.length && (
+                <button className="thumb add-file-card" onClick={() => generatedInputRef.current?.click()}>
+                  <FileText size={24} />
+                  <span>添加临时文件</span>
+                </button>
+              )}
+            </div>
+          </section>
+        </section>
+
+        <div className="row-resizer" onPointerDown={startGeneratedRecordResize} />
 
         <section className={`panel record-panel ${fullscreenPanel === "record" ? "fullscreen-panel" : ""}`}>
           <PanelHeader
@@ -1954,17 +2749,22 @@ export function App() {
                   <strong>会议记录</strong>
                   <span>{meetingRecordEnabled ? `${meetingMessages.length} 段` : "已关闭"}</span>
                 </div>
-                <button
-                  className={meetingRecordEnabled ? "toggle record-toggle enabled" : "toggle record-toggle"}
-                  title={meetingRecordEnabled ? "关闭会议记录" : "打开会议记录"}
-                  aria-label={meetingRecordEnabled ? "关闭会议记录" : "打开会议记录"}
-                  aria-pressed={meetingRecordEnabled}
-                  onClick={() => setMeetingRecordEnabled((value) => !value)}
-                >
-                  <span />
-                </button>
+                <div className="record-section-actions">
+                  <button className="icon-button compact export-button" title="导出会议记录" aria-label="导出会议记录" onClick={exportMeetingRecord}>
+                    <Download size={15} />
+                  </button>
+                  <button
+                    className={meetingRecordEnabled ? "toggle record-toggle enabled" : "toggle record-toggle"}
+                    title={meetingRecordEnabled ? "关闭会议记录" : "打开会议记录"}
+                    aria-label={meetingRecordEnabled ? "关闭会议记录" : "打开会议记录"}
+                    aria-pressed={meetingRecordEnabled}
+                    onClick={() => setMeetingRecordEnabled((value) => !value)}
+                  >
+                    <span />
+                  </button>
+                </div>
               </header>
-              <div className="record-stream" ref={recordStreamRef}>
+              <div className={`record-stream ${meetingMessages.length ? "" : "has-empty-record"}`} ref={recordStreamRef}>
                 {meetingMessages.length ? (
                   meetingMessages.map((message) => (
                     <article key={message.id} className={`note-line ${message.role}`}>
@@ -1982,10 +2782,17 @@ export function App() {
             </section>
             <section className="record-history">
               <header>
-                <strong>要点</strong>
-                <span>{currentNotes.length} 段</span>
+                <div className="record-title-block">
+                  <strong>要点</strong>
+                  <span>{currentNotes.length} 段</span>
+                </div>
+                <div className="record-section-actions">
+                  <button className="icon-button compact export-button" title="导出要点" aria-label="导出要点" onClick={exportNotes}>
+                    <Download size={15} />
+                  </button>
+                </div>
               </header>
-              <div className="history-card-list">
+              <div className={`history-card-list ${currentNotes.length ? "" : "has-empty-record"}`}>
                 {currentNotes.length ? (
                   currentNotes.map((note) => (
                     <article key={note.id} className="history-card">
@@ -2041,6 +2848,7 @@ export function App() {
           setDraftText={setDraftText}
           boardItems={boardItems}
           setBoardItems={setBoardItems}
+          boardLinks={boardLinks}
           drawPoints={drawPoints}
           setDrawPoints={setDrawPoints}
           boardRef={boardRef}
@@ -2053,6 +2861,7 @@ export function App() {
         />
       )}
       {previewFile && <FilePreviewWindow file={previewFile} onClose={() => setPreviewFileId(null)} />}
+      {webPreview && <WebPreviewWindow page={webPreview} onClose={() => setWebPreview(null)} />}
       {previewRecord && <RecordPreviewWindow record={previewRecord} onClose={() => setPreviewRecordId(null)} />}
       {generatedEditorFile && (
         <GeneratedFileEditor
@@ -2202,8 +3011,18 @@ function TaskIndicator({ tasks }: { tasks: TaskItem[] }) {
 function EmptyTopic({ onChoose }: { onChoose: () => void }) {
   return (
     <div className="empty-topic">
-      <Sparkles size={26} />
-      <button onClick={onChoose}>Open file</button>
+      <div className="empty-topic-fan" aria-label="选择主题文件">
+        <button className="empty-topic-card image" title="添加图片主题" aria-label="添加图片主题" onClick={onChoose}>
+          <ImageIcon size={42} />
+        </button>
+        <button className="empty-topic-card file" title="添加文件主题" aria-label="添加文件主题" onClick={onChoose}>
+          <FileText size={42} />
+        </button>
+        <button className="empty-topic-card chart" title="添加图表主题" aria-label="添加图表主题" onClick={onChoose}>
+          <ChartNoAxesColumn size={42} />
+        </button>
+      </div>
+      <span className="empty-topic-label">添加讨论主题文件</span>
     </div>
   );
 }
@@ -2259,6 +3078,7 @@ function FileThumb({
   onSelect,
   onOpen,
   onDelete,
+  onDownload,
   onCopy,
   onDragStart,
   onDragEnd,
@@ -2269,6 +3089,7 @@ function FileThumb({
   onSelect: () => void;
   onOpen: () => void;
   onDelete: () => void;
+  onDownload: () => void;
   onCopy?: () => void;
   onDragStart?: (_event: DragEvent<HTMLElement>) => void;
   onDragEnd?: () => void;
@@ -2287,6 +3108,17 @@ function FileThumb({
         <span className="transfer-badge promote"><Plus size={17} /></span>
       ) : (
         <div className="card-actions">
+          <button
+            className="card-export"
+            title="导出文件"
+            onClick={(event) => {
+              event.stopPropagation();
+              onDownload();
+            }}
+            onDoubleClick={(event) => event.stopPropagation()}
+          >
+            <Download size={13} />
+          </button>
           {onCopy && (
             <button
               className="card-copy"
@@ -2332,6 +3164,29 @@ function FilePreviewWindow({ file, onClose }: { file: DiscuzFile; onClose: () =>
       </header>
       <div className="file-preview-body">
         <FilePreview file={file} />
+      </div>
+    </aside>
+  );
+}
+
+function WebPreviewWindow({ page, onClose }: { page: WebPreview; onClose: () => void }) {
+  return (
+    <aside className="web-preview-window">
+      <header className="tool-head">
+        <div className="web-preview-title">
+          <strong>{page.title || "网页"}</strong>
+          <span>{page.url}</span>
+        </div>
+        <div className="header-actions">
+          <a className="icon-button" title="在浏览器打开" href={page.url} target="_blank" rel="noreferrer">
+            <ExternalLink size={16} />
+          </a>
+          <button className="icon-button" title="关闭网页窗口" onClick={onClose}>×</button>
+        </div>
+      </header>
+      <div className="web-preview-body">
+        <iframe title={page.title || page.url} src={page.url} />
+        <p>如果网页没有显示，说明该网站禁止嵌入，可点右上角打开。</p>
       </div>
     </aside>
   );
@@ -2412,6 +3267,7 @@ function ToolWindow({
   setDraftText,
   boardItems,
   setBoardItems,
+  boardLinks,
   drawPoints,
   setDrawPoints,
   boardRef,
@@ -2426,8 +3282,9 @@ function ToolWindow({
   selectedFile: DiscuzFile | null;
   draftText: string;
   setDraftText: Dispatch<SetStateAction<string>>;
-  boardItems: Array<{ id: string; kind: "text" | "image"; value: string; x: number; y: number }>;
-  setBoardItems: Dispatch<SetStateAction<Array<{ id: string; kind: "text" | "image"; value: string; x: number; y: number }>>>;
+  boardItems: BoardItem[];
+  setBoardItems: Dispatch<SetStateAction<BoardItem[]>>;
+  boardLinks: BoardLink[];
   drawPoints: Array<{ id: string; x: number; y: number }>;
   setDrawPoints: Dispatch<SetStateAction<Array<{ id: string; x: number; y: number }>>>;
   boardRef: RefObject<HTMLDivElement | null>;
@@ -2438,6 +3295,7 @@ function ToolWindow({
   onClear: () => void;
   onClose: () => void;
 }) {
+  const [draggingBoardItem, setDraggingBoardItem] = useState<{ id: string; offsetX: number; offsetY: number } | null>(null);
   const title = {
     whiteboard: "无限白板",
     draft: "临时文档",
@@ -2467,6 +3325,48 @@ function ToolWindow({
   const updateBoardText = (id: string, value: string) => {
     setBoardItems((items) => items.map((item) => item.id === id ? { ...item, value } : item));
   };
+
+  const itemCenter = (item: BoardItem) => ({
+    x: item.x + (item.kind === "image" ? 130 : 95),
+    y: item.y + 43
+  });
+  const itemById = new Map(boardItems.map((item) => [item.id, item]));
+
+  const startBoardItemDrag = (event: ReactPointerEvent<HTMLButtonElement>, item: BoardItem) => {
+    const board = boardRef.current;
+    if (!board) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const rect = board.getBoundingClientRect();
+    const scale = Math.max(layoutScale, 0.01);
+    const x = (event.clientX - rect.left) / scale + board.scrollLeft;
+    const y = (event.clientY - rect.top) / scale + board.scrollTop;
+    setDraggingBoardItem({ id: item.id, offsetX: x - item.x, offsetY: y - item.y });
+  };
+
+  useEffect(() => {
+    if (!draggingBoardItem) return;
+    const move = (event: PointerEvent) => {
+      const board = boardRef.current;
+      if (!board) return;
+      const rect = board.getBoundingClientRect();
+      const scale = Math.max(layoutScale, 0.01);
+      const x = (event.clientX - rect.left) / scale + board.scrollLeft - draggingBoardItem.offsetX;
+      const y = (event.clientY - rect.top) / scale + board.scrollTop - draggingBoardItem.offsetY;
+      setBoardItems((items) => items.map((item) => item.id === draggingBoardItem.id ? {
+        ...item,
+        x: Math.max(12, Math.min(2380, x)),
+        y: Math.max(12, Math.min(1680, y))
+      } : item));
+    };
+    const stop = () => setDraggingBoardItem(null);
+    document.addEventListener("pointermove", move);
+    document.addEventListener("pointerup", stop, { once: true });
+    return () => {
+      document.removeEventListener("pointermove", move);
+      document.removeEventListener("pointerup", stop);
+    };
+  }, [boardRef, draggingBoardItem, layoutScale, setBoardItems]);
 
   return (
     <aside className="tool-window">
@@ -2516,9 +3416,24 @@ function ToolWindow({
           }}
         >
           <div className="board-canvas">
+            <svg className="board-links" viewBox="0 0 2600 1800" aria-hidden="true">
+              {boardLinks.map((link) => {
+                const from = itemById.get(link.from);
+                const to = itemById.get(link.to);
+                if (!from || !to) return null;
+                const start = itemCenter(from);
+                const end = itemCenter(to);
+                return <line key={link.id} x1={start.x} y1={start.y} x2={end.x} y2={end.y} />;
+              })}
+            </svg>
             {drawPoints.map((point) => <i key={point.id} className="draw-point" style={{ left: point.x, top: point.y }} />)}
             {boardItems.map((item) => (
               <div key={item.id} className={`board-item ${item.kind}`} style={{ left: item.x, top: item.y }}>
+                <button
+                  className="board-drag-handle"
+                  title="拖动节点"
+                  onPointerDown={(event) => startBoardItemDrag(event, item)}
+                />
                 {item.kind === "image" ? <img src={item.value} alt="" /> : <textarea value={item.value} onChange={(event) => updateBoardText(item.id, event.target.value)} />}
               </div>
             ))}

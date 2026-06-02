@@ -10,6 +10,8 @@ export type DiscuzFile = {
   extractedText: string;
   renderedHtml: string;
   summary: string;
+  extractionStatus?: "pending" | "processing" | "complete" | "error";
+  extractionError?: string;
   sortOrder: number;
   createdAt: string;
   updatedAt: string;
