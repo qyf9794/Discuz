@@ -23,7 +23,7 @@ import {
 } from "lucide-react";
 import { ChangeEvent, DragEvent, forwardRef, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, Dispatch, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, ReactNode, RefObject, SetStateAction } from "react";
-import type { AppState, DiscussionDirection, DiscussionRecord, DiscussionTopic, DiscuzFile, MeetingMessage, Note } from "./types";
+import type { AiSettings, AppState, DiscussionDirection, DiscussionRecord, DiscussionTopic, DiscuzFile, MeetingMessage, Note } from "./types";
 
 const emptyState: AppState = {
   files: [],
@@ -36,7 +36,22 @@ const emptyState: AppState = {
   activeTopicId: "",
   topics: [],
   activities: [],
-  settings: { openaiApiKeyConfigured: false, openaiApiKeySource: "none", wallpaperUrl: "" }
+  settings: {
+    openaiApiKeyConfigured: false,
+    openaiApiKeySource: "none",
+    wallpaperUrl: "",
+    ai: {
+      assistantName: "Discuz",
+      realtimeModel: "gpt-realtime-2",
+      realtimeVoice: "shimmer",
+      transcriptionModel: "gpt-4o-transcribe",
+      imageModel: "gpt-image-1.5",
+      imageQuality: "high",
+      responseLength: "short",
+      responseTone: "活泼、简洁、有一点笑意",
+      visualStyle: "清晰、精致、可用于讨论"
+    }
+  }
 };
 type TopicProposal = { title: string; reason: string; intent: "confirm" | "drift" };
 type DirectionProposal = { directions: string[]; reason: string };
@@ -398,6 +413,15 @@ function downloadUploadedFile(file: DiscuzFile) {
   anchor.remove();
 }
 
+function fileExtractionLabel(file: DiscuzFile) {
+  if (file.kind === "image") return "后台识别图片";
+  if (file.kind === "spreadsheet") return "后台解析表格";
+  if (file.kind === "pptx") return "后台解析PPT";
+  if (file.kind === "doc" || file.kind === "docx") return "后台解析Word";
+  if (file.kind === "pdf") return "后台解析PDF";
+  return "后台解析文字";
+}
+
 function normalizeLines(value: unknown) {
   return (Array.isArray(value) ? value : [])
     .map((item) => String(item || "").trim())
@@ -490,6 +514,9 @@ export function App() {
   const voiceMeterRef = useRef<VoiceMeter | null>(null);
   const pendingTaskCountRef = useRef(0);
   const activeTaskLabelRef = useRef("");
+  const backgroundParsingActiveRef = useRef(false);
+  const assistantRespondedSinceUserRef = useRef(true);
+  const lastLocalAckAtRef = useRef(0);
   const lastStatusLogRef = useRef("Ready");
   const lastErrorLogRef = useRef("");
   const assistantTranscriptRef = useRef("");
@@ -500,9 +527,25 @@ export function App() {
   const primaryFiles = useMemo(() => state.files.filter((file) => file.role === "primary"), [state.files]);
   const contextFiles = useMemo(() => state.files.filter((file) => file.role === "context"), [state.files]);
   const generatedFiles = useMemo(() => state.files.filter((file) => file.role === "generated"), [state.files]);
-  const hasParsingFiles = useMemo(
-    () => state.files.some((file) => file.extractionStatus === "pending" || file.extractionStatus === "processing"),
+  const parsingFiles = useMemo(
+    () => state.files.filter((file) => file.extractionStatus === "pending" || file.extractionStatus === "processing"),
     [state.files]
+  );
+  const hasParsingFiles = useMemo(
+    () => parsingFiles.length > 0,
+    [parsingFiles]
+  );
+  const backgroundParsingTasks = useMemo<TaskItem[]>(
+    () => parsingFiles.map((file) => ({
+      id: `parse-${file.id}`,
+      label: fileExtractionLabel(file),
+      startedAt: file.updatedAt || file.createdAt
+    })),
+    [parsingFiles]
+  );
+  const visibleTasks = useMemo(
+    () => [...backgroundParsingTasks, ...pendingTasks].slice(-6),
+    [backgroundParsingTasks, pendingTasks]
   );
   const selectedFile = useMemo(
     () => state.files.find((file) => file.id === selectedId) ?? primaryFiles[0] ?? null,
@@ -589,6 +632,19 @@ export function App() {
     }, 2500);
     return () => window.clearInterval(timer);
   }, [hasParsingFiles, loadState]);
+
+  useEffect(() => {
+    if (parsingFiles.length) {
+      backgroundParsingActiveRef.current = true;
+      const label = parsingFiles.length === 1 ? fileExtractionLabel(parsingFiles[0]) : `后台解析/识别 ${parsingFiles.length} 个文件`;
+      if (pendingTaskCountRef.current === 0) setStatusText(`AI正在执行：${label}，请稍等`);
+      return;
+    }
+    if (backgroundParsingActiveRef.current) {
+      backgroundParsingActiveRef.current = false;
+      if (pendingTaskCountRef.current === 0) setStatusText("后台解析/识别完成");
+    }
+  }, [parsingFiles]);
 
   useEffect(() => {
     localStorage.setItem("discuz-draft", draftText);
@@ -847,6 +903,22 @@ export function App() {
     };
   }, []);
 
+  const acknowledgeImmediately = useCallback((text: string, speak = false) => {
+    const clean = text.trim();
+    if (!clean) return;
+    setStatusText(clean);
+    if (!speak || !("speechSynthesis" in window) || typeof SpeechSynthesisUtterance === "undefined") return;
+    const nowMs = Date.now();
+    if (nowMs - lastLocalAckAtRef.current < 1200) return;
+    lastLocalAckAtRef.current = nowMs;
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(clean);
+    utterance.lang = "zh-CN";
+    utterance.rate = 1.08;
+    utterance.pitch = 1.08;
+    window.speechSynthesis.speak(utterance);
+  }, []);
+
   const setPrimary = async (files: FileList | File[]) => {
     const list = Array.from(files);
     if (!list.length) return;
@@ -944,7 +1016,7 @@ export function App() {
     }
   };
 
-  const generateImageFile = async (title: string, prompt: string, size = "1024x1024", quality = "medium") => {
+  const generateImageFile = async (title: string, prompt: string, size = "1024x1024", quality = "high") => {
     const finishTask = beginTask("生成图片");
     try {
       const response = await fetch("/api/files/generated/image", {
@@ -1257,6 +1329,8 @@ export function App() {
         discussionInputs: payload.discussionInputs ?? current.discussionInputs,
         activities: payload.activities ?? current.activities
       }));
+      assistantRespondedSinceUserRef.current = false;
+      acknowledgeImmediately("收到，我在处理。");
       saveMeetingMessage(text, "user").catch((err) => setError(err instanceof Error ? err.message : "Unable to save meeting record"));
 
       const channel = dataChannelRef.current;
@@ -1270,7 +1344,7 @@ export function App() {
           }
         }));
         requestRealtimeResponse();
-        setStatusText("Text sent");
+        setStatusText("收到，我在处理。");
       } else {
         setStatusText("Saved for next discussion");
       }
@@ -1363,7 +1437,12 @@ export function App() {
     const channel = dataChannelRef.current;
     if (!channel || channel.readyState !== "open" || !message.call_id || !message.name) return;
     const args = JSON.parse(message.arguments || "{}");
-    const finishTask = beginTask(toolCallLabel(message.name));
+    const label = toolCallLabel(message.name);
+    if (!assistantRespondedSinceUserRef.current) {
+      acknowledgeImmediately(`我在执行${label}，稍等。`, true);
+      assistantRespondedSinceUserRef.current = true;
+    }
+    const finishTask = beginTask(label);
     let output = {};
     try {
       if (message.name === "search_context") {
@@ -1843,7 +1922,7 @@ export function App() {
         const title = String(args.title || "AI生成图片.png").trim();
         const prompt = String(args.prompt || "").trim();
         const size = ["1024x1024", "1024x1536", "1536x1024"].includes(args.size) ? args.size : "1024x1024";
-        const quality = ["low", "medium", "high", "auto"].includes(args.quality) ? args.quality : "medium";
+        const quality = ["low", "medium", "high", "auto"].includes(args.quality) ? args.quality : "high";
         if (prompt) {
           const file = await generateImageFile(title, prompt, size, quality);
           output = { ok: true, generated: file.originalName, opened: file.originalName };
@@ -2183,15 +2262,17 @@ export function App() {
           if (message.type === "response.done") {
             responseActiveRef.current = false;
             setVoiceState("live");
-            if (pendingTaskCountRef.current === 0) setStatusText("Live");
+            if (pendingTaskCountRef.current === 0 && !backgroundParsingActiveRef.current) setStatusText("Live");
             window.setTimeout(() => flushRealtimeResponse(), 0);
           }
           if (message.type === "response.output_audio_transcript.delta") {
+            assistantRespondedSinceUserRef.current = true;
             assistantTranscriptRef.current += message.delta;
             setTranscript(assistantTranscriptRef.current.slice(-220));
           }
           if (message.type === "response.output_audio_transcript.done") {
             const text = String(message.transcript || assistantTranscriptRef.current || "").trim();
+            if (text) assistantRespondedSinceUserRef.current = true;
             if (text) saveMeetingMessage(text, "assistant").catch((err) => setError(err instanceof Error ? err.message : "Unable to save meeting record"));
             assistantTranscriptRef.current = "";
           }
@@ -2201,7 +2282,11 @@ export function App() {
           }
           if (message.type === "conversation.item.input_audio_transcription.completed") {
             const text = String(message.transcript || userTranscriptRef.current || "").trim();
-            if (text) saveMeetingMessage(text, "user").catch((err) => setError(err instanceof Error ? err.message : "Unable to save meeting record"));
+            if (text) {
+              assistantRespondedSinceUserRef.current = false;
+              acknowledgeImmediately("收到，我在处理。", true);
+              saveMeetingMessage(text, "user").catch((err) => setError(err instanceof Error ? err.message : "Unable to save meeting record"));
+            }
             userTranscriptRef.current = "";
           }
           if (message.type === "response.function_call_arguments.done") {
@@ -2442,7 +2527,7 @@ export function App() {
       <div className="light-wash" />
       <div className="bottom-discussion-bar">
         <StatusLogPanel ref={statusLogRef} entries={statusLog} transcript={transcript} />
-        <TaskIndicator tasks={pendingTasks} />
+        <TaskIndicator tasks={visibleTasks} />
         <form
           className="discussion-text-form"
           onSubmit={(event) => {
@@ -3573,9 +3658,14 @@ const SettingsPopover = forwardRef<HTMLElement, {
   style
 }, ref) {
   const [apiKey, setApiKey] = useState("");
+  const [aiDraft, setAiDraft] = useState<AiSettings>(settings.ai);
   const wallpaperInputRef = useRef<HTMLInputElement | null>(null);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
+
+  useEffect(() => {
+    setAiDraft(settings.ai);
+  }, [settings.ai]);
 
   const saveApiKey = async (nextKey = apiKey) => {
     setSaving(true);
@@ -3593,6 +3683,26 @@ const SettingsPopover = forwardRef<HTMLElement, {
       setMessage(nextKey.trim() ? "已保存" : "已清除");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "保存失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const saveAiSettings = async () => {
+    setSaving(true);
+    setMessage("");
+    try {
+      const response = await fetch("/api/settings/ai", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(aiDraft)
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const nextSettings = await response.json();
+      onSettingsSaved(nextSettings);
+      setMessage("AI 设定已保存");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "AI 设定保存失败");
     } finally {
       setSaving(false);
     }
@@ -3664,6 +3774,103 @@ const SettingsPopover = forwardRef<HTMLElement, {
             清除本地 Key
           </button>
           {message && <span>{message}</span>}
+        </div>
+      </section>
+
+      <section className="settings-section ai-settings-section">
+        <div className="settings-section-title">
+          <strong>AI 设定</strong>
+          <span>语音重连后生效</span>
+        </div>
+        <div className="ai-settings-grid">
+          <label>
+            名字
+            <input
+              value={aiDraft.assistantName}
+              onChange={(event) => setAiDraft((draft) => ({ ...draft, assistantName: event.target.value }))}
+            />
+          </label>
+          <label>
+            声音
+            <select
+              value={aiDraft.realtimeVoice}
+              onChange={(event) => setAiDraft((draft) => ({ ...draft, realtimeVoice: event.target.value }))}
+            >
+              {["shimmer", "alloy", "ash", "ballad", "coral", "echo", "sage", "verse"].map((voice) => (
+                <option key={voice} value={voice}>{voice}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            语音模型
+            <select
+              value={aiDraft.realtimeModel}
+              onChange={(event) => setAiDraft((draft) => ({ ...draft, realtimeModel: event.target.value }))}
+            >
+              <option value="gpt-realtime-2">gpt-realtime-2</option>
+              <option value="gpt-realtime">gpt-realtime</option>
+            </select>
+          </label>
+          <label>
+            转写模型
+            <select
+              value={aiDraft.transcriptionModel}
+              onChange={(event) => setAiDraft((draft) => ({ ...draft, transcriptionModel: event.target.value }))}
+            >
+              <option value="gpt-4o-transcribe">gpt-4o-transcribe</option>
+              <option value="gpt-4o-mini-transcribe">gpt-4o-mini-transcribe</option>
+            </select>
+          </label>
+          <label>
+            图片模型
+            <select
+              value={aiDraft.imageModel}
+              onChange={(event) => setAiDraft((draft) => ({ ...draft, imageModel: event.target.value }))}
+            >
+              <option value="gpt-image-1.5">gpt-image-1.5</option>
+              <option value="gpt-image-1">gpt-image-1</option>
+            </select>
+          </label>
+          <label>
+            图片质量
+            <select
+              value={aiDraft.imageQuality}
+              onChange={(event) => setAiDraft((draft) => ({ ...draft, imageQuality: event.target.value as AiSettings["imageQuality"] }))}
+            >
+              <option value="high">high</option>
+              <option value="auto">auto</option>
+              <option value="medium">medium</option>
+              <option value="low">low</option>
+            </select>
+          </label>
+          <label>
+            回答长度
+            <select
+              value={aiDraft.responseLength}
+              onChange={(event) => setAiDraft((draft) => ({ ...draft, responseLength: event.target.value as AiSettings["responseLength"] }))}
+            >
+              <option value="short">短</option>
+              <option value="medium">中</option>
+              <option value="long">长</option>
+            </select>
+          </label>
+          <label className="wide">
+            语气风格
+            <input
+              value={aiDraft.responseTone}
+              onChange={(event) => setAiDraft((draft) => ({ ...draft, responseTone: event.target.value }))}
+            />
+          </label>
+          <label className="wide">
+            图片风格
+            <input
+              value={aiDraft.visualStyle}
+              onChange={(event) => setAiDraft((draft) => ({ ...draft, visualStyle: event.target.value }))}
+            />
+          </label>
+        </div>
+        <div className="settings-actions">
+          <button disabled={saving} onClick={saveAiSettings}>保存 AI 设定</button>
         </div>
       </section>
 

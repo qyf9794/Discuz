@@ -21,6 +21,18 @@ const legacyUploadDir = path.join(dataDir, "uploads");
 const topicsDir = path.join(dataDir, "topics");
 const dbPath = path.join(dataDir, "discuz.sqlite");
 const port = Number(process.env.PORT || 8787);
+const defaultImageGenerationModel = process.env.OPENAI_IMAGE_MODEL || "gpt-image-1.5";
+const aiSettingsDefaults = {
+  assistantName: "Discuz",
+  realtimeModel: "gpt-realtime-2",
+  realtimeVoice: "shimmer",
+  transcriptionModel: "gpt-4o-transcribe",
+  imageModel: defaultImageGenerationModel,
+  imageQuality: "high",
+  responseLength: "short",
+  responseTone: "活泼、简洁、有一点笑意",
+  visualStyle: "清晰、精致、可用于讨论"
+};
 
 fs.mkdirSync(legacyUploadDir, { recursive: true });
 fs.mkdirSync(topicsDir, { recursive: true });
@@ -835,7 +847,7 @@ function generatedImageTitle(value) {
   return `${baseName}.png`;
 }
 
-async function persistGeneratedImage({ title, prompt, size = "1024x1024", quality = "medium" }) {
+async function persistGeneratedImage({ title, prompt, size = "1024x1024", quality = "high" }) {
   const openAiApiKey = getOpenAiApiKey();
   if (!openAiApiKey) {
     throw new Error("OPENAI_API_KEY is not configured");
@@ -845,7 +857,8 @@ async function persistGeneratedImage({ title, prompt, size = "1024x1024", qualit
     throw new Error("Missing image prompt");
   }
   const safeSize = ["1024x1024", "1024x1536", "1536x1024"].includes(size) ? size : "1024x1024";
-  const safeQuality = ["low", "medium", "high", "auto"].includes(quality) ? quality : "medium";
+  const aiSettings = getAiSettingsState();
+  const safeQuality = ["low", "medium", "high", "auto"].includes(quality) ? quality : aiSettings.imageQuality;
 
   const response = await fetch("https://api.openai.com/v1/images/generations", {
     method: "POST",
@@ -854,7 +867,7 @@ async function persistGeneratedImage({ title, prompt, size = "1024x1024", qualit
       "Content-Type": "application/json"
     },
     body: JSON.stringify({
-      model: "gpt-image-1",
+      model: aiSettings.imageModel,
       prompt: cleanedPrompt,
       n: 1,
       size: safeSize,
@@ -879,6 +892,7 @@ async function persistGeneratedImage({ title, prompt, size = "1024x1024", qualit
   const createdAt = now();
   const extractedText = [
     `AI生成图片：${originalName}`,
+    `模型：${aiSettings.imageModel}`,
     `提示词：${cleanedPrompt}`,
     `尺寸：${safeSize}`,
     `质量：${safeQuality}`
@@ -1186,13 +1200,58 @@ function getOpenAiApiKey() {
   return cleanText(getSetting("openai_api_key")) || cleanText(process.env.OPENAI_API_KEY || "");
 }
 
+function oneOf(value, allowed, fallback) {
+  const cleaned = cleanText(value);
+  return allowed.includes(cleaned) ? cleaned : fallback;
+}
+
+function getAiSettingsState() {
+  return {
+    assistantName: cleanText(getSetting("ai_assistant_name")) || aiSettingsDefaults.assistantName,
+    realtimeModel: oneOf(getSetting("ai_realtime_model"), ["gpt-realtime-2", "gpt-realtime"], aiSettingsDefaults.realtimeModel),
+    realtimeVoice: oneOf(getSetting("ai_realtime_voice"), ["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"], aiSettingsDefaults.realtimeVoice),
+    transcriptionModel: oneOf(getSetting("ai_transcription_model"), ["gpt-4o-transcribe", "gpt-4o-mini-transcribe"], aiSettingsDefaults.transcriptionModel),
+    imageModel: oneOf(getSetting("ai_image_model"), ["gpt-image-1.5", "gpt-image-1"], aiSettingsDefaults.imageModel),
+    imageQuality: oneOf(getSetting("ai_image_quality"), ["low", "medium", "high", "auto"], aiSettingsDefaults.imageQuality),
+    responseLength: oneOf(getSetting("ai_response_length"), ["short", "medium", "long"], aiSettingsDefaults.responseLength),
+    responseTone: cleanText(getSetting("ai_response_tone")) || aiSettingsDefaults.responseTone,
+    visualStyle: cleanText(getSetting("ai_visual_style")) || aiSettingsDefaults.visualStyle
+  };
+}
+
+function saveAiSettings(payload = {}) {
+  const current = getAiSettingsState();
+  const next = {
+    assistantName: cleanText(payload.assistantName ?? current.assistantName).slice(0, 40) || aiSettingsDefaults.assistantName,
+    realtimeModel: oneOf(payload.realtimeModel ?? current.realtimeModel, ["gpt-realtime-2", "gpt-realtime"], current.realtimeModel),
+    realtimeVoice: oneOf(payload.realtimeVoice ?? current.realtimeVoice, ["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"], current.realtimeVoice),
+    transcriptionModel: oneOf(payload.transcriptionModel ?? current.transcriptionModel, ["gpt-4o-transcribe", "gpt-4o-mini-transcribe"], current.transcriptionModel),
+    imageModel: oneOf(payload.imageModel ?? current.imageModel, ["gpt-image-1.5", "gpt-image-1"], current.imageModel),
+    imageQuality: oneOf(payload.imageQuality ?? current.imageQuality, ["low", "medium", "high", "auto"], current.imageQuality),
+    responseLength: oneOf(payload.responseLength ?? current.responseLength, ["short", "medium", "long"], current.responseLength),
+    responseTone: cleanText(payload.responseTone ?? current.responseTone).slice(0, 120) || aiSettingsDefaults.responseTone,
+    visualStyle: cleanText(payload.visualStyle ?? current.visualStyle).slice(0, 160) || aiSettingsDefaults.visualStyle
+  };
+  setSetting("ai_assistant_name", next.assistantName);
+  setSetting("ai_realtime_model", next.realtimeModel);
+  setSetting("ai_realtime_voice", next.realtimeVoice);
+  setSetting("ai_transcription_model", next.transcriptionModel);
+  setSetting("ai_image_model", next.imageModel);
+  setSetting("ai_image_quality", next.imageQuality);
+  setSetting("ai_response_length", next.responseLength);
+  setSetting("ai_response_tone", next.responseTone);
+  setSetting("ai_visual_style", next.visualStyle);
+  return next;
+}
+
 function getSettingsState() {
   const localKey = cleanText(getSetting("openai_api_key"));
   const envKey = cleanText(process.env.OPENAI_API_KEY || "");
   return {
     openaiApiKeyConfigured: Boolean(localKey || envKey),
     openaiApiKeySource: localKey ? "local" : envKey ? "env" : "none",
-    wallpaperUrl: cleanText(getSetting("wallpaper_url"))
+    wallpaperUrl: cleanText(getSetting("wallpaper_url")),
+    ai: getAiSettingsState()
   };
 }
 
@@ -1207,6 +1266,7 @@ refreshStoredFiles().catch((error) => {
 });
 
 function buildDiscussionContext() {
+  const aiSettings = getAiSettingsState();
   const topicId = getActiveTopicId();
   const primaryFiles = db.prepare("SELECT * FROM files WHERE role = 'primary' AND topic_id = ? ORDER BY created_at DESC LIMIT 8").all(topicId).map(rowToFile);
   const contextFiles = db.prepare("SELECT * FROM files WHERE role = 'context' AND topic_id = ? ORDER BY created_at DESC LIMIT 12").all(topicId).map(rowToFile);
@@ -1234,10 +1294,11 @@ function buildDiscussionContext() {
     .map((direction, index) => `- ${direction.completed ? "已完成" : "未完成"}｜${index + 1}. ${direction.text}`)
     .join("\n");
   return [
-    "你是 Discuz，一个用于本地文件语音讨论的 AI 伙伴。你的对话必须紧密围绕当前主讨论文件、用户给出的背景材料和用户刚刚提出的问题。",
-    "语音风格：更活泼、轻松、有一点笑意，像一位反应快、亲切的讨论搭子。不要严肃播报、不要会议主持腔、不要长篇铺陈。",
-    "语音节奏：说得自然一点，可以略快但不要赶；用短句，语气有起伏。每次最多 2 句中文，每句尽量不超过 25 个字。需要用户确认时，只问 1 个问题。",
+    `你是 ${aiSettings.assistantName}，一个用于本地文件语音讨论的 AI 伙伴。你的对话必须紧密围绕当前主讨论文件、用户给出的背景材料和用户刚刚提出的问题。`,
+    `语音风格：${aiSettings.responseTone}。不要严肃播报、不要会议主持腔、不要长篇铺陈。`,
+    `语音节奏：说得自然一点，可以略快但不要赶；用短句，语气有起伏。当前回答长度设置为 ${aiSettings.responseLength}：short 最多 2 句，medium 最多 4 句，long 最多 6 句；需要用户确认时，只问 1 个问题。`,
     "表达习惯：可以用“好呀”“可以”“这个点不错”“我先看这块”这类自然口语开头，但不要过度卖萌、不要夸张，不要使用表情符号。",
+    "逐句回应规则：用户每说完或输入一条内容，你都必须先用 1 句中文口头回应，表示你听到了并说明下一步。禁止静默直接调用工具；如果确实要调用工具，这句回应必须出现在工具调用之前。",
     "执行反馈规则：只要你准备调用工具、后台任务、搜索、生成、分析、打开窗口、下载或保存文件，必须先用 1 句中文告诉用户“我在执行……，稍等”。工具完成后必须再用 1 句中文说明结果或下一步，不要沉默等待用户问“在吗”。",
     "等待反馈规则：如果上一轮回复、工具调用或后台任务还在处理，不要假装完成；用 1 句中文说明“我还在处理，稍等一下”，并让界面状态继续显示任务。",
     "开场规则：语音刚开始或用户还没有明确提出讨论内容时，不要上来就概括主题或调用 propose_discussion_topic。先自然打招呼，例如“嗨，我在”，再问一句“你想先聊哪块？”等用户说明。",
@@ -1262,7 +1323,7 @@ function buildDiscussionContext() {
     "用户可以用语音要求你操控界面：打开/关闭前台文件窗口、打开无限白板或临时文档、保存或清空白板/临时文档、复制文件到临时区、把文件移动到主题区/资源区/临时区。遇到这些请求时应调用对应工具完成，不只用语言说明。",
     "当用户要求打开网页、查看链接，或你需要把某个搜索结果展示给用户时，调用 open_web_page 在前台网页窗口打开；不要只口头描述链接。如果网站禁止内嵌，用户可以从窗口右上角跳到浏览器打开。",
     "当你需要生成文案、副本、修改稿或阶段性成果草稿时，先调用 create_generated_file，把它放入资源窗口下半区的 AI 临时生成文案。用户可以先打开编辑并“保存编辑”，这只表示编辑确认；只有用户进一步“确认为成果”后，它才会进入讨论主题窗口，作为最终成果继续讨论。",
-    "当用户要求生成、绘制、设计图片、地图、海报、示意图或视觉素材时，调用 generate_image。图片会保存到 AI 临时生成区；生成完成后用一句话提示用户可以预览或确认为成果。",
+    `当用户要求生成、绘制、设计图片、地图、海报、示意图或视觉素材时，调用 generate_image。默认视觉风格：${aiSettings.visualStyle}。prompt 必须补全主体、构图、风格、材质、颜色、文字标签、比例和清晰度要求，不要只传用户的一句短话。图片会保存到 AI 临时生成区；生成完成后用一句话提示用户可以预览或确认为成果。`,
     "如果用户要求把某个资源文件、AI 临时文案或修改稿作为成果继续讨论，你可以调用 add_file_to_topic，把它加入讨论主题窗口。加入后它就是主讨论文件，应作为后续重点讨论对象。",
     "不要泛泛而谈，不要把话题扩展到无关方向。每次回复优先给出中肯、可执行、能推进讨论的意见。",
     "如果信息不足，先指出缺口，再建议用户补充哪类材料。需要资料时，优先调用本地背景材料检索；本地资料不足时，再调用联网搜索。",
@@ -1500,6 +1561,13 @@ app.post("/api/settings/openai-key", (req, res) => {
   res.json(getSettingsState());
 });
 
+app.post("/api/settings/ai", (req, res) => {
+  saveAiSettings(req.body || {});
+  addActivity("Settings", "AI settings updated", now());
+  writeTopicSnapshot();
+  res.json(getSettingsState());
+});
+
 app.post("/api/settings/wallpaper", upload.single("wallpaper"), (req, res) => {
   const file = req.file;
   if (!file) return res.status(400).json({ error: "Missing wallpaper file" });
@@ -1553,7 +1621,7 @@ app.post("/api/files/generated/image", async (req, res) => {
       title: cleanText(req.body?.title || ""),
       prompt: cleanText(req.body?.prompt || ""),
       size: cleanText(req.body?.size || "1024x1024"),
-      quality: cleanText(req.body?.quality || "medium")
+      quality: cleanText(req.body?.quality || getAiSettingsState().imageQuality)
     });
     writeTopicSnapshot();
     res.json({ file, files: getFiles(), activities: getActivities(), topics: getTopics() });
@@ -1794,10 +1862,11 @@ app.post("/api/realtime/session", async (req, res) => {
   if (!req.body || typeof req.body !== "string") {
     return res.status(400).json({ error: "Expected SDP body" });
   }
+  const aiSettings = getAiSettingsState();
 
   const session = {
     type: "realtime",
-    model: "gpt-realtime-2",
+    model: aiSettings.realtimeModel,
     instructions: buildDiscussionContext(),
     tools: [
       {
@@ -2485,7 +2554,7 @@ app.post("/api/realtime/session", async (req, res) => {
             quality: {
               type: "string",
               enum: ["low", "medium", "high", "auto"],
-              description: "Generation quality. Use medium by default; high only when the user asks for higher quality."
+              description: "Generation quality. Use high by default for polished output; use medium or low only when the user asks to save cost or generate quickly."
             }
           },
           required: ["title", "prompt", "size", "quality"],
@@ -2655,7 +2724,7 @@ app.post("/api/realtime/session", async (req, res) => {
     audio: {
       input: {
         transcription: {
-          model: "gpt-4o-transcribe",
+          model: aiSettings.transcriptionModel,
           language: "zh"
         },
         turn_detection: {
@@ -2665,7 +2734,7 @@ app.post("/api/realtime/session", async (req, res) => {
           interrupt_response: false
         }
       },
-      output: { voice: "shimmer" }
+      output: { voice: aiSettings.realtimeVoice }
     }
   };
   const fd = new FormData();

@@ -77,6 +77,18 @@ export type DiscussionDirection = {
   updatedAt: string;
 };
 
+export type AiSettings = {
+  assistantName: string;
+  realtimeModel: string;
+  realtimeVoice: string;
+  transcriptionModel: string;
+  imageModel: string;
+  imageQuality: "low" | "medium" | "high" | "auto";
+  responseLength: "short" | "medium" | "long";
+  responseTone: string;
+  visualStyle: string;
+};
+
 export type AppState = {
   files: DiscuzFile[];
   notes: Note[];
@@ -92,5 +104,6 @@ export type AppState = {
     openaiApiKeyConfigured: boolean;
     openaiApiKeySource: "local" | "env" | "none";
     wallpaperUrl: string;
+    ai: AiSettings;
   };
 };
