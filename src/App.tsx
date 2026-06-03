@@ -1452,7 +1452,6 @@ export function App() {
         activities: payload.activities ?? current.activities
       }));
       assistantRespondedSinceUserRef.current = false;
-      acknowledgeImmediately("收到，我在处理。");
       saveMeetingMessage(text, "user").catch((err) => setError(err instanceof Error ? err.message : "Unable to save meeting record"));
 
       const channel = dataChannelRef.current;
@@ -1466,7 +1465,6 @@ export function App() {
           }
         }));
         requestRealtimeResponse();
-        setStatusText("收到，我在处理。");
       } else {
         setStatusText("Saved for next discussion");
       }
@@ -2532,7 +2530,7 @@ export function App() {
               setStatusText("讨论已结束");
               window.setTimeout(() => {
                 if (sessionId === voiceSessionRef.current) stopVoice();
-              }, 800);
+              }, 1600);
               return;
             }
             window.setTimeout(() => flushRealtimeResponse(), 0);
@@ -2556,7 +2554,6 @@ export function App() {
             const text = String(message.transcript || userTranscriptRef.current || "").trim();
             if (text) {
               assistantRespondedSinceUserRef.current = false;
-              acknowledgeImmediately("收到，我在处理。", true);
               saveMeetingMessage(text, "user").catch((err) => setError(err instanceof Error ? err.message : "Unable to save meeting record"));
             }
             userTranscriptRef.current = "";
@@ -4026,7 +4023,7 @@ function GlassSelect({
   id?: string;
   value: string;
   options: GlassSelectOption[];
-  onChange: (value: string) => void;
+  onChange: (_value: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);

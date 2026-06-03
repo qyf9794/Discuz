@@ -1401,7 +1401,7 @@ function buildDiscussionContext() {
     "随着讨论深入，如果你判断已经形成更准确的讨论主题，必须调用 propose_discussion_topic 请用户确认。若你发现用户正在严重偏离已确认主题，也要调用 propose_discussion_topic 提醒用户，并说明是继续原主题还是确认更换主题。",
     "讨论方向 todo 的节奏：主题一旦被用户确认，就立即调用 propose_discussion_directions 提出 1 到 3 个方向等用户确认，一次最多 3 个，不要再等待几轮讨论。语音只轻轻提示“我先列几个方向，你看要不要删改”。用户确认后，界面会在主题区显示 todo。用户明确要求“再加一个/再补几个/增加方向”时，调用 add_discussion_directions 追加 1 到 3 个新方向；用户不满意时，优先调用 update_discussion_directions 用完整新列表快速替换；用户只想删掉某一条时，可以提醒他点该条右侧删除按钮。每完成一个方向，调用 complete_discussion_direction 标记完成，并写一条简洁记录。",
     "语音确认规则：如果你刚提出了待确认讨论主题，用户说“确认”“可以”“就这个”“对”“没问题”等肯定语义时，调用 confirm_discussion_topic；如果你刚提出了待确认讨论方向 todo，用户说类似肯定语义时，调用 confirm_discussion_directions。不要只口头说已确认，必须调用对应工具保存到界面。",
-    "语音结束规则：如果用户说“结束讨论”“断开连接”“先到这”“停一下今天到这里”等结束语音会话的意图，先用一句中文回应你会收尾，然后调用 end_voice_discussion。工具返回后再说一句很短的收束回应；应用会在这句回应结束后断开语音并保存记录。",
+    "语音结束规则：如果用户说“停止”“结束对话”“结束讨论”“断开连接”“关闭语音”“先到这”“停一下今天到这里”等想结束本次语音连接的话，必须先问一句确认，例如“你是想结束语音连接吗？确认后我会断开。”不要立刻断开，也不要把它当作 cancel_current_task。只有用户随后明确确认时，才调用 end_voice_discussion；工具返回后只说一句“下次再聊”，不要继续展开。应用会在这句回应结束后断开语音并保存记录。",
     "如果收到系统事件提示主题区文件被添加或删除，你必须立即用 1 句中文询问用户下一步想怎么讨论；不要调用 propose_discussion_topic、propose_discussion_directions 或 update_discussion_directions，不要修改、重命名、清空或重新确认当前讨论主题，除非用户明确要求修改主题或重新确认主题。",
     "如果收到系统事件提示当前主题文件已被删除，你必须立即停止基于该文件继续分析，并询问用户是继续用剩余主题文件讨论、上传新的主题文件，还是暂停这个主题；不要主动改变讨论主题。",
     "每次重新打开语音时，你必须先读取下面的讨论记忆，承接此前已经形成的要点、结论、问题和行动项。不要让用户重复已经讨论过的背景；如果记忆和当前文件冲突，以当前文件为准并说明差异。",
@@ -1877,29 +1877,44 @@ app.get("/api/context/search", (req, res) => {
 app.get("/api/web/search", async (req, res) => {
   const query = cleanText(req.query.q || "");
   if (!query) return res.json({ query, results: [] });
+  const warnings = [];
   try {
     const response = await fetch(`https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
       headers: {
-        "User-Agent": "Discuz/0.1 local discussion assistant"
+        "Accept": "text/html,application/xhtml+xml",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Discuz/0.1 local discussion assistant"
       }
     });
     const html = await response.text();
     let results = extractDuckDuckGoResults(html);
+    if (!response.ok) warnings.push(`DuckDuckGo returned ${response.status}`);
+    if (/anomaly-modal|challenge-form|anomaly\.js/i.test(html)) warnings.push("DuckDuckGo returned a challenge page");
     if (!results.length) {
-      const wikiResponse = await fetch(`https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&origin=*&srsearch=${encodeURIComponent(query)}`);
-      const wikiPayload = await wikiResponse.json();
-      results = (wikiPayload.query?.search || []).slice(0, 6).map((item) => ({
-        title: item.title,
-        url: `https://en.wikipedia.org/wiki/${encodeURIComponent(item.title.replaceAll(" ", "_"))}`,
-        snippet: stripTags(decodeHtml(item.snippet)),
-        source: "wikipedia"
-      }));
+      const wikiResponse = await fetch(`https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&origin=*&srsearch=${encodeURIComponent(query)}`, {
+        headers: {
+          "Accept": "application/json",
+          "User-Agent": "Discuz/0.1 local discussion assistant (local development)"
+        }
+      });
+      const contentType = wikiResponse.headers.get("content-type") || "";
+      const wikiText = await wikiResponse.text();
+      if (wikiResponse.ok && contentType.includes("application/json")) {
+        const wikiPayload = JSON.parse(wikiText);
+        results = (wikiPayload.query?.search || []).slice(0, 6).map((item) => ({
+          title: item.title,
+          url: `https://en.wikipedia.org/wiki/${encodeURIComponent(item.title.replaceAll(" ", "_"))}`,
+          snippet: stripTags(decodeHtml(item.snippet)),
+          source: "wikipedia"
+        }));
+      } else {
+        warnings.push(`Wikipedia returned ${wikiResponse.status} ${contentType || "unknown content type"}`);
+      }
     }
-  addActivity("Web", query, now());
+    addActivity("Web", query, now());
     writeTopicSnapshot();
-    res.json({ query, results });
+    res.json({ query, results, warnings });
   } catch (error) {
-    res.status(502).json({ error: error.message, query, results: [] });
+    res.json({ error: error.message, query, results: [], warnings });
   }
 });
 
@@ -2214,7 +2229,7 @@ app.post("/api/realtime/session", async (req, res) => {
       {
         type: "function",
         name: "cancel_current_task",
-        description: "Cancel the current AI response or running task when the user interrupts, asks to stop, or wants to change direction.",
+        description: "Cancel only the current AI response or running tool task when the user interrupts or wants to change direction. Do not use this to end or disconnect the voice session.",
         parameters: {
           type: "object",
           properties: {
@@ -2927,7 +2942,7 @@ app.post("/api/realtime/session", async (req, res) => {
       {
         type: "function",
         name: "end_voice_discussion",
-        description: "End the current voice discussion only when the user asks to stop, end discussion, disconnect, or says the session is done. The app will disconnect after your short closing response.",
+        description: "End the current voice discussion only after the user explicitly confirms they want to stop, end discussion, disconnect, or says the session is done. After this tool returns, say only this short Chinese farewell: 下次再聊. The app will disconnect after that response.",
         parameters: {
           type: "object",
           properties: {
