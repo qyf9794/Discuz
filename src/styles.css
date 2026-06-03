@@ -560,6 +560,7 @@ a.icon-button {
 }
 
 .topic-preview {
+  display: flex;
   min-height: 0;
   flex: 1;
   margin: 0 24px;
@@ -571,9 +572,11 @@ a.icon-button {
   grid-template-columns: repeat(auto-fill, minmax(min(400px, 100%), 400px));
   align-content: start;
   justify-content: start;
-  height: 100%;
+  min-height: 0;
+  flex: 1;
   gap: 16px;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
   padding: 16px 24px;
 }
 
@@ -583,11 +586,14 @@ a.icon-button {
 
 .topic-file-card {
   position: relative;
-  display: flex;
+  display: grid;
   width: min(400px, 100%);
-  flex-direction: column;
+  height: 625px;
+  box-sizing: border-box;
+  grid-template-rows: minmax(0, 1fr) minmax(0, 39px);
   gap: 10px;
   overflow: hidden;
+  padding: 10px;
   border: 0;
   border-radius: 18px;
   background: rgba(255, 255, 255, 0.36);
@@ -607,18 +613,49 @@ a.icon-button {
 }
 
 .topic-card-preview {
+  display: grid;
   width: 100%;
+  height: 100%;
   aspect-ratio: 1 / 1.414;
+  place-items: center;
   min-height: 0;
   overflow: hidden;
   border-radius: 16px;
   background: rgba(255, 255, 255, 0.34);
 }
 
+.topic-card-preview img,
+.topic-card-preview video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  object-fit: cover;
+  pointer-events: none;
+}
+
+.topic-card-preview pre {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  padding: 22px;
+  color: rgba(30, 42, 54, 0.86);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.topic-card-preview .mini-document iframe {
+  transform: scale(0.66);
+}
+
 .topic-file-card footer {
   display: grid;
   gap: 4px;
-  padding: 0 12px 12px;
+  min-width: 0;
+  padding: 0 10px 2px;
   text-align: center;
 }
 
@@ -640,6 +677,10 @@ a.icon-button {
 }
 
 .directions-card {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  grid-template-rows: none;
   min-height: 260px;
   padding: 16px;
   background: transparent;
@@ -691,6 +732,7 @@ a.icon-button {
   display: grid;
   gap: 10px;
   min-height: 0;
+  max-height: calc(100% - 40px);
   margin: 0;
   overflow: auto;
   padding: 2px 0 0;

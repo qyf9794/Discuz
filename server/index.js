@@ -484,10 +484,15 @@ function summarizeText(text, fallbackName) {
 }
 
 async function extractPdf(filePath) {
-  const pdfParse = await import("pdf-parse");
+  const { PDFParse } = await import("pdf-parse");
   const dataBuffer = fs.readFileSync(filePath);
-  const result = await pdfParse.default(dataBuffer);
-  return { text: cleanText(result.text), html: "" };
+  const parser = new PDFParse({ data: dataBuffer });
+  try {
+    const result = await parser.getText();
+    return { text: cleanText(result.text), html: "" };
+  } finally {
+    await parser.destroy();
+  }
 }
 
 async function extractDocx(filePath) {
@@ -1200,7 +1205,7 @@ function replaceDirections(items) {
   const cleaned = (Array.isArray(items) ? items : [])
     .map((item) => cleanText(typeof item === "string" ? item : item?.text))
     .filter(Boolean)
-    .slice(0, 8);
+    .slice(0, 20);
   if (!cleaned.length) return getDirections(topicId);
   const createdAt = now();
   db.exec("BEGIN");

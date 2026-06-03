@@ -63,7 +63,7 @@ type ToolId = "whiteboard" | "draft" | "image" | "video" | "audio";
 type StatusLogEntry = { id: string; kind: "status" | "error"; text: string; createdAt: string };
 type TaskItem = { id: string; label: string; startedAt: string };
 type ToolActivity = { id: string; label: string; status: "running" | "done" | "failed" | "cancelled"; startedAt: string; endedAt?: string; detail?: string; result?: string };
-type DiagnosticEvent = { type: "task:start" | "task:finish"; id: string; label: string; at: string; elapsedMs?: number };
+type DiagnosticEvent = { type: "task:start" | "task:finish" | "task:cancel"; id: string; label: string; at: string; elapsedMs?: number };
 type DiagnosticSnapshot = {
   statusText: string;
   pendingTasks: TaskItem[];
@@ -108,8 +108,23 @@ type DiscuzDiagnostics = {
   clearEvents: () => void;
   runTool: (_name: string, _args?: Record<string, unknown>) => Promise<ToolDiagnosticResult>;
   runTools: (_items: Array<{ name: string; args?: Record<string, unknown> }>) => Promise<ToolDiagnosticResult[]>;
+  runScenario: (_payload: DiagnosticScenarioPayload) => Promise<DiagnosticScenarioResult>;
 };
 type DiscuzDiagnosticWindow = Window & { __discuzDiagnostics?: DiscuzDiagnostics };
+type DiagnosticScenarioPayload = {
+  id?: string;
+  name?: string;
+  args?: Record<string, unknown>;
+  tools?: Array<{ name: string; args?: Record<string, unknown> }>;
+  parallel?: boolean;
+  cancelAfterMs?: number;
+};
+type DiagnosticScenarioResult = DiagnosticSnapshot & {
+  id: string;
+  ok: boolean;
+  results: ToolDiagnosticResult[];
+  error?: string;
+};
 type VoiceMeter = {
   context: AudioContext;
   inputAnalyser?: AnalyserNode;
@@ -345,6 +360,18 @@ function selectOfficeFile(files: DiscuzFile[], kind: OfficeAnalysisKind, role?: 
 function compactText(value: string, maxChars = 18000) {
   const text = value.trim();
   return text.length > maxChars ? `${text.slice(0, maxChars)}\n\n... 已截断，以上为前 ${maxChars} 字。` : text;
+}
+
+function parseHttpUrl(value: string) {
+  const rawUrl = value.trim();
+  if (!rawUrl) return null;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(rawUrl) && !/^https?:\/\//i.test(rawUrl)) return null;
+  try {
+    const parsed = new URL(/^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 function isDiagnosticsEnabled() {
@@ -644,6 +671,9 @@ export function App() {
   const responseTaskTimerRef = useRef<number | null>(null);
   const continuationNudgeTimerRef = useRef<number | null>(null);
   const activeTaskFinishersRef = useRef<Record<string, (_failed?: boolean) => void>>({});
+  const activeTaskLabelsRef = useRef<Record<string, string>>({});
+  const activeTaskOrderRef = useRef<string[]>([]);
+  const taskEpochRef = useRef(0);
   const voiceMeterRef = useRef<VoiceMeter | null>(null);
   const pendingVoiceStopAfterResponseRef = useRef<PendingVoiceStop>("none");
   const pendingTaskCountRef = useRef(0);
@@ -1087,7 +1117,10 @@ export function App() {
     const id = crypto.randomUUID();
     const startedAt = new Date().toISOString();
     const startedAtMs = Date.now();
-    pendingTaskCountRef.current += 1;
+    const epoch = taskEpochRef.current;
+    activeTaskLabelsRef.current[id] = label;
+    activeTaskOrderRef.current = [...activeTaskOrderRef.current.filter((taskId) => taskId !== id), id];
+    pendingTaskCountRef.current = activeTaskOrderRef.current.length;
     activeTaskLabelRef.current = label;
     if (isDiagnosticsEnabled()) {
       diagnosticEventsRef.current = [
@@ -1104,6 +1137,10 @@ export function App() {
       finishing = true;
       const complete = () => {
         if (completed) return;
+        if (epoch !== taskEpochRef.current) {
+          completed = true;
+          return;
+        }
         completed = true;
         if (isDiagnosticsEnabled()) {
           diagnosticEventsRef.current = [
@@ -1111,10 +1148,15 @@ export function App() {
             { type: "task:finish", id, label, at: new Date().toISOString(), elapsedMs: Date.now() - startedAtMs }
           ];
         }
-        pendingTaskCountRef.current = Math.max(0, pendingTaskCountRef.current - 1);
+        delete activeTaskLabelsRef.current[id];
+        activeTaskOrderRef.current = activeTaskOrderRef.current.filter((taskId) => taskId !== id);
+        pendingTaskCountRef.current = activeTaskOrderRef.current.length;
         setPendingTasks((current) => current.filter((task) => task.id !== id));
         if (pendingTaskCountRef.current > 0) {
-          setStatusText(`${activeTaskLabelRef.current || "任务"}进行中`);
+          const activeId = activeTaskOrderRef.current[activeTaskOrderRef.current.length - 1];
+          const activeLabel = activeTaskLabelsRef.current[activeId] || "任务";
+          activeTaskLabelRef.current = activeLabel;
+          setStatusText(pendingTaskCountRef.current > 1 ? `正在执行 ${pendingTaskCountRef.current} 个任务` : `${activeLabel}进行中`);
         } else {
           activeTaskLabelRef.current = "";
           setStatusText(`${label}${failed ? "失败" : "完成"}`);
@@ -1144,8 +1186,23 @@ export function App() {
   }, []);
 
   const finishAllVisibleTasks = useCallback(() => {
-    Object.values(activeTaskFinishersRef.current).forEach((finish) => finish());
+    if (isDiagnosticsEnabled() && activeTaskOrderRef.current.length) {
+      const cancelledAt = new Date().toISOString();
+      const cancelledEvents = activeTaskOrderRef.current.map((id) => ({
+        type: "task:cancel" as const,
+        id,
+        label: activeTaskLabelsRef.current[id] || "任务",
+        at: cancelledAt
+      }));
+      diagnosticEventsRef.current = [
+        ...diagnosticEventsRef.current.slice(-199),
+        ...cancelledEvents
+      ].slice(-200);
+    }
+    taskEpochRef.current += 1;
     activeTaskFinishersRef.current = {};
+    activeTaskLabelsRef.current = {};
+    activeTaskOrderRef.current = [];
     if (responseTaskTimerRef.current) window.clearTimeout(responseTaskTimerRef.current);
     responseTaskTimerRef.current = null;
     if (continuationNudgeTimerRef.current) window.clearTimeout(continuationNudgeTimerRef.current);
@@ -1204,12 +1261,18 @@ export function App() {
       startedAt: new Date().toISOString(),
       detail
     };
-    setToolActivities([activity]);
+    setToolActivities((items) => [activity, ...items].slice(0, 12));
     return id;
   };
 
   const updateToolActivity = (id: string, patch: Partial<ToolActivity>) => {
-    setToolActivities((items) => items.map((item) => item.id === id ? { ...item, ...patch, endedAt: patch.endedAt ?? item.endedAt } : item));
+    setToolActivities((items) => items.map((item) => {
+      if (item.id !== id) return item;
+      if (item.status === "cancelled" && patch.status && patch.status !== "cancelled") {
+        return { ...item, result: item.result ?? patch.result, endedAt: item.endedAt ?? patch.endedAt };
+      }
+      return { ...item, ...patch, endedAt: patch.endedAt ?? item.endedAt };
+    }));
   };
 
   const setPrimary = async (files: FileList | File[]) => {
@@ -1480,6 +1543,7 @@ export function App() {
       }, 18000);
     }
     session.sendMessage(text);
+    window.setTimeout(() => requestRealtimeResponseRef.current(), 0);
     return true;
   };
 
@@ -1501,7 +1565,7 @@ export function App() {
   }, [beginUniqueTask, requestRealtimeResponse]);
 
   const notifyForegroundDiscussion = (title: string, text: string) => {
-    realtimeSessionRef.current?.sendMessage(`系统事件：用户打开了前台讨论窗口《${title}》。这个窗口现在是当前临时讨论对象，请先阅读以下内容，再围绕它继续讨论。\n\n${text.slice(0, 6000)}`);
+    sendRealtimeSystemEvent(`系统事件：用户打开了前台讨论窗口《${title}》。这个窗口现在是当前临时讨论对象，请先阅读以下内容，再围绕它继续讨论。\n\n${text.slice(0, 6000)}`);
   };
 
   const describeFileForDiscussion = (file: DiscuzFile) => {
@@ -1649,6 +1713,7 @@ export function App() {
           clearResponseWatchdog();
         }
         session.sendMessage(`用户文字输入：${text}`);
+        window.setTimeout(() => requestRealtimeResponseRef.current(), 0);
       } else {
         setStatusText("Saved for next discussion");
       }
@@ -1677,7 +1742,9 @@ export function App() {
         activities: payload.activities ?? current.activities
       }));
       setTopicProposal(null);
+      topicProposalRef.current = null;
       setDirectionProposal(null);
+      directionProposalRef.current = null;
       setStatusText(`已确认主题：${confirmedTitle}`);
       const session = realtimeSessionRef.current;
       if (options.notifyRealtime !== false && session) {
@@ -1716,6 +1783,7 @@ export function App() {
         topics: payload.topics ?? current.topics
       }));
       setDirectionProposal(null);
+      directionProposalRef.current = null;
       setStatusText("讨论方向已确认");
       const confirmedDirections = (payload.directions ?? []).map((direction: DiscussionDirection, index: number) => (
         `${index + 1}. ${direction.completed ? "已完成" : "未完成"}｜${direction.text}`
@@ -1841,7 +1909,7 @@ export function App() {
   const executeRealtimeTool = async (name: string, args: Record<string, any> = {}) => {
     const label = toolCallLabel(name);
     const activityId = createToolActivity(label, name);
-    const finishTask = beginUniqueTask(`tool-${name}`, label);
+    const finishTask = beginTask(label);
     let output = {};
     try {
       if (name === "search_context") {
@@ -1867,18 +1935,15 @@ export function App() {
         }
       }
       if (name === "open_web_page") {
-        const rawUrl = String(args.url || "").trim();
-        const url = rawUrl && !/^https?:\/\//i.test(rawUrl) ? `https://${rawUrl}` : rawUrl;
-        try {
-          const parsed = new URL(url);
-          if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("Unsupported protocol");
+        const parsed = parseHttpUrl(String(args.url || ""));
+        if (parsed) {
           setWebPreview({ url: parsed.toString(), title: String(args.title || parsed.hostname || "网页").trim() });
           setActiveTool(null);
           setPreviewFileId(null);
           setPreviewRecordId(null);
           setGeneratedEditorId(null);
           output = { ok: true, opened: parsed.toString() };
-        } catch {
+        } else {
           output = { ok: false, error: "Invalid web URL. Use an http or https URL." };
         }
       }
@@ -2037,7 +2102,9 @@ export function App() {
       }
       if (name === "start_break") {
         const minutes = Math.max(1, Math.min(30, Number(args.minutes || args.durationMinutes || 5)));
-        const until = new Date(Date.now() + minutes * 60000).toISOString();
+        const untilDate = new Date();
+        untilDate.setTime(untilDate.getTime() + minutes * 60000);
+        const until = untilDate.toISOString();
         setBreakUntil(until);
         setAmbientMode(args.ambientMode === true ? true : ambientMode);
         setStatusText(`休息中 ${minutes}:00`);
@@ -2050,16 +2117,13 @@ export function App() {
         output = { ok: true, resumed: true };
       }
       if (name === "open_media_url") {
-        const rawUrl = String(args.url || "").trim();
-        const url = rawUrl && !/^https?:\/\//i.test(rawUrl) ? `https://${rawUrl}` : rawUrl;
-        try {
-          const parsed = new URL(url);
-          if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("Unsupported protocol");
+        const parsed = parseHttpUrl(String(args.url || ""));
+        if (parsed) {
           const mediaType = String(args.mediaType || "media").trim();
           setWebPreview({ url: parsed.toString(), title: String(args.title || (mediaType === "music" ? "在线音乐" : mediaType === "video" ? "视频" : "媒体")).trim() });
           setStatusText("媒体窗口已打开");
           output = { ok: true, opened: parsed.toString(), mediaType };
-        } catch {
+        } else {
           output = { ok: false, error: "Invalid media URL. Use an http or https URL." };
         }
       }
@@ -2068,8 +2132,8 @@ export function App() {
         setAmbientMode(enabled);
         const musicUrl = String(args.musicUrl || "").trim();
         if (enabled && musicUrl) {
-          const url = /^https?:\/\//i.test(musicUrl) ? musicUrl : `https://${musicUrl}`;
-          setWebPreview({ url, title: String(args.title || "氛围音乐").trim() });
+          const parsed = parseHttpUrl(musicUrl);
+          if (parsed) setWebPreview({ url: parsed.toString(), title: String(args.title || "氛围音乐").trim() });
         }
         setStatusText(enabled ? "氛围模式已开启" : "氛围模式已关闭");
         output = { ok: true, ambientMode: enabled, musicUrl: musicUrl || "" };
@@ -2448,7 +2512,9 @@ export function App() {
           .filter(Boolean)
           .slice(0, 3);
         if (directions.length) {
-          setDirectionProposal({ directions, reason: String(args.reason || "").trim() });
+          const proposal = { directions, reason: String(args.reason || "").trim() };
+          directionProposalRef.current = proposal;
+          setDirectionProposal(proposal);
           output = { ok: true, proposed: directions };
         } else {
           output = { ok: false, error: "Missing discussion directions." };
@@ -2491,7 +2557,7 @@ export function App() {
         }
       }
       if (name === "confirm_discussion_topic") {
-        const title = String(args.title || topicProposal?.title || "").trim();
+        const title = String(args.title || topicProposalRef.current?.title || "").trim();
         if (title) {
           await confirmDiscussionTopic(title, { notifyRealtime: false });
           output = {
@@ -2504,7 +2570,7 @@ export function App() {
         }
       }
       if (name === "confirm_discussion_directions") {
-        const directions = directionProposal?.directions ?? [];
+        const directions = directionProposalRef.current?.directions ?? [];
         if (directions.length) {
           await confirmDirectionProposal(directions, { notifyRealtime: false });
           output = {
@@ -2528,7 +2594,7 @@ export function App() {
       if (name === "propose_discussion_topic") {
         const title = String(args.title || "").trim();
         const reason = String(args.reason || "").trim();
-        const intent = args.intent === "drift" ? "drift" : "confirm";
+        const intent: TopicProposal["intent"] = args.intent === "drift" ? "drift" : "confirm";
         if (topicFileChangeBlocksTopicProposalRef.current) {
           setStatusText("已阻止自动修改主题");
           output = {
@@ -2536,7 +2602,9 @@ export function App() {
             error: "刚刚发生主题区文件增删。此时只能询问用户下一步，不允许拟确认或修改讨论主题，除非用户明确要求。"
           };
         } else if (title) {
-          setTopicProposal({ title, reason, intent });
+          const proposal = { title, reason, intent };
+          topicProposalRef.current = proposal;
+          setTopicProposal(proposal);
           output = { ok: true, proposed: title };
         } else {
           output = { ok: false, error: "Missing topic title." };
@@ -2564,50 +2632,74 @@ export function App() {
     executeRealtimeToolRef.current = executeRealtimeTool;
   });
 
-  useEffect(() => {
-    if (!isDiagnosticsEnabled()) return;
-    const snapshot = (): DiagnosticSnapshot => ({
+  const diagnosticSnapshot = useCallback((): DiagnosticSnapshot => ({
       statusText: statusTextRef.current,
       pendingTasks: pendingTasksRef.current,
       visibleTasks: visibleTasksRef.current,
       toolActivities: toolActivitiesRef.current.slice(0, 12),
       taskEvents: diagnosticEventsRef.current.slice(-60)
-    });
-    const runTool = async (name: string, args: Record<string, unknown> = {}) => {
-      const startedAt = performance.now();
-      const eventStartIndex = diagnosticEventsRef.current.length;
-      const result = await executeRealtimeTool(name, args);
-      await new Promise((resolve) => window.setTimeout(resolve, 960));
-      const taskEvents = diagnosticEventsRef.current.slice(eventStartIndex);
-      const failed = Boolean((result as { error?: unknown; ok?: unknown })?.error) || (result as { ok?: unknown })?.ok === false;
-      return {
-        ...snapshot(),
-        taskEvents,
-        name,
-        ok: !failed,
-        elapsedMs: Math.round(performance.now() - startedAt),
-        result,
-        observedTask: taskEvents.some((event) => event.type === "task:start")
-      };
+  }), []);
+
+  const runDiagnosticTool = useCallback(async (name: string, args: Record<string, unknown> = {}) => {
+    const startedAt = performance.now();
+    const eventStartIndex = diagnosticEventsRef.current.length;
+    const executor = executeRealtimeToolRef.current;
+    if (!executor) throw new Error("Realtime tool executor is not ready.");
+    const result = await executor(name, args);
+    await new Promise((resolve) => window.setTimeout(resolve, 960));
+    const taskEvents = diagnosticEventsRef.current.slice(eventStartIndex);
+    const failed = Boolean((result as { error?: unknown; ok?: unknown })?.error) || (result as { ok?: unknown })?.ok === false;
+    return {
+      ...diagnosticSnapshot(),
+      taskEvents,
+      name,
+      ok: !failed,
+      elapsedMs: Math.round(performance.now() - startedAt),
+      result,
+      observedTask: taskEvents.some((event) => event.type === "task:start")
     };
+  }, [diagnosticSnapshot]);
+
+  const runDiagnosticScenario = useCallback(async (payload: DiagnosticScenarioPayload): Promise<DiagnosticScenarioResult> => {
+    const id = payload.id || crypto.randomUUID();
+    const tools = (Array.isArray(payload.tools) && payload.tools.length
+      ? payload.tools
+      : [{ name: String(payload.name || "").trim(), args: payload.args ?? {} }]
+    ).filter((item) => String(item.name || "").trim());
+    if (!tools.length) throw new Error("Missing diagnostic tool name.");
+    const cancelAfterMs = Number(payload.cancelAfterMs);
+    const cancelTimer = Number.isFinite(cancelAfterMs) && cancelAfterMs >= 0
+      ? window.setTimeout(() => cancelCurrentTask(), cancelAfterMs)
+      : null;
+    try {
+      const results = payload.parallel
+        ? await Promise.all(tools.map((item) => runDiagnosticTool(String(item.name).trim(), item.args ?? {})))
+        : await tools.reduce<Promise<ToolDiagnosticResult[]>>(async (previous, item) => {
+            const results = await previous;
+            results.push(await runDiagnosticTool(String(item.name).trim(), item.args ?? {}));
+            return results;
+          }, Promise.resolve([]));
+      await new Promise((resolve) => window.setTimeout(resolve, 250));
+      return { id, ok: results.every((result) => result.ok), results, ...diagnosticSnapshot() };
+    } finally {
+      if (cancelTimer) window.clearTimeout(cancelTimer);
+    }
+  }, [cancelCurrentTask, diagnosticSnapshot, runDiagnosticTool]);
+
+  useEffect(() => {
+    if (!isDiagnosticsEnabled()) return;
     const publishResult = (payload: unknown) => {
       document.documentElement.dataset.discuzDiagnosticResult = JSON.stringify(payload);
     };
     const handleRunTool = (event: Event) => {
-      const detail = (event as CustomEvent<{ id?: string; name?: string; args?: Record<string, unknown> }>).detail ?? {};
-      const id = detail.id || crypto.randomUUID();
-      const name = String(detail.name || "").trim();
-      if (!name) {
-        publishResult({ id, ok: false, error: "Missing tool name." });
-        return;
-      }
-      runTool(name, detail.args ?? {})
+      const detail = (event as CustomEvent<DiagnosticScenarioPayload>).detail ?? {};
+      runDiagnosticScenario(detail)
         .then((result) => {
-          const payload = { id, ...result };
-          publishResult(payload);
-          document.dispatchEvent(new CustomEvent("discuz:tool-result", { detail: payload }));
+          publishResult(result);
+          document.dispatchEvent(new CustomEvent("discuz:tool-result", { detail: result }));
         })
         .catch((err) => {
+          const id = detail.id || crypto.randomUUID();
           const payload = { id, ok: false, error: err instanceof Error ? err.message : "Diagnostic tool run failed." };
           publishResult(payload);
           document.dispatchEvent(new CustomEvent("discuz:tool-result", { detail: payload }));
@@ -2616,49 +2708,58 @@ export function App() {
     document.addEventListener("discuz:run-tool", handleRunTool);
     const diagnosticWindow = window as DiscuzDiagnosticWindow;
     diagnosticWindow.__discuzDiagnostics = {
-      snapshot,
+      snapshot: diagnosticSnapshot,
       clearEvents: () => {
         diagnosticEventsRef.current = [];
       },
-      runTool,
+      runTool: runDiagnosticTool,
       runTools: async (items) => {
         const results: ToolDiagnosticResult[] = [];
         for (const item of items) {
-          results.push(await runTool(item.name, item.args ?? {}));
+          results.push(await runDiagnosticTool(item.name, item.args ?? {}));
         }
         return results;
-      }
+      },
+      runScenario: runDiagnosticScenario
     };
     return () => {
       document.removeEventListener("discuz:run-tool", handleRunTool);
-      if (diagnosticWindow.__discuzDiagnostics?.runTool === runTool) delete diagnosticWindow.__discuzDiagnostics;
+      if (diagnosticWindow.__discuzDiagnostics?.runTool === runDiagnosticTool) delete diagnosticWindow.__discuzDiagnostics;
     };
-  });
+  }, [diagnosticSnapshot, runDiagnosticScenario, runDiagnosticTool]);
+
+  useEffect(() => {
+    if (!isDiagnosticsEnabled()) return;
+    const raw = new URLSearchParams(window.location.search).get("discuzDiag");
+    if (!raw) return;
+    try {
+      const payload = JSON.parse(raw) as DiagnosticScenarioPayload;
+      runDiagnosticScenario(payload)
+        .then((result) => {
+          document.documentElement.dataset.discuzDiagnosticResult = JSON.stringify(result);
+          document.dispatchEvent(new CustomEvent("discuz:tool-result", { detail: result }));
+        })
+        .catch((err) => {
+          document.documentElement.dataset.discuzDiagnosticResult = JSON.stringify({
+            id: payload.id || crypto.randomUUID(),
+            ok: false,
+            error: err instanceof Error ? err.message : "Diagnostic scenario failed."
+          });
+        });
+    } catch (err) {
+      document.documentElement.dataset.discuzDiagnosticResult = JSON.stringify({
+        id: crypto.randomUUID(),
+        ok: false,
+        error: err instanceof Error ? err.message : "Invalid diagnostic scenario."
+      });
+    } finally {
+      window.history.replaceState(null, "", window.location.pathname);
+    }
+  }, [runDiagnosticScenario]);
 
   const runDiagnosticBridge = async () => {
-    const payload = JSON.parse(diagnosticInput || "{}") as { id?: string; name?: string; args?: Record<string, unknown> };
-    const id = payload.id || crypto.randomUUID();
-    const name = String(payload.name || "").trim();
-    if (!name) throw new Error("Missing diagnostic tool name.");
-    const startedAt = performance.now();
-    const eventStartIndex = diagnosticEventsRef.current.length;
-    const result = await executeRealtimeTool(name, payload.args ?? {});
-    await new Promise((resolve) => window.setTimeout(resolve, 960));
-    const taskEvents = diagnosticEventsRef.current.slice(eventStartIndex);
-    const failed = Boolean((result as { error?: unknown; ok?: unknown })?.error) || (result as { ok?: unknown })?.ok === false;
-    const diagnosticResult: ToolDiagnosticResult & { id: string } = {
-      id,
-      name,
-      ok: !failed,
-      elapsedMs: Math.round(performance.now() - startedAt),
-      result,
-      statusText: statusTextRef.current,
-      pendingTasks: pendingTasksRef.current,
-      visibleTasks: visibleTasksRef.current,
-      toolActivities: toolActivitiesRef.current.slice(0, 12),
-      taskEvents,
-      observedTask: taskEvents.some((event) => event.type === "task:start")
-    };
+    const payload = JSON.parse(diagnosticInput || "{}") as DiagnosticScenarioPayload;
+    const diagnosticResult = await runDiagnosticScenario(payload);
     document.documentElement.dataset.discuzDiagnosticResult = JSON.stringify(diagnosticResult);
   };
 
@@ -2897,16 +2998,11 @@ export function App() {
       session.on("agent_tool_start", (...values: unknown[]) => {
         if (sessionId !== voiceSessionRef.current) return;
         const name = realtimeEventToolName(...values);
-        const label = toolCallLabel(name || "任务");
         finishUniqueTask(`approval-${name || "tool"}`);
         finishResponseTask();
-        beginUniqueTask(`tool-${name || label}`, label);
       });
-      session.on("agent_tool_end", (...values: unknown[]) => {
+      session.on("agent_tool_end", () => {
         if (sessionId !== voiceSessionRef.current) return;
-        const name = realtimeEventToolName(...values);
-        const label = toolCallLabel(name || "任务");
-        finishUniqueTask(`tool-${name || label}`);
         if (responseActiveRef.current) scheduleResponseTask("AI整理结果");
         scheduleContinuationResponse("AI继续回答");
       });
@@ -2978,11 +3074,20 @@ export function App() {
             userTranscriptRef.current = "";
           }
           if (message.type === "error") {
+            const messageText = message.error?.message || "Realtime error";
+            if (/active response in progress/i.test(messageText)) {
+              responseActiveRef.current = true;
+              responsePendingRef.current = true;
+              setStatusText("上一轮还在处理");
+              setVoiceState("thinking");
+              startResponseWatchdog();
+              scheduleResponseTask("AI处理中");
+              return;
+            }
             responseActiveRef.current = false;
             clearResponseWatchdog();
             finishAllVisibleTasks();
-            if (/active response in progress/i.test(message.error?.message || "")) responsePendingRef.current = true;
-            setError(message.error?.message || "Realtime error");
+            setError(messageText);
             setVoiceState("error");
           }
         } catch {
@@ -3165,7 +3270,9 @@ export function App() {
     setActiveTool(null);
     setWebPreview(null);
     setTopicProposal(null);
+    topicProposalRef.current = null;
     setDirectionProposal(null);
+    directionProposalRef.current = null;
     setDiscussionText("");
     setError("");
     setTranscript("");
@@ -3279,7 +3386,10 @@ export function App() {
               currentTopic={state.discussionTopic}
               proposal={topicProposal}
               onConfirm={(title) => confirmDiscussionTopic(title).catch((err) => setError(err.message))}
-              onDismiss={() => setTopicProposal(null)}
+              onDismiss={() => {
+                topicProposalRef.current = null;
+                setTopicProposal(null);
+              }}
             />
           }
           action={
@@ -3302,7 +3412,10 @@ export function App() {
                   directions={state.directions}
                   proposal={directionProposal}
                   onConfirmProposal={() => directionProposal && confirmDirectionProposal(directionProposal.directions).catch((err) => setError(err.message))}
-                  onDismissProposal={() => setDirectionProposal(null)}
+                  onDismissProposal={() => {
+                    directionProposalRef.current = null;
+                    setDirectionProposal(null);
+                  }}
                   onComplete={(direction) => completeDirection(direction).catch((err) => setError(err.message))}
                   onDelete={(direction) => deleteDirection(direction).catch((err) => setError(err.message))}
                 />
@@ -3370,7 +3483,7 @@ export function App() {
                     </div>
                   )}
                   <div className="topic-card-preview">
-                    <FilePreview file={file} />
+                    <FileMiniPreview file={file} />
                   </div>
                   <footer>
                     <span>{file.kind}</span>
