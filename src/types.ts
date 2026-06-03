@@ -84,9 +84,25 @@ export type AiSettings = {
   transcriptionModel: string;
   imageModel: string;
   imageQuality: "low" | "medium" | "high" | "auto";
-  responseLength: "short" | "medium" | "long";
-  responseTone: string;
-  visualStyle: string;
+  webSearchProviders: string;
+  braveSearchApiKey?: string;
+  braveSearchApiKeyConfigured?: boolean;
+  braveSearchApiKeySource?: "local" | "env" | "none";
+  bingSearchApiKey?: string;
+  bingSearchApiKeyConfigured?: boolean;
+  bingSearchApiKeySource?: "local" | "env" | "none";
+  googleSearchApiKey?: string;
+  googleSearchApiKeyConfigured?: boolean;
+  googleSearchApiKeySource?: "local" | "env" | "none";
+  googleSearchEngineId?: string;
+  googleSearchEngineIdConfigured?: boolean;
+  googleSearchEngineIdSource?: "local" | "env" | "none";
+  serpApiKey?: string;
+  serpApiKeyConfigured?: boolean;
+  serpApiKeySource?: "local" | "env" | "none";
+  tavilyApiKey?: string;
+  tavilyApiKeyConfigured?: boolean;
+  tavilyApiKeySource?: "local" | "env" | "none";
 };
 
 export type AppState = {

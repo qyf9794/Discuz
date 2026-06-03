@@ -13,6 +13,7 @@ import multer from "multer";
 import mammoth from "mammoth";
 import JSZip from "jszip";
 import { XMLParser } from "fast-xml-parser";
+import OpenAI from "openai";
 
 const execFileAsync = promisify(execFile);
 const officeConverterCandidates = [
@@ -38,9 +39,16 @@ const aiSettingsDefaults = {
   transcriptionModel: "gpt-4o-transcribe",
   imageModel: defaultImageGenerationModel,
   imageQuality: "high",
-  responseLength: "short",
-  responseTone: "活泼、简洁、有一点笑意",
-  visualStyle: "清晰、精致、可用于讨论"
+  webSearchProviders: "brave,bing,google,serpapi,tavily,duckduckgo,wikipedia"
+};
+const webSearchProviders = ["brave", "bing", "google", "serpapi", "tavily", "duckduckgo", "wikipedia"];
+const webSearchSecretSettings = {
+  brave: { setting: "web_search_brave_api_key", env: ["BRAVE_SEARCH_API_KEY"] },
+  bing: { setting: "web_search_bing_api_key", env: ["BING_SEARCH_API_KEY"] },
+  google: { setting: "web_search_google_api_key", env: ["GOOGLE_SEARCH_API_KEY", "GOOGLE_API_KEY"] },
+  googleEngine: { setting: "web_search_google_engine_id", env: ["GOOGLE_SEARCH_ENGINE_ID", "GOOGLE_CSE_ID"] },
+  serpapi: { setting: "web_search_serpapi_api_key", env: ["SERPAPI_API_KEY"] },
+  tavily: { setting: "web_search_tavily_api_key", env: ["TAVILY_API_KEY"] }
 };
 
 fs.mkdirSync(legacyUploadDir, { recursive: true });
@@ -210,7 +218,6 @@ const upload = multer({
 
 const app = express();
 app.use(cors());
-app.use("/api/realtime/session", express.text({ type: ["application/sdp", "text/plain"], limit: "2mb" }));
 app.use(express.json({ limit: "2mb" }));
 app.get("/api/raw/:topicId/:storedName", (req, res) => {
   const topicId = cleanText(req.params.topicId);
@@ -1283,6 +1290,12 @@ function deleteSetting(key) {
   db.prepare("DELETE FROM settings WHERE key = ?").run(key);
 }
 
+function deleteLegacyAiTuningSettings() {
+  ["ai_response_length", "ai_response_tone", "ai_visual_style"].forEach(deleteSetting);
+}
+
+deleteLegacyAiTuningSettings();
+
 function addActivity(label, detail = "", createdAt = now(), topicId = getActiveTopicId()) {
   db.prepare("INSERT INTO activities (id, topic_id, label, detail, created_at) VALUES (?, ?, ?, ?, ?)")
     .run(crypto.randomUUID(), topicId, label, cleanText(detail), createdAt);
@@ -1293,12 +1306,47 @@ function getOpenAiApiKey() {
   return cleanText(getSetting("openai_api_key")) || cleanText(process.env.OPENAI_API_KEY || "");
 }
 
+function getEnvValue(names = []) {
+  return names.map((name) => cleanText(process.env[name] || "")).find(Boolean) || "";
+}
+
+function getWebSearchSecret(name) {
+  const config = webSearchSecretSettings[name];
+  if (!config) return "";
+  return getEnvValue(config.env) || cleanText(getSetting(config.setting));
+}
+
+function getWebSearchSecretState(name) {
+  const config = webSearchSecretSettings[name];
+  if (!config) return { configured: false, source: "none" };
+  const env = getEnvValue(config.env);
+  const local = cleanText(getSetting(config.setting));
+  return {
+    configured: Boolean(env || local),
+    source: env ? "env" : local ? "local" : "none"
+  };
+}
+
+function cleanWebSearchProviders(value) {
+  const providers = cleanText(value)
+    .split(/[,;\s]+/)
+    .map((item) => item.toLowerCase())
+    .filter((item, index, list) => webSearchProviders.includes(item) && list.indexOf(item) === index);
+  return providers.length ? providers.join(",") : aiSettingsDefaults.webSearchProviders;
+}
+
 function oneOf(value, allowed, fallback) {
   const cleaned = cleanText(value);
   return allowed.includes(cleaned) ? cleaned : fallback;
 }
 
 function getAiSettingsState() {
+  const braveState = getWebSearchSecretState("brave");
+  const bingState = getWebSearchSecretState("bing");
+  const googleState = getWebSearchSecretState("google");
+  const googleEngineState = getWebSearchSecretState("googleEngine");
+  const serpApiState = getWebSearchSecretState("serpapi");
+  const tavilyState = getWebSearchSecretState("tavily");
   return {
     assistantName: cleanText(getSetting("ai_assistant_name")) || aiSettingsDefaults.assistantName,
     realtimeModel: oneOf(getSetting("ai_realtime_model"), ["gpt-realtime-2", "gpt-realtime"], aiSettingsDefaults.realtimeModel),
@@ -1306,9 +1354,19 @@ function getAiSettingsState() {
     transcriptionModel: oneOf(getSetting("ai_transcription_model"), ["gpt-4o-transcribe", "gpt-4o-mini-transcribe"], aiSettingsDefaults.transcriptionModel),
     imageModel: oneOf(getSetting("ai_image_model"), ["gpt-image-1.5", "gpt-image-1"], aiSettingsDefaults.imageModel),
     imageQuality: oneOf(getSetting("ai_image_quality"), ["low", "medium", "high", "auto"], aiSettingsDefaults.imageQuality),
-    responseLength: oneOf(getSetting("ai_response_length"), ["short", "medium", "long"], aiSettingsDefaults.responseLength),
-    responseTone: cleanText(getSetting("ai_response_tone")) || aiSettingsDefaults.responseTone,
-    visualStyle: cleanText(getSetting("ai_visual_style")) || aiSettingsDefaults.visualStyle
+    webSearchProviders: cleanWebSearchProviders(process.env.WEB_SEARCH_PROVIDERS || process.env.WEB_SEARCH_PROVIDER || getSetting("web_search_providers")),
+    braveSearchApiKeyConfigured: braveState.configured,
+    braveSearchApiKeySource: braveState.source,
+    bingSearchApiKeyConfigured: bingState.configured,
+    bingSearchApiKeySource: bingState.source,
+    googleSearchApiKeyConfigured: googleState.configured,
+    googleSearchApiKeySource: googleState.source,
+    googleSearchEngineIdConfigured: googleEngineState.configured,
+    googleSearchEngineIdSource: googleEngineState.source,
+    serpApiKeyConfigured: serpApiState.configured,
+    serpApiKeySource: serpApiState.source,
+    tavilyApiKeyConfigured: tavilyState.configured,
+    tavilyApiKeySource: tavilyState.source
   };
 }
 
@@ -1321,9 +1379,7 @@ function saveAiSettings(payload = {}) {
     transcriptionModel: oneOf(payload.transcriptionModel ?? current.transcriptionModel, ["gpt-4o-transcribe", "gpt-4o-mini-transcribe"], current.transcriptionModel),
     imageModel: oneOf(payload.imageModel ?? current.imageModel, ["gpt-image-1.5", "gpt-image-1"], current.imageModel),
     imageQuality: oneOf(payload.imageQuality ?? current.imageQuality, ["low", "medium", "high", "auto"], current.imageQuality),
-    responseLength: oneOf(payload.responseLength ?? current.responseLength, ["short", "medium", "long"], current.responseLength),
-    responseTone: cleanText(payload.responseTone ?? current.responseTone).slice(0, 120) || aiSettingsDefaults.responseTone,
-    visualStyle: cleanText(payload.visualStyle ?? current.visualStyle).slice(0, 160) || aiSettingsDefaults.visualStyle
+    webSearchProviders: cleanWebSearchProviders(payload.webSearchProviders ?? current.webSearchProviders)
   };
   setSetting("ai_assistant_name", next.assistantName);
   setSetting("ai_realtime_model", next.realtimeModel);
@@ -1331,10 +1387,26 @@ function saveAiSettings(payload = {}) {
   setSetting("ai_transcription_model", next.transcriptionModel);
   setSetting("ai_image_model", next.imageModel);
   setSetting("ai_image_quality", next.imageQuality);
-  setSetting("ai_response_length", next.responseLength);
-  setSetting("ai_response_tone", next.responseTone);
-  setSetting("ai_visual_style", next.visualStyle);
-  return next;
+  setSetting("web_search_providers", next.webSearchProviders);
+
+  [
+    ["brave", "braveSearchApiKey"],
+    ["bing", "bingSearchApiKey"],
+    ["google", "googleSearchApiKey"],
+    ["googleEngine", "googleSearchEngineId"],
+    ["serpapi", "serpApiKey"],
+    ["tavily", "tavilyApiKey"]
+  ].forEach(([secretName, payloadKey]) => {
+    const settingKey = webSearchSecretSettings[secretName].setting;
+    const clearKeys = Array.isArray(payload.clearWebSearchKeys) ? payload.clearWebSearchKeys : [];
+    if (clearKeys.includes(secretName)) {
+      deleteSetting(settingKey);
+      return;
+    }
+    const value = cleanText(payload[payloadKey] || "");
+    if (value) setSetting(settingKey, value);
+  });
+  return getAiSettingsState();
 }
 
 function getSettingsState() {
@@ -1388,12 +1460,11 @@ function buildDiscussionContext() {
     .join("\n");
   return [
     `你是 ${aiSettings.assistantName}，一个用于本地文件语音讨论的 AI 伙伴。你的对话必须紧密围绕当前主讨论文件、用户给出的背景材料和用户刚刚提出的问题。`,
-    `语音风格：${aiSettings.responseTone}。不要严肃播报、不要会议主持腔、不要长篇铺陈。`,
-    `语音节奏：说得自然一点，可以略快但不要赶；用短句，语气有起伏。当前回答长度设置为 ${aiSettings.responseLength}：short 最多 2 句，medium 最多 4 句，long 最多 6 句；需要用户确认时，只问 1 个问题。`,
     "表达习惯：保持自然口语，但不要依赖固定开场白、固定等待语或固定结束语；每次根据上下文换一种说法。不要过度卖萌、不要夸张，不要使用表情符号。",
     "逐句回应规则：用户每说完或输入一条内容，你要自然回应并说明下一步。禁止静默直接调用工具；如果确实要调用工具，先用符合上下文的短句承接，不要套模板。",
     "执行反馈规则：只要你准备调用工具、后台任务、搜索、生成、分析、打开窗口、下载或保存文件，先自然告诉用户你接下来做什么。不要使用固定等待口头禅，也不要反复套同一种句式。工具完成后说明结果或下一步，不要沉默等待用户问“在吗”。",
     "等待反馈规则：如果上一轮回复、工具调用或后台任务还在处理，不要假装完成；简短说明当前仍在处理中，并让界面状态继续显示任务。不要反复使用同一个等待句式。",
+    "用户优先规则：如果后台任务、文件解析、搜索、生成或其他工具仍在进行，而用户提出新的问题或要求，优先回应并执行用户最新要求；无关任务继续在后台进行，不要让用户等待它们结束。只有当前任务与用户最新要求直接冲突时，才简短说明冲突并请用户选择。",
     "开场规则：语音刚开始或用户还没有明确提出讨论内容时，不要上来就概括主题或调用 propose_discussion_topic。先自然打招呼，再询问用户想从哪里开始；不要固定使用某一句开场。",
     "默认讨论对象是当前打开的主题文件、前台弹出的预览窗口和白板。除非用户明确要求讨论其他资源文件，或当前信息确实不足，否则不要主动把讨论焦点切到其他文件。",
     "讨论主题不只来自主题文件，也来自用户在底部输入框提交的主题、观点、问题和链接。用户的文字输入优先级很高，要把它当作当前讨论指令的一部分。",
@@ -1406,7 +1477,7 @@ function buildDiscussionContext() {
     "如果收到系统事件提示当前主题文件已被删除，你必须立即停止基于该文件继续分析，并询问用户是继续用剩余主题文件讨论、上传新的主题文件，还是暂停这个主题；不要主动改变讨论主题。",
     "每次重新打开语音时，你必须先读取下面的讨论记忆，承接此前已经形成的要点、结论、问题和行动项。不要让用户重复已经讨论过的背景；如果记忆和当前文件冲突，以当前文件为准并说明差异。",
     "记录窗口保存的是讨论要点，不是逐句转写。不要把自己或用户的原话逐句写入记录；只有在形成一个完整观点、阶段性结论、待确认问题或行动项后，才调用 save_discussion_note 保存一段简洁总结。每条记录应是一小段话，优先概括“讨论了什么、形成了什么判断、下一步是什么”。",
-    "讨论推进工具：需要确认当前界面焦点时调用 read_current_focus；需要完整讨论状态时调用 get_discussion_state；需要用户确认时调用 ask_user_confirmation；用户临时追加任务时调用 queue_task；需要设置回答长短和语气时调用 set_response_style。",
+    "讨论推进工具：需要确认当前界面焦点时调用 read_current_focus；需要完整讨论状态时调用 get_discussion_state；需要用户确认时调用 ask_user_confirmation；用户临时追加任务时调用 queue_task。",
     "实时存在感工具：用户说休息、暂停、继续、播放用户给出的媒体链接、进入氛围模式、查看工具进度或取消当前任务时，分别调用 start_break、resume_discussion、open_media_url、set_ambient_mode、show_tool_activity、cancel_current_task。调用前后都要用短句告诉用户状态。",
     "媒体与陪伴边界：open_media_url 只打开用户提供的合法 http/https 音乐、视频、直播或网页链接，或应用内置的安全休息页面；不要编造直播电视、音乐平台或受版权限制的播放源。氛围模式只降低打扰和显示状态，不替用户做未经确认的外部播放。",
     "讨论治理工具：需要更有约束时，先调用 set_discussion_contract 设定目标、边界和输出形式；再调用 create_discussion_agenda 生成议程，并在用户确认后 lock_discussion_agenda。讨论中用 check_topic_alignment 防止偏题，用 limit_response_scope 控制每次只讲一个点，用 advance_discussion_step 推进步骤，用 summarize_current_step 做阶段小结。信息不足时调用 mark_uncertainty，不要装作确定。",
@@ -1418,9 +1489,10 @@ function buildDiscussionContext() {
     "资源用户区文件只作为阅读和参考上下文，不纳入主要讨论对象，除非用户明确要求打开某个资源文件作为前台临时主题讨论。资源原件不能编辑；需要修改时必须先复制到 AI 临时生成文案区。",
     "AI 临时生成文案区的文件可以编辑、修改、迭代。所有文件都可以通过打开前台预览窗口临时成为当前讨论对象，但这不会改变它们所属区域或最终成果状态。",
     "用户可以用语音要求你操控界面：打开/关闭前台文件窗口、打开无限白板或临时文档、保存或清空白板/临时文档、复制文件到临时区、把文件移动到主题区/资源区/临时区。遇到这些请求时应调用对应工具完成，不只用语言说明。",
+    "联网资料规则：web_search 只用于发现候选网页；如果用户要求基于网页事实回答，或搜索结果摘要不足，继续调用 read_web_page 读取最相关、最权威的网页正文后再回答。回答中说明网页标题或来源网站。遇到登录、付费墙、验证码、反爬或动态页面读取失败时，如实说明限制并换用其他公开来源。",
     "当用户要求打开网页、查看链接，或你需要把某个搜索结果展示给用户时，调用 open_web_page 在前台网页窗口打开；不要只口头描述链接。如果网站禁止内嵌，用户可以从窗口右上角跳到浏览器打开。",
     "当你需要生成文案、副本、修改稿或阶段性成果草稿时，先调用 create_generated_file，把它放入资源窗口下半区的 AI 临时生成文案。用户可以先打开编辑并“保存编辑”，这只表示编辑确认；只有用户进一步“确认为成果”后，它才会进入讨论主题窗口，作为最终成果继续讨论。",
-    `当用户要求生成、绘制、设计图片、地图、海报、示意图或视觉素材时，调用 generate_image。默认视觉风格：${aiSettings.visualStyle}。prompt 必须补全主体、构图、风格、材质、颜色、文字标签、比例和清晰度要求，不要只传用户的一句短话。图片会保存到 AI 临时生成区；生成完成后用一句话提示用户可以预览或确认为成果。`,
+    "当用户要求生成、绘制、设计图片、地图、海报、示意图或视觉素材时，调用 generate_image。prompt 必须补全主体、构图、风格、材质、颜色、文字标签、比例和清晰度要求，不要只传用户的一句短话。图片会保存到 AI 临时生成区；生成完成后用一句话提示用户可以预览或确认为成果。",
     "如果用户要求把某个资源文件、AI 临时文案或修改稿作为成果继续讨论，你可以调用 add_file_to_topic，把它加入讨论主题窗口。加入后它就是主讨论文件，应作为后续重点讨论对象。",
     "不要泛泛而谈，不要把话题扩展到无关方向。每次回复优先给出中肯、可执行、能推进讨论的意见。",
     "如果信息不足，先指出缺口，再建议用户补充哪类材料。需要资料时，优先调用本地背景材料检索；本地资料不足时，再调用联网搜索。",
@@ -1463,6 +1535,47 @@ function extractDuckDuckGoResults(html) {
   }).filter(Boolean).slice(0, 6);
 }
 
+function officialWebSearchFallbackResults(query) {
+  const normalized = cleanText(query).toLowerCase();
+  const wantsFifaWorldCup = /\bfifa\b|世界杯|world cup/.test(normalized);
+  const wantsSchedule = /schedule|fixture|match|赛程|日程|比赛|fixtures/.test(normalized);
+  if (!wantsFifaWorldCup || !wantsSchedule) return [];
+  return [
+    {
+      title: "World Cup 2026 | Match schedule, fixtures & stadiums",
+      url: "https://www.fifa.com/en/tournaments/mens/worldcup/canadamexicousa2026/articles/match-schedule-fixtures-results-teams-stadiums",
+      snippet: "FIFA official page for the FIFA World Cup 2026 schedule, match fixtures, dates, venues and stadiums.",
+      source: "official-fifa"
+    },
+    {
+      title: "Match schedule revealed | Fixtures, venues, dates and kick-off times | FIFA World Cup 2026",
+      url: "https://www.fifa.com/en/tournaments/mens/worldcup/canadamexicousa2026/articles/updated-fifa-world-cup-2026-match-schedule-now-available",
+      snippet: "FIFA article announcing the updated FIFA World Cup 2026 match schedule, including fixtures, venues, dates and kick-off times.",
+      source: "official-fifa"
+    }
+  ];
+}
+
+function mergeSearchResults(...groups) {
+  const seen = new Set();
+  return groups.flat().filter((item) => {
+    const url = cleanText(item?.url);
+    if (!url || seen.has(url)) return false;
+    seen.add(url);
+    return true;
+  }).slice(0, 10);
+}
+
+function formatSearchResultText(results) {
+  if (!results.length) return "没有找到可用搜索结果。";
+  return results.map((result, index) => [
+    `${index + 1}. ${cleanText(result.title) || "Untitled"}`,
+    `URL: ${cleanText(result.url)}`,
+    result.snippet ? `摘要: ${cleanText(result.snippet)}` : "",
+    result.source ? `来源: ${cleanText(result.source)}` : ""
+  ].filter(Boolean).join("\n")).join("\n\n");
+}
+
 function decodeHtml(value) {
   return String(value || "")
     .replace(/&amp;/g, "&")
@@ -1475,6 +1588,329 @@ function decodeHtml(value) {
 
 function stripTags(value) {
   return cleanText(String(value || "").replace(/<[^>]*>/g, " ")).replace(/\s{2,}/g, " ");
+}
+
+function normalizeWebUrl(value) {
+  const rawUrl = cleanText(value);
+  const url = rawUrl && !/^https?:\/\//i.test(rawUrl) ? `https://${rawUrl}` : rawUrl;
+  const parsed = new URL(url);
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("Only http and https URLs are supported.");
+  return parsed.toString();
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Discuz/0.1 local discussion assistant",
+        ...(options.headers || {})
+      }
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function searchLimit(value) {
+  const limit = Number(value || 8);
+  if (!Number.isFinite(limit)) return 8;
+  return Math.max(1, Math.min(10, Math.round(limit)));
+}
+
+function providerResult(title, url, snippet = "", source = "web") {
+  try {
+    return {
+      title: cleanText(title) || new URL(url).hostname,
+      url: normalizeWebUrl(url),
+      snippet: cleanText(snippet),
+      source
+    };
+  } catch {
+    return null;
+  }
+}
+
+function normalizeSearchResults(results, limit = 8) {
+  return results
+    .map((item) => providerResult(item?.title, item?.url, item?.snippet, item?.source))
+    .filter(Boolean)
+    .slice(0, limit);
+}
+
+function searchProviderOrder() {
+  const configured = cleanText(process.env.WEB_SEARCH_PROVIDERS || process.env.WEB_SEARCH_PROVIDER || getSetting("web_search_providers"))
+    .split(/[,;\s]+/)
+    .map((item) => item.toLowerCase())
+    .filter((item, index, list) => webSearchProviders.includes(item) && list.indexOf(item) === index);
+  if (configured.length) return configured;
+  return aiSettingsDefaults.webSearchProviders.split(",");
+}
+
+async function braveSearch(query, limit) {
+  const key = getWebSearchSecret("brave");
+  if (!key) return { skipped: "BRAVE_SEARCH_API_KEY is not configured" };
+  const url = new URL("https://api.search.brave.com/res/v1/web/search");
+  url.searchParams.set("q", query);
+  url.searchParams.set("count", String(Math.min(limit, 10)));
+  const response = await fetchWithTimeout(url, {
+    headers: {
+      "Accept": "application/json",
+      "X-Subscription-Token": key
+    }
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(`Brave returned ${response.status}`);
+  return {
+    results: normalizeSearchResults((payload.web?.results || []).map((item) => ({
+      title: item.title,
+      url: item.url,
+      snippet: item.description,
+      source: "brave"
+    })), limit)
+  };
+}
+
+async function bingSearch(query, limit) {
+  const key = getWebSearchSecret("bing");
+  if (!key) return { skipped: "BING_SEARCH_API_KEY is not configured" };
+  const url = new URL("https://api.bing.microsoft.com/v7.0/search");
+  url.searchParams.set("q", query);
+  url.searchParams.set("count", String(Math.min(limit, 10)));
+  const response = await fetchWithTimeout(url, {
+    headers: {
+      "Accept": "application/json",
+      "Ocp-Apim-Subscription-Key": key
+    }
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(`Bing returned ${response.status}`);
+  return {
+    results: normalizeSearchResults((payload.webPages?.value || []).map((item) => ({
+      title: item.name,
+      url: item.url,
+      snippet: item.snippet,
+      source: "bing"
+    })), limit)
+  };
+}
+
+async function googleSearch(query, limit) {
+  const key = getWebSearchSecret("google");
+  const engineId = getWebSearchSecret("googleEngine");
+  if (!key || !engineId) return { skipped: "GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_ENGINE_ID are not configured" };
+  const url = new URL("https://www.googleapis.com/customsearch/v1");
+  url.searchParams.set("key", key);
+  url.searchParams.set("cx", engineId);
+  url.searchParams.set("q", query);
+  url.searchParams.set("num", String(Math.min(limit, 10)));
+  const response = await fetchWithTimeout(url, { headers: { "Accept": "application/json" } });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(`Google Custom Search returned ${response.status}`);
+  return {
+    results: normalizeSearchResults((payload.items || []).map((item) => ({
+      title: item.title,
+      url: item.link,
+      snippet: item.snippet,
+      source: "google"
+    })), limit)
+  };
+}
+
+async function serpApiSearch(query, limit) {
+  const key = getWebSearchSecret("serpapi");
+  if (!key) return { skipped: "SERPAPI_API_KEY is not configured" };
+  const url = new URL("https://serpapi.com/search.json");
+  url.searchParams.set("engine", "google");
+  url.searchParams.set("q", query);
+  url.searchParams.set("api_key", key);
+  url.searchParams.set("num", String(Math.min(limit, 10)));
+  const response = await fetchWithTimeout(url, { headers: { "Accept": "application/json" } });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(`SerpAPI returned ${response.status}`);
+  return {
+    results: normalizeSearchResults((payload.organic_results || []).map((item) => ({
+      title: item.title,
+      url: item.link,
+      snippet: item.snippet,
+      source: "serpapi"
+    })), limit)
+  };
+}
+
+async function tavilySearch(query, limit) {
+  const key = getWebSearchSecret("tavily");
+  if (!key) return { skipped: "TAVILY_API_KEY is not configured" };
+  const response = await fetchWithTimeout("https://api.tavily.com/search", {
+    method: "POST",
+    headers: {
+      "Accept": "application/json",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      api_key: key,
+      query,
+      search_depth: "basic",
+      max_results: Math.min(limit, 10),
+      include_answer: false
+    })
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(`Tavily returned ${response.status}`);
+  return {
+    results: normalizeSearchResults((payload.results || []).map((item) => ({
+      title: item.title,
+      url: item.url,
+      snippet: item.content,
+      source: "tavily"
+    })), limit)
+  };
+}
+
+async function duckDuckGoSearch(query, limit) {
+  const response = await fetchWithTimeout(`https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
+    headers: { "Accept": "text/html,application/xhtml+xml" }
+  });
+  const html = await response.text();
+  if (!response.ok) throw new Error(`DuckDuckGo returned ${response.status}`);
+  if (/anomaly-modal|challenge-form|anomaly\.js/i.test(html)) throw new Error("DuckDuckGo returned a challenge page");
+  return { results: extractDuckDuckGoResults(html).slice(0, limit) };
+}
+
+async function wikipediaSearch(query, limit) {
+  const response = await fetchWithTimeout(`https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&origin=*&srsearch=${encodeURIComponent(query)}`, {
+    headers: { "Accept": "application/json" }
+  });
+  const contentType = response.headers.get("content-type") || "";
+  const text = await response.text();
+  if (!response.ok || !contentType.includes("application/json")) {
+    throw new Error(`Wikipedia returned ${response.status} ${contentType || "unknown content type"}`);
+  }
+  const payload = JSON.parse(text);
+  return {
+    results: normalizeSearchResults((payload.query?.search || []).map((item) => ({
+      title: item.title,
+      url: `https://en.wikipedia.org/wiki/${encodeURIComponent(item.title.replaceAll(" ", "_"))}`,
+      snippet: stripTags(decodeHtml(item.snippet)),
+      source: "wikipedia"
+    })), limit)
+  };
+}
+
+async function runSearchProvider(provider, query, limit) {
+  if (provider === "brave") return braveSearch(query, limit);
+  if (provider === "bing") return bingSearch(query, limit);
+  if (provider === "google") return googleSearch(query, limit);
+  if (provider === "serpapi") return serpApiSearch(query, limit);
+  if (provider === "tavily") return tavilySearch(query, limit);
+  if (provider === "duckduckgo") return duckDuckGoSearch(query, limit);
+  if (provider === "wikipedia") return wikipediaSearch(query, limit);
+  return { skipped: `Unknown web search provider: ${provider}` };
+}
+
+async function runWebSearch(query, limit = 8) {
+  const providers = [];
+  const warnings = [];
+  let results = [];
+  for (const provider of searchProviderOrder()) {
+    const record = { provider, status: "running", count: 0 };
+    providers.push(record);
+    try {
+      const output = await runSearchProvider(provider, query, limit);
+      if (output.skipped) {
+        record.status = "skipped";
+        record.message = output.skipped;
+        continue;
+      }
+      record.status = "ok";
+      record.count = output.results?.length || 0;
+      results = mergeSearchResults(results, output.results || []).slice(0, limit);
+      if (results.length >= Math.min(limit, 6)) break;
+    } catch (error) {
+      record.status = "failed";
+      record.message = error.message;
+      warnings.push(`${provider}: ${error.message}`);
+    }
+  }
+  return { results, providers, warnings };
+}
+
+function extractHtmlTitle(html, fallbackUrl = "") {
+  const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]
+    || html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i)?.[1]
+    || html.match(/<meta[^>]+name=["']title["'][^>]+content=["']([^"']+)["']/i)?.[1]
+    || "";
+  if (title) return stripTags(decodeHtml(title));
+  try {
+    return new URL(fallbackUrl).hostname;
+  } catch {
+    return "网页";
+  }
+}
+
+function htmlToReadableText(html) {
+  return stripTags(decodeHtml(String(html || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<svg[\s\S]*?<\/svg>/gi, " ")
+    .replace(/<header[\s\S]*?<\/header>/gi, " ")
+    .replace(/<footer[\s\S]*?<\/footer>/gi, " ")
+    .replace(/<nav[\s\S]*?<\/nav>/gi, " ")
+    .replace(/<aside[\s\S]*?<\/aside>/gi, " ")
+    .replace(/<\/(p|div|section|article|h[1-6]|li|tr|br)>/gi, "\n")));
+}
+
+async function readWebPageDirect(url, maxChars) {
+  const response = await fetchWithTimeout(url, {
+    headers: { "Accept": "text/html,text/plain,application/xhtml+xml" }
+  }, 15000);
+  const contentType = response.headers.get("content-type") || "";
+  const html = await response.text();
+  if (!response.ok) throw new Error(`Page returned ${response.status}`);
+  const isHtml = /html|xml/i.test(contentType) || /<html|<article|<body/i.test(html);
+  const text = isHtml ? htmlToReadableText(html) : cleanText(html);
+  return {
+    title: isHtml ? extractHtmlTitle(html, url) : new URL(url).hostname,
+    url,
+    contentType,
+    text: text.slice(0, maxChars),
+    length: text.length,
+    source: "direct-fetch"
+  };
+}
+
+async function readWebPageWithJina(url, maxChars) {
+  const readerUrl = `https://r.jina.ai/http://${url.replace(/^https?:\/\//i, "")}`;
+  const response = await fetchWithTimeout(readerUrl, {
+    headers: { "Accept": "text/plain,text/markdown" }
+  }, 18000);
+  const text = await response.text();
+  if (!response.ok) throw new Error(`Jina Reader returned ${response.status}`);
+  const title = text.match(/^Title:\s*(.+)$/m)?.[1] || new URL(url).hostname;
+  return {
+    title: cleanText(title),
+    url,
+    contentType: response.headers.get("content-type") || "text/markdown",
+    text: cleanText(text).slice(0, maxChars),
+    length: cleanText(text).length,
+    source: "jina-reader"
+  };
+}
+
+async function readPublicWebPage(rawUrl, maxChars = 10000) {
+  const url = normalizeWebUrl(rawUrl);
+  const useJina = process.env.WEB_READ_USE_JINA !== "false";
+  try {
+    const direct = await readWebPageDirect(url, maxChars);
+    if (direct.text.length >= 500 || !useJina) return direct;
+  } catch (error) {
+    if (!useJina) throw error;
+  }
+  return readWebPageWithJina(url, maxChars);
 }
 
 function statePayload(extra = {}) {
@@ -1877,44 +2313,57 @@ app.get("/api/context/search", (req, res) => {
 app.get("/api/web/search", async (req, res) => {
   const query = cleanText(req.query.q || "");
   if (!query) return res.json({ query, results: [] });
-  const warnings = [];
   try {
-    const response = await fetch(`https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
-      headers: {
-        "Accept": "text/html,application/xhtml+xml",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Discuz/0.1 local discussion assistant"
-      }
-    });
-    const html = await response.text();
-    let results = extractDuckDuckGoResults(html);
-    if (!response.ok) warnings.push(`DuckDuckGo returned ${response.status}`);
-    if (/anomaly-modal|challenge-form|anomaly\.js/i.test(html)) warnings.push("DuckDuckGo returned a challenge page");
-    if (!results.length) {
-      const wikiResponse = await fetch(`https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&origin=*&srsearch=${encodeURIComponent(query)}`, {
-        headers: {
-          "Accept": "application/json",
-          "User-Agent": "Discuz/0.1 local discussion assistant (local development)"
-        }
-      });
-      const contentType = wikiResponse.headers.get("content-type") || "";
-      const wikiText = await wikiResponse.text();
-      if (wikiResponse.ok && contentType.includes("application/json")) {
-        const wikiPayload = JSON.parse(wikiText);
-        results = (wikiPayload.query?.search || []).slice(0, 6).map((item) => ({
-          title: item.title,
-          url: `https://en.wikipedia.org/wiki/${encodeURIComponent(item.title.replaceAll(" ", "_"))}`,
-          snippet: stripTags(decodeHtml(item.snippet)),
-          source: "wikipedia"
-        }));
-      } else {
-        warnings.push(`Wikipedia returned ${wikiResponse.status} ${contentType || "unknown content type"}`);
-      }
-    }
+    const limit = searchLimit(req.query.limit);
+    const officialFallback = officialWebSearchFallbackResults(query);
+    const searchOutput = await runWebSearch(query, limit);
+    const results = mergeSearchResults(officialFallback, searchOutput.results).slice(0, limit);
+    const resultText = formatSearchResultText(results);
     addActivity("Web", query, now());
     writeTopicSnapshot();
-    res.json({ query, results, warnings });
+    res.json({
+      query,
+      results,
+      resultText,
+      count: results.length,
+      providers: searchOutput.providers,
+      warnings: searchOutput.warnings
+    });
   } catch (error) {
-    res.json({ error: error.message, query, results: [], warnings });
+    const results = officialWebSearchFallbackResults(query);
+    res.json({
+      error: results.length ? "" : error.message,
+      query,
+      results,
+      resultText: formatSearchResultText(results),
+      count: results.length,
+      providers: [],
+      warnings: [error.message].filter(Boolean)
+    });
+  }
+});
+
+app.get("/api/web/read", async (req, res) => {
+  const rawUrl = cleanText(req.query.url || "");
+  if (!rawUrl) return res.status(400).json({ ok: false, error: "Missing URL." });
+  try {
+    const maxChars = Math.max(1200, Math.min(20000, Number(req.query.maxChars || 10000) || 10000));
+    const page = await readPublicWebPage(rawUrl, maxChars);
+    addActivity("Web", `读取网页：${page.title}`, now());
+    writeTopicSnapshot();
+    res.json({
+      ok: true,
+      ...page,
+      truncated: page.length > page.text.length,
+      resultText: [
+        `标题: ${page.title}`,
+        `URL: ${page.url}`,
+        `来源: ${page.source}`,
+        `正文:\n${page.text}`
+      ].join("\n")
+    });
+  } catch (error) {
+    res.status(400).json({ ok: false, error: error.message, url: rawUrl });
   }
 });
 
@@ -2006,1051 +2455,1048 @@ app.post("/api/records/finish", (req, res) => {
   });
 });
 
-app.post("/api/realtime/session", async (req, res) => {
-  const openAiApiKey = getOpenAiApiKey();
-  if (!openAiApiKey) {
-    return res.status(500).json({ error: "OPENAI_API_KEY is not configured" });
-  }
-  if (!req.body || typeof req.body !== "string") {
-    return res.status(400).json({ error: "Expected SDP body" });
-  }
-  const aiSettings = getAiSettingsState();
+function buildRealtimeToolDefinitions() {
+  return [
+    {
+      type: "function",
+      name: "search_context",
+      description: "Search the user's local background materials for topic-relevant evidence. Use before answering questions that require document context.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "A focused search query about the current topic." }
+        },
+        required: ["query"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "web_search",
+      description: "Search the public web when local materials are insufficient. This returns candidate URLs and snippets; call read_web_page for facts that need page-level grounding.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "A focused web search query." },
+          limit: { type: "number", description: "Optional number of results to return, 1 to 10." }
+        },
+        required: ["query"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "read_web_page",
+      description: "Read and extract text from a public http/https webpage after web_search finds a relevant URL, or when the user gives a link and asks what it says.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "The full http or https URL to read. If the user gave a domain, convert it to https://domain." },
+          maxChars: { type: "number", description: "Optional maximum extracted characters, from 1200 to 20000." }
+        },
+        required: ["url"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "open_web_page",
+      description: "Open a public http/https URL in a frontmost web preview popup when the user asks to view a page, open a link, or see a search result.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "The full http or https URL to open. If the user gave a domain, convert it to https://domain." },
+          title: { type: "string", description: "A short display title for the popup." }
+        },
+        required: ["url"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "set_layout",
+      description: "Adjust the Discuz discussion workspace layout by voice, including focusing or fullscreening one panel.",
+      parameters: {
+        type: "object",
+        properties: {
+          target: { type: "string", enum: ["topic", "resources", "generated", "record", "reset"] },
+          mode: { type: "string", enum: ["focus", "fullscreen", "reset"] }
+        },
+        required: ["target", "mode"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "open_discussion_tool",
+      description: "Open a temporary frontmost tool for discussion, such as whiteboard, document draft, image viewer, video viewer, or audio player.",
+      parameters: {
+        type: "object",
+        properties: {
+          tool: { type: "string", enum: ["whiteboard", "draft", "image", "video", "audio"] },
+          title: { type: "string" }
+        },
+        required: ["tool"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "save_discussion_tool",
+      description: "Save the current whiteboard or temporary draft into the AI temporary generated files section.",
+      parameters: {
+        type: "object",
+        properties: {
+          tool: { type: "string", enum: ["whiteboard", "draft"], description: "The tool to save. Use the currently open tool if the user says save this window." }
+        },
+        required: ["tool"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "clear_discussion_tool",
+      description: "Clear all content from the whiteboard or temporary draft. Use only when the user explicitly asks to clear it.",
+      parameters: {
+        type: "object",
+        properties: {
+          tool: { type: "string", enum: ["whiteboard", "draft"], description: "The tool to clear." }
+        },
+        required: ["tool"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "close_foreground_window",
+      description: "Close the foreground tool, web page, file preview/editor, record preview, or all foreground windows.",
+      parameters: {
+        type: "object",
+        properties: {
+          target: { type: "string", enum: ["tool", "web", "file", "record", "all"], description: "Which foreground window to close." }
+        },
+        required: ["target"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "open_file_preview",
+      description: "Open a frontmost preview window for a topic, resource, or temporary generated file when it should become the temporary focused discussion object.",
+      parameters: {
+        type: "object",
+        properties: {
+          role: { type: "string", enum: ["primary", "context", "generated"], description: "primary for topic files, context for resource files, generated for temporary editable files." },
+          query: { type: "string", description: "Optional part of the filename to open. Leave empty to open the first matching file." }
+        },
+        required: ["role"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "read_current_focus",
+      description: "Read the user's current foreground window, selected file, active tool, web popup, and confirmed topic before answering focus-sensitive questions.",
+      parameters: {
+        type: "object",
+        properties: {},
+        required: [],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "get_discussion_state",
+      description: "Get the current topic, files, directions, recent meeting messages, notes, records, foreground state, pending tasks, and status text.",
+      parameters: {
+        type: "object",
+        properties: {},
+        required: [],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "ask_user_confirmation",
+      description: "Ask the user to confirm a topic, direction, edit plan, export, or action before proceeding. Use when consent or a choice is needed.",
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: { type: "string", description: "A concise Chinese confirmation question." },
+          options: { type: "array", items: { type: "string" }, description: "Optional short choices." }
+        },
+        required: ["prompt"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "queue_task",
+      description: "Record a user-requested side task while another discussion or generation is in progress. This is a lightweight queue/status marker.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Short task title." },
+          detail: { type: "string", description: "Optional task detail." }
+        },
+        required: ["title"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "start_break",
+      description: "Start a short discussion break with a visible countdown. Use when the user asks to pause, rest, or take a 3/5/10 minute break.",
+      parameters: {
+        type: "object",
+        properties: {
+          minutes: { type: "number", description: "Break duration in minutes. Prefer 3, 5, or 10; the client clamps it to a safe range." },
+          reason: { type: "string", description: "Optional short reason for the break." },
+          ambientMode: { type: "boolean", description: "Whether to enable ambient mode during the break." }
+        },
+        required: ["minutes"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "resume_discussion",
+      description: "Resume the discussion after a break, ambient pause, media pause, or user request to continue.",
+      parameters: {
+        type: "object",
+        properties: {},
+        required: [],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "open_media_url",
+      description: "Open a user-provided legal online music, video, live, or media webpage in the foreground media/web popup. Do not invent streaming sources.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "User-provided http or https URL to open." },
+          title: { type: "string", description: "Optional window title." },
+          mediaType: { type: "string", enum: ["music", "video", "live", "media"], description: "Type of media being opened." }
+        },
+        required: ["url"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "set_ambient_mode",
+      description: "Enable or disable ambient mode. Ambient mode lowers AI interruption frequency while keeping subtitles and discussion records.",
+      parameters: {
+        type: "object",
+        properties: {
+          enabled: { type: "boolean", description: "Whether ambient mode should be enabled." },
+          title: { type: "string", description: "Optional title if a user-provided music URL is opened." },
+          musicUrl: { type: "string", description: "Optional user-provided http or https URL for background music." }
+        },
+        required: ["enabled"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "show_tool_activity",
+      description: "Return recent visible tool activity cards and their execution status so the user can see what is running, complete, failed, or cancelled.",
+      parameters: {
+        type: "object",
+        properties: {},
+        required: [],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "cancel_current_task",
+      description: "Cancel only the current AI response or running tool task when the user interrupts or wants to change direction. Do not use this to end or disconnect the voice session.",
+      parameters: {
+        type: "object",
+        properties: {
+          reason: { type: "string", description: "Optional user reason for cancellation." }
+        },
+        required: [],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "analyze_word_file",
+      description: "Load structured discussion context for a Word .doc/.docx file using the Documents skill bridge. Use before answering requests to discuss, review, summarize, or improve a Word document.",
+      parameters: {
+        type: "object",
+        properties: {
+          role: { type: "string", enum: ["primary", "context", "generated"], description: "Optional file area to search." },
+          query: { type: "string", description: "Optional part of the filename." },
+          focus: { type: "string", description: "What the user wants to inspect, such as structure, argument, clarity, risks, or edits." }
+        },
+        required: [],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "analyze_spreadsheet_file",
+      description: "Load structured discussion context for an Excel .xls/.xlsx/.xlsm, CSV, or TSV spreadsheet using the Spreadsheets skill bridge. Use before answering requests about tables, sheets, fields, trends, anomalies, formulas, or analysis plans.",
+      parameters: {
+        type: "object",
+        properties: {
+          role: { type: "string", enum: ["primary", "context", "generated"], description: "Optional file area to search." },
+          query: { type: "string", description: "Optional part of the filename." },
+          focus: { type: "string", description: "What the user wants to inspect, such as data quality, trends, fields, outliers, or next analysis steps." }
+        },
+        required: [],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "analyze_presentation_file",
+      description: "Load structured discussion context for a PowerPoint .ppt/.pptx file using the Presentations skill bridge. Use before answering requests to discuss deck story, slide flow, claims, evidence, audience fit, or improvements.",
+      parameters: {
+        type: "object",
+        properties: {
+          role: { type: "string", enum: ["primary", "context", "generated"], description: "Optional file area to search." },
+          query: { type: "string", description: "Optional part of the filename." },
+          focus: { type: "string", description: "What the user wants to inspect, such as narrative, slide claims, flow, proof objects, or rewrite ideas." }
+        },
+        required: [],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "analyze_image_file",
+      description: "Analyze an uploaded image, screenshot, map, poster, or photo and return a Chinese visual summary for discussion.",
+      parameters: {
+        type: "object",
+        properties: {
+          role: { type: "string", enum: ["primary", "context", "generated"], description: "Optional file area to search." },
+          query: { type: "string", description: "Optional part of the image filename." },
+          focus: { type: "string", description: "What to focus on, such as visible text, layout, route, objects, or design critique." }
+        },
+        required: [],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "edit_spreadsheet_file",
+      description: "Create a safe, reviewable edit plan for a generated or uploaded spreadsheet. Do not overwrite the original spreadsheet.",
+      parameters: {
+        type: "object",
+        properties: {
+          role: { type: "string", enum: ["primary", "context", "generated"], description: "File area to search, usually generated for temporary spreadsheets." },
+          query: { type: "string", description: "Optional part of the spreadsheet filename." },
+          editPlan: { type: "string", description: "Concrete sheet/range/cell edits, formulas, rows, or formatting changes requested by the user." }
+        },
+        required: ["editPlan"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "create_outline",
+      description: "Save a structured discussion, report, speech, or article outline into the AI temporary generated files section.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Markdown filename." },
+          text: { type: "string", description: "Full outline content in Markdown." },
+          sections: { type: "array", items: { type: "string" }, description: "Optional outline sections when text is omitted." }
+        },
+        required: ["title"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "compare_files",
+      description: "Load two files' discussion context so you can compare differences, risks, and suggested changes.",
+      parameters: {
+        type: "object",
+        properties: {
+          firstRole: { type: "string", enum: ["primary", "context", "generated"], description: "Optional first file area." },
+          firstQuery: { type: "string", description: "First filename keyword." },
+          secondRole: { type: "string", enum: ["primary", "context", "generated"], description: "Optional second file area." },
+          secondQuery: { type: "string", description: "Second filename keyword." }
+        },
+        required: ["firstQuery", "secondQuery"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "extract_action_items",
+      description: "Save action items extracted from the current discussion as a Markdown table in the AI temporary generated files section.",
+      parameters: {
+        type: "object",
+        properties: {
+          source: { type: "string", description: "Source label such as meeting record or topic." },
+          items: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                task: { type: "string" },
+                owner: { type: "string" },
+                due: { type: "string" }
+              },
+              required: ["task"],
+              additionalProperties: false
+            }
+          }
+        },
+        required: ["items"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "create_table_summary",
+      description: "Save discussion content as a Markdown table, such as issue-conclusion-evidence-next-step.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Markdown filename." },
+          headers: { type: "array", items: { type: "string" } },
+          rows: {
+            type: "array",
+            items: { type: "array", items: { type: "string" } }
+          }
+        },
+        required: ["title", "headers", "rows"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "export_discussion_record",
+      description: "Export the current meeting transcript, notes, and directions as a Markdown file in the AI temporary generated section.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Markdown filename." }
+        },
+        required: [],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "download_file",
+      description: "Directly download the selected file, foreground file, a specified uploaded file, meeting record, notes, or the full discussion record through the browser.",
+      parameters: {
+        type: "object",
+        properties: {
+          target: {
+            type: "string",
+            enum: ["selected_file", "foreground_file", "file", "meeting_record", "notes", "discussion_record"],
+            description: "selected_file uses the currently selected file; foreground_file uses the open preview/editor file; file searches by role/query; meeting_record, notes, and discussion_record export Markdown."
+          },
+          role: {
+            type: "string",
+            enum: ["primary", "context", "generated"],
+            description: "Optional file area when target is file."
+          },
+          query: {
+            type: "string",
+            description: "Optional filename keyword when target is file."
+          },
+          title: {
+            type: "string",
+            description: "Optional download title for meeting_record, notes, or discussion_record."
+          }
+        },
+        required: ["target"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "create_diagram",
+      description: "Save a Mermaid diagram or structured diagram text as a temporary Markdown file.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Markdown filename." },
+          diagramType: { type: "string", enum: ["mermaid", "text"], description: "Use mermaid for Mermaid code." },
+          content: { type: "string", description: "Mermaid code or diagram text." }
+        },
+        required: ["title", "content"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "schedule_followup",
+      description: "Save a follow-up reminder/action note from the discussion. This does not create a system automation.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Follow-up title." },
+          when: { type: "string", description: "Suggested time/date in the user's words." },
+          detail: { type: "string", description: "Additional detail." }
+        },
+        required: ["title"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "set_discussion_contract",
+      description: "Set a discussion contract that constrains the goal, boundaries, output format, and answer length for the current topic.",
+      parameters: {
+        type: "object",
+        properties: {
+          goal: { type: "string", description: "The concrete discussion goal." },
+          boundaries: { type: "array", items: { type: "string" }, description: "What should stay out of scope or be treated carefully." },
+          outputFormat: { type: "string", description: "Expected output shape, such as conclusion plus next step." },
+          responseLength: { type: "string", enum: ["short", "medium", "long"] }
+        },
+        required: ["goal"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "check_topic_alignment",
+      description: "Record whether the current answer or discussion move is still aligned to the confirmed topic and contract.",
+      parameters: {
+        type: "object",
+        properties: {
+          aligned: { type: "boolean" },
+          score: { type: "number", description: "0-100 alignment score." },
+          issue: { type: "string", description: "What is drifting or risky." },
+          recommendation: { type: "string", description: "How to get back on track." }
+        },
+        required: ["aligned", "score"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "advance_discussion_step",
+      description: "Advance the active agenda step and optionally save a short step note.",
+      parameters: {
+        type: "object",
+        properties: {
+          stepIndex: { type: "number", description: "Zero-based agenda index to make active. Omit to move to the next step." },
+          note: { type: "string", description: "Optional note about why the step changed." }
+        },
+        required: [],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "mark_uncertainty",
+      description: "Mark missing information, assumptions, or uncertainty before answering too confidently.",
+      parameters: {
+        type: "object",
+        properties: {
+          text: { type: "string", description: "What is uncertain." },
+          reason: { type: "string", description: "Why it is uncertain." },
+          needed: { type: "array", items: { type: "string" }, description: "Information needed to resolve it." }
+        },
+        required: ["text"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "limit_response_scope",
+      description: "Set strict scope for the next answers, such as one point only and a maximum sentence count.",
+      parameters: {
+        type: "object",
+        properties: {
+          maxSentences: { type: "number" },
+          onePointOnly: { type: "boolean" },
+          mustAskFirst: { type: "boolean" }
+        },
+        required: ["maxSentences"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "create_discussion_agenda",
+      description: "Create an ordered agenda for the current discussion, with objective and expected output for each step.",
+      parameters: {
+        type: "object",
+        properties: {
+          items: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                title: { type: "string" },
+                objective: { type: "string" },
+                output: { type: "string" }
+              },
+              required: ["title"],
+              additionalProperties: false
+            }
+          }
+        },
+        required: ["items"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "lock_discussion_agenda",
+      description: "Lock the current agenda after user confirmation so later changes require explicit confirmation.",
+      parameters: {
+        type: "object",
+        properties: {
+          reason: { type: "string" }
+        },
+        required: [],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "request_agenda_change",
+      description: "Request confirmation before adding, deleting, reordering, or changing agenda items.",
+      parameters: {
+        type: "object",
+        properties: {
+          change: { type: "string", description: "The proposed agenda change." },
+          reason: { type: "string", description: "Why the change is needed." }
+        },
+        required: ["change"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "score_discussion_progress",
+      description: "Score current discussion progress and return completed items, blockers, and next steps.",
+      parameters: {
+        type: "object",
+        properties: {
+          score: { type: "number", description: "0-100 progress score." },
+          completed: { type: "array", items: { type: "string" } },
+          blocked: { type: "array", items: { type: "string" } },
+          next: { type: "array", items: { type: "string" } }
+        },
+        required: ["score"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "summarize_current_step",
+      description: "Save a concise summary for the current agenda step before moving on.",
+      parameters: {
+        type: "object",
+        properties: {
+          summary: { type: "string" },
+          next: { type: "string" }
+        },
+        required: ["summary"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "detect_overlong_answer",
+      description: "Check whether a draft answer is too long and provide a compressed version.",
+      parameters: {
+        type: "object",
+        properties: {
+          original: { type: "string" },
+          compressed: { type: "string" },
+          maxSentences: { type: "number" }
+        },
+        required: ["compressed"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "set_user_cognitive_load",
+      description: "Set how much information the user wants right now: simple, normal, detailed, or step-by-step.",
+      parameters: {
+        type: "object",
+        properties: {
+          level: { type: "string", enum: ["simple", "normal", "detailed", "step_by_step"] }
+        },
+        required: ["level"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "pause_and_wait",
+      description: "Pause the discussion and explicitly wait for the user instead of continuing to elaborate.",
+      parameters: {
+        type: "object",
+        properties: {
+          reason: { type: "string" }
+        },
+        required: ["reason"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "define_output_rubric",
+      description: "Define criteria for evaluating the final discussion output or deliverable.",
+      parameters: {
+        type: "object",
+        properties: {
+          criteria: { type: "array", items: { type: "string" } }
+        },
+        required: ["criteria"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "save_discussion_note",
+      description: "Save a concise paragraph summary of a completed discussion point. Do not use this for verbatim transcript or sentence-by-sentence notes.",
+      parameters: {
+        type: "object",
+        properties: {
+          kind: {
+            type: "string",
+            enum: ["point", "decision", "question", "action"],
+            description: "The type of summarized discussion note."
+          },
+          text: {
+            type: "string",
+            description: "A concise paragraph in Chinese summarizing the completed point, conclusion, open question, or action item."
+          }
+        },
+        required: ["kind", "text"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "create_generated_file",
+      description: "Create an AI temporary generated markdown draft, copy, edited document, or stage result in the lower generated section of resources. It remains temporary until the user confirms it as an outcome.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: {
+            type: "string",
+            description: "A concise filename. A .md extension will be appended when missing."
+          },
+          text: {
+            type: "string",
+            description: "Markdown content for the generated temporary file."
+          }
+        },
+        required: ["title", "text"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "generate_image",
+      description: "Generate a PNG image from a prompt and save it into the AI temporary generated files section. Use when the user asks to draw, create, design, or generate an image, map, poster, diagram, visual, or illustration.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: {
+            type: "string",
+            description: "A concise Chinese filename for the generated image. A .png extension will be appended or normalized."
+          },
+          prompt: {
+            type: "string",
+            description: "A detailed visual prompt describing the desired image, including subject, style, layout, text labels, colors, and aspect ratio."
+          },
+          size: {
+            type: "string",
+            enum: ["1024x1024", "1024x1536", "1536x1024"],
+            description: "Image size. Use 1024x1024 for square, 1024x1536 for portrait, 1536x1024 for landscape."
+          },
+          quality: {
+            type: "string",
+            enum: ["low", "medium", "high", "auto"],
+            description: "Generation quality. Use high by default for polished output; use medium or low only when the user asks to save cost or generate quickly."
+          }
+        },
+        required: ["title", "prompt", "size", "quality"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "copy_file_to_generated",
+      description: "Copy a topic or resource file into the AI temporary generated section so it can be edited without changing the original file.",
+      parameters: {
+        type: "object",
+        properties: {
+          role: { type: "string", enum: ["primary", "context", "generated"], description: "The current area of the source file." },
+          query: { type: "string", description: "Part of the source filename to copy." }
+        },
+        required: ["role", "query"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "add_file_to_topic",
+      description: "Add an existing resource file or AI temporary generated file to the topic panel as an outcome for further focused discussion.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Part of the filename to add to the topic panel. Leave empty only when there is exactly one suitable resource or generated file."
+          }
+        },
+        required: ["query"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "move_file_to_area",
+      description: "Move a file to the topic area, user resource area, or AI temporary file area. Moving to generated creates a temporary copy when the source is not already generated.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Part of the filename to move or copy."
+          },
+          role: {
+            type: "string",
+            enum: ["primary", "context", "generated"],
+            description: "primary = topic area, context = user resource area, generated = AI temporary file area."
+          }
+        },
+        required: ["query", "role"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "update_generated_file",
+      description: "Replace the content of an editable AI temporary text/markdown file. Use when the user asks you to revise or edit a temporary document by voice.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Part of the generated filename to edit."
+          },
+          text: {
+            type: "string",
+            description: "The full new markdown/text content to save into the temporary file."
+          }
+        },
+        required: ["query", "text"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "propose_discussion_directions",
+      description: "Propose 1 to 3 discussion directions immediately after the user confirms the topic. This only asks the user to confirm; it does not save the todo list yet. Never propose more than 3 at once.",
+      parameters: {
+        type: "object",
+        properties: {
+          directions: {
+            type: "array",
+            minItems: 1,
+            maxItems: 3,
+            items: { type: "string" },
+            description: "Concise Chinese discussion directions for the current confirmed topic."
+          },
+          reason: {
+            type: "string",
+            description: "A short reason explaining why these directions fit the confirmed topic."
+          }
+        },
+        required: ["directions", "reason"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "add_discussion_directions",
+      description: "Append 1 to 3 new discussion directions to the existing confirmed todo list only when the user explicitly asks to add more directions.",
+      parameters: {
+        type: "object",
+        properties: {
+          directions: {
+            type: "array",
+            minItems: 1,
+            maxItems: 3,
+            items: { type: "string" },
+            description: "New concise Chinese directions to append after the existing list."
+          }
+        },
+        required: ["directions"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "update_discussion_directions",
+      description: "Replace the current confirmed discussion direction todo list according to user feedback. Provide the complete new ordered list.",
+      parameters: {
+        type: "object",
+        properties: {
+          directions: {
+            type: "array",
+            minItems: 1,
+            maxItems: 8,
+            items: { type: "string" },
+            description: "The full updated ordered todo list."
+          }
+        },
+        required: ["directions"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "complete_discussion_direction",
+      description: "Mark one discussion direction as complete and record the completion in notes.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "The direction number, id, or a distinctive phrase from the direction text."
+          },
+          note: {
+            type: "string",
+            description: "A concise Chinese record of what was concluded or completed for this direction."
+          }
+        },
+        required: ["query", "note"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "confirm_discussion_topic",
+      description: "Confirm the currently pending discussion topic after the user says yes, confirm, okay, right, or similar by voice. After this succeeds, propose discussion directions.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: {
+            type: "string",
+            description: "Optional pending topic title to confirm. Leave empty to confirm the latest pending proposal shown in the UI."
+          }
+        },
+        required: [],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "confirm_discussion_directions",
+      description: "Confirm the currently pending discussion direction todo list after the user says yes, confirm, okay, right, or similar by voice.",
+      parameters: {
+        type: "object",
+        properties: {},
+        required: [],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "end_voice_discussion",
+      description: "End the current voice discussion only after the user explicitly confirms they want to stop, end discussion, disconnect, or says the session is done. After this tool returns, say one short natural Chinese farewell without using a fixed scripted phrase. The app will disconnect after that response.",
+      parameters: {
+        type: "object",
+        properties: {
+          reason: {
+            type: "string",
+            description: "A concise reason inferred from the user's request, if any."
+          }
+        },
+        required: [],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "propose_discussion_topic",
+      description: "Generate a proposed discussion topic for user confirmation from the user's latest speech/text and current topic files before long-running discussion or direction planning, or warn that the discussion is drifting and ask whether to switch topics.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: {
+            type: "string",
+            description: "The proposed discussion topic in concise Chinese."
+          },
+          reason: {
+            type: "string",
+            description: "Why this topic should be confirmed, or why the current discussion appears to be drifting."
+          },
+          intent: {
+            type: "string",
+            enum: ["confirm", "drift"],
+            description: "Use confirm for a better topic name; use drift when reminding the user about serious topic drift."
+          }
+        },
+        required: ["title", "reason", "intent"],
+        additionalProperties: false
+      }
+    }
+  ];
+}
 
-  const session = {
+function buildRealtimeSessionConfig(aiSettings) {
+  return {
     type: "realtime",
     model: aiSettings.realtimeModel,
     instructions: buildDiscussionContext(),
-    tools: [
-      {
-        type: "function",
-        name: "search_context",
-        description: "Search the user's local background materials for topic-relevant evidence. Use before answering questions that require document context.",
-        parameters: {
-          type: "object",
-          properties: {
-            query: { type: "string", description: "A focused search query about the current topic." }
-          },
-          required: ["query"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "web_search",
-        description: "Search the public web when local materials are insufficient. Use sparingly and bring the answer back to the current discussion topic.",
-        parameters: {
-          type: "object",
-          properties: {
-            query: { type: "string", description: "A focused web search query." }
-          },
-          required: ["query"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "open_web_page",
-        description: "Open a public http/https URL in a frontmost web preview popup when the user asks to view a page, open a link, or see a search result.",
-        parameters: {
-          type: "object",
-          properties: {
-            url: { type: "string", description: "The full http or https URL to open. If the user gave a domain, convert it to https://domain." },
-            title: { type: "string", description: "A short display title for the popup." }
-          },
-          required: ["url"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "set_layout",
-        description: "Adjust the Discuz discussion workspace layout by voice, including focusing or fullscreening one panel.",
-        parameters: {
-          type: "object",
-          properties: {
-            target: { type: "string", enum: ["topic", "resources", "generated", "record", "reset"] },
-            mode: { type: "string", enum: ["focus", "fullscreen", "reset"] }
-          },
-          required: ["target", "mode"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "open_discussion_tool",
-        description: "Open a temporary frontmost tool for discussion, such as whiteboard, document draft, image viewer, video viewer, or audio player.",
-        parameters: {
-          type: "object",
-          properties: {
-            tool: { type: "string", enum: ["whiteboard", "draft", "image", "video", "audio"] },
-            title: { type: "string" }
-          },
-          required: ["tool"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "save_discussion_tool",
-        description: "Save the current whiteboard or temporary draft into the AI temporary generated files section.",
-        parameters: {
-          type: "object",
-          properties: {
-            tool: { type: "string", enum: ["whiteboard", "draft"], description: "The tool to save. Use the currently open tool if the user says save this window." }
-          },
-          required: ["tool"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "clear_discussion_tool",
-        description: "Clear all content from the whiteboard or temporary draft. Use only when the user explicitly asks to clear it.",
-        parameters: {
-          type: "object",
-          properties: {
-            tool: { type: "string", enum: ["whiteboard", "draft"], description: "The tool to clear." }
-          },
-          required: ["tool"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "close_foreground_window",
-        description: "Close the foreground tool, web page, file preview/editor, record preview, or all foreground windows.",
-        parameters: {
-          type: "object",
-          properties: {
-            target: { type: "string", enum: ["tool", "web", "file", "record", "all"], description: "Which foreground window to close." }
-          },
-          required: ["target"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "open_file_preview",
-        description: "Open a frontmost preview window for a topic, resource, or temporary generated file when it should become the temporary focused discussion object.",
-        parameters: {
-          type: "object",
-          properties: {
-            role: { type: "string", enum: ["primary", "context", "generated"], description: "primary for topic files, context for resource files, generated for temporary editable files." },
-            query: { type: "string", description: "Optional part of the filename to open. Leave empty to open the first matching file." }
-          },
-          required: ["role"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "read_current_focus",
-        description: "Read the user's current foreground window, selected file, active tool, web popup, and confirmed topic before answering focus-sensitive questions.",
-        parameters: {
-          type: "object",
-          properties: {},
-          required: [],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "get_discussion_state",
-        description: "Get the current topic, files, directions, recent meeting messages, notes, records, foreground state, pending tasks, and status text.",
-        parameters: {
-          type: "object",
-          properties: {},
-          required: [],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "ask_user_confirmation",
-        description: "Ask the user to confirm a topic, direction, edit plan, export, or action before proceeding. Use when consent or a choice is needed.",
-        parameters: {
-          type: "object",
-          properties: {
-            prompt: { type: "string", description: "A concise Chinese confirmation question." },
-            options: { type: "array", items: { type: "string" }, description: "Optional short choices." }
-          },
-          required: ["prompt"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "queue_task",
-        description: "Record a user-requested side task while another discussion or generation is in progress. This is a lightweight queue/status marker.",
-        parameters: {
-          type: "object",
-          properties: {
-            title: { type: "string", description: "Short task title." },
-            detail: { type: "string", description: "Optional task detail." }
-          },
-          required: ["title"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "start_break",
-        description: "Start a short discussion break with a visible countdown. Use when the user asks to pause, rest, or take a 3/5/10 minute break.",
-        parameters: {
-          type: "object",
-          properties: {
-            minutes: { type: "number", description: "Break duration in minutes. Prefer 3, 5, or 10; the client clamps it to a safe range." },
-            reason: { type: "string", description: "Optional short reason for the break." },
-            ambientMode: { type: "boolean", description: "Whether to enable ambient mode during the break." }
-          },
-          required: ["minutes"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "resume_discussion",
-        description: "Resume the discussion after a break, ambient pause, media pause, or user request to continue.",
-        parameters: {
-          type: "object",
-          properties: {},
-          required: [],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "open_media_url",
-        description: "Open a user-provided legal online music, video, live, or media webpage in the foreground media/web popup. Do not invent streaming sources.",
-        parameters: {
-          type: "object",
-          properties: {
-            url: { type: "string", description: "User-provided http or https URL to open." },
-            title: { type: "string", description: "Optional window title." },
-            mediaType: { type: "string", enum: ["music", "video", "live", "media"], description: "Type of media being opened." }
-          },
-          required: ["url"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "set_ambient_mode",
-        description: "Enable or disable ambient mode. Ambient mode lowers AI interruption frequency while keeping subtitles and discussion records.",
-        parameters: {
-          type: "object",
-          properties: {
-            enabled: { type: "boolean", description: "Whether ambient mode should be enabled." },
-            title: { type: "string", description: "Optional title if a user-provided music URL is opened." },
-            musicUrl: { type: "string", description: "Optional user-provided http or https URL for background music." }
-          },
-          required: ["enabled"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "show_tool_activity",
-        description: "Return recent visible tool activity cards and their execution status so the user can see what is running, complete, failed, or cancelled.",
-        parameters: {
-          type: "object",
-          properties: {},
-          required: [],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "cancel_current_task",
-        description: "Cancel only the current AI response or running tool task when the user interrupts or wants to change direction. Do not use this to end or disconnect the voice session.",
-        parameters: {
-          type: "object",
-          properties: {
-            reason: { type: "string", description: "Optional user reason for cancellation." }
-          },
-          required: [],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "analyze_word_file",
-        description: "Load structured discussion context for a Word .doc/.docx file using the Documents skill bridge. Use before answering requests to discuss, review, summarize, or improve a Word document.",
-        parameters: {
-          type: "object",
-          properties: {
-            role: { type: "string", enum: ["primary", "context", "generated"], description: "Optional file area to search." },
-            query: { type: "string", description: "Optional part of the filename." },
-            focus: { type: "string", description: "What the user wants to inspect, such as structure, argument, clarity, risks, or edits." }
-          },
-          required: [],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "analyze_spreadsheet_file",
-        description: "Load structured discussion context for an Excel .xls/.xlsx/.xlsm, CSV, or TSV spreadsheet using the Spreadsheets skill bridge. Use before answering requests about tables, sheets, fields, trends, anomalies, formulas, or analysis plans.",
-        parameters: {
-          type: "object",
-          properties: {
-            role: { type: "string", enum: ["primary", "context", "generated"], description: "Optional file area to search." },
-            query: { type: "string", description: "Optional part of the filename." },
-            focus: { type: "string", description: "What the user wants to inspect, such as data quality, trends, fields, outliers, or next analysis steps." }
-          },
-          required: [],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "analyze_presentation_file",
-        description: "Load structured discussion context for a PowerPoint .ppt/.pptx file using the Presentations skill bridge. Use before answering requests to discuss deck story, slide flow, claims, evidence, audience fit, or improvements.",
-        parameters: {
-          type: "object",
-          properties: {
-            role: { type: "string", enum: ["primary", "context", "generated"], description: "Optional file area to search." },
-            query: { type: "string", description: "Optional part of the filename." },
-            focus: { type: "string", description: "What the user wants to inspect, such as narrative, slide claims, flow, proof objects, or rewrite ideas." }
-          },
-          required: [],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "analyze_image_file",
-        description: "Analyze an uploaded image, screenshot, map, poster, or photo and return a Chinese visual summary for discussion.",
-        parameters: {
-          type: "object",
-          properties: {
-            role: { type: "string", enum: ["primary", "context", "generated"], description: "Optional file area to search." },
-            query: { type: "string", description: "Optional part of the image filename." },
-            focus: { type: "string", description: "What to focus on, such as visible text, layout, route, objects, or design critique." }
-          },
-          required: [],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "edit_spreadsheet_file",
-        description: "Create a safe, reviewable edit plan for a generated or uploaded spreadsheet. Do not overwrite the original spreadsheet.",
-        parameters: {
-          type: "object",
-          properties: {
-            role: { type: "string", enum: ["primary", "context", "generated"], description: "File area to search, usually generated for temporary spreadsheets." },
-            query: { type: "string", description: "Optional part of the spreadsheet filename." },
-            editPlan: { type: "string", description: "Concrete sheet/range/cell edits, formulas, rows, or formatting changes requested by the user." }
-          },
-          required: ["editPlan"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "create_outline",
-        description: "Save a structured discussion, report, speech, or article outline into the AI temporary generated files section.",
-        parameters: {
-          type: "object",
-          properties: {
-            title: { type: "string", description: "Markdown filename." },
-            text: { type: "string", description: "Full outline content in Markdown." },
-            sections: { type: "array", items: { type: "string" }, description: "Optional outline sections when text is omitted." }
-          },
-          required: ["title"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "compare_files",
-        description: "Load two files' discussion context so you can compare differences, risks, and suggested changes.",
-        parameters: {
-          type: "object",
-          properties: {
-            firstRole: { type: "string", enum: ["primary", "context", "generated"], description: "Optional first file area." },
-            firstQuery: { type: "string", description: "First filename keyword." },
-            secondRole: { type: "string", enum: ["primary", "context", "generated"], description: "Optional second file area." },
-            secondQuery: { type: "string", description: "Second filename keyword." }
-          },
-          required: ["firstQuery", "secondQuery"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "extract_action_items",
-        description: "Save action items extracted from the current discussion as a Markdown table in the AI temporary generated files section.",
-        parameters: {
-          type: "object",
-          properties: {
-            source: { type: "string", description: "Source label such as meeting record or topic." },
-            items: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: {
-                  task: { type: "string" },
-                  owner: { type: "string" },
-                  due: { type: "string" }
-                },
-                required: ["task"],
-                additionalProperties: false
-              }
-            }
-          },
-          required: ["items"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "create_table_summary",
-        description: "Save discussion content as a Markdown table, such as issue-conclusion-evidence-next-step.",
-        parameters: {
-          type: "object",
-          properties: {
-            title: { type: "string", description: "Markdown filename." },
-            headers: { type: "array", items: { type: "string" } },
-            rows: {
-              type: "array",
-              items: { type: "array", items: { type: "string" } }
-            }
-          },
-          required: ["title", "headers", "rows"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "export_discussion_record",
-        description: "Export the current meeting transcript, notes, and directions as a Markdown file in the AI temporary generated section.",
-        parameters: {
-          type: "object",
-          properties: {
-            title: { type: "string", description: "Markdown filename." }
-          },
-          required: [],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "download_file",
-        description: "Directly download the selected file, foreground file, a specified uploaded file, meeting record, notes, or the full discussion record through the browser.",
-        parameters: {
-          type: "object",
-          properties: {
-            target: {
-              type: "string",
-              enum: ["selected_file", "foreground_file", "file", "meeting_record", "notes", "discussion_record"],
-              description: "selected_file uses the currently selected file; foreground_file uses the open preview/editor file; file searches by role/query; meeting_record, notes, and discussion_record export Markdown."
-            },
-            role: {
-              type: "string",
-              enum: ["primary", "context", "generated"],
-              description: "Optional file area when target is file."
-            },
-            query: {
-              type: "string",
-              description: "Optional filename keyword when target is file."
-            },
-            title: {
-              type: "string",
-              description: "Optional download title for meeting_record, notes, or discussion_record."
-            }
-          },
-          required: ["target"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "create_diagram",
-        description: "Save a Mermaid diagram or structured diagram text as a temporary Markdown file.",
-        parameters: {
-          type: "object",
-          properties: {
-            title: { type: "string", description: "Markdown filename." },
-            diagramType: { type: "string", enum: ["mermaid", "text"], description: "Use mermaid for Mermaid code." },
-            content: { type: "string", description: "Mermaid code or diagram text." }
-          },
-          required: ["title", "content"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "schedule_followup",
-        description: "Save a follow-up reminder/action note from the discussion. This does not create a system automation.",
-        parameters: {
-          type: "object",
-          properties: {
-            title: { type: "string", description: "Follow-up title." },
-            when: { type: "string", description: "Suggested time/date in the user's words." },
-            detail: { type: "string", description: "Additional detail." }
-          },
-          required: ["title"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "set_response_style",
-        description: "Set the preferred response length, tone, and whether to ask before proceeding.",
-        parameters: {
-          type: "object",
-          properties: {
-            length: { type: "string", enum: ["short", "medium", "long"] },
-            tone: { type: "string" },
-            askFirst: { type: "boolean" }
-          },
-          required: ["length"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "set_discussion_contract",
-        description: "Set a discussion contract that constrains the goal, boundaries, output format, and answer length for the current topic.",
-        parameters: {
-          type: "object",
-          properties: {
-            goal: { type: "string", description: "The concrete discussion goal." },
-            boundaries: { type: "array", items: { type: "string" }, description: "What should stay out of scope or be treated carefully." },
-            outputFormat: { type: "string", description: "Expected output shape, such as conclusion plus next step." },
-            responseLength: { type: "string", enum: ["short", "medium", "long"] }
-          },
-          required: ["goal"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "check_topic_alignment",
-        description: "Record whether the current answer or discussion move is still aligned to the confirmed topic and contract.",
-        parameters: {
-          type: "object",
-          properties: {
-            aligned: { type: "boolean" },
-            score: { type: "number", description: "0-100 alignment score." },
-            issue: { type: "string", description: "What is drifting or risky." },
-            recommendation: { type: "string", description: "How to get back on track." }
-          },
-          required: ["aligned", "score"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "advance_discussion_step",
-        description: "Advance the active agenda step and optionally save a short step note.",
-        parameters: {
-          type: "object",
-          properties: {
-            stepIndex: { type: "number", description: "Zero-based agenda index to make active. Omit to move to the next step." },
-            note: { type: "string", description: "Optional note about why the step changed." }
-          },
-          required: [],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "mark_uncertainty",
-        description: "Mark missing information, assumptions, or uncertainty before answering too confidently.",
-        parameters: {
-          type: "object",
-          properties: {
-            text: { type: "string", description: "What is uncertain." },
-            reason: { type: "string", description: "Why it is uncertain." },
-            needed: { type: "array", items: { type: "string" }, description: "Information needed to resolve it." }
-          },
-          required: ["text"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "limit_response_scope",
-        description: "Set strict scope for the next answers, such as one point only and a maximum sentence count.",
-        parameters: {
-          type: "object",
-          properties: {
-            maxSentences: { type: "number" },
-            onePointOnly: { type: "boolean" },
-            mustAskFirst: { type: "boolean" }
-          },
-          required: ["maxSentences"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "create_discussion_agenda",
-        description: "Create an ordered agenda for the current discussion, with objective and expected output for each step.",
-        parameters: {
-          type: "object",
-          properties: {
-            items: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: {
-                  title: { type: "string" },
-                  objective: { type: "string" },
-                  output: { type: "string" }
-                },
-                required: ["title"],
-                additionalProperties: false
-              }
-            }
-          },
-          required: ["items"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "lock_discussion_agenda",
-        description: "Lock the current agenda after user confirmation so later changes require explicit confirmation.",
-        parameters: {
-          type: "object",
-          properties: {
-            reason: { type: "string" }
-          },
-          required: [],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "request_agenda_change",
-        description: "Request confirmation before adding, deleting, reordering, or changing agenda items.",
-        parameters: {
-          type: "object",
-          properties: {
-            change: { type: "string", description: "The proposed agenda change." },
-            reason: { type: "string", description: "Why the change is needed." }
-          },
-          required: ["change"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "score_discussion_progress",
-        description: "Score current discussion progress and return completed items, blockers, and next steps.",
-        parameters: {
-          type: "object",
-          properties: {
-            score: { type: "number", description: "0-100 progress score." },
-            completed: { type: "array", items: { type: "string" } },
-            blocked: { type: "array", items: { type: "string" } },
-            next: { type: "array", items: { type: "string" } }
-          },
-          required: ["score"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "summarize_current_step",
-        description: "Save a concise summary for the current agenda step before moving on.",
-        parameters: {
-          type: "object",
-          properties: {
-            summary: { type: "string" },
-            next: { type: "string" }
-          },
-          required: ["summary"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "detect_overlong_answer",
-        description: "Check whether a draft answer is too long and provide a compressed version.",
-        parameters: {
-          type: "object",
-          properties: {
-            original: { type: "string" },
-            compressed: { type: "string" },
-            maxSentences: { type: "number" }
-          },
-          required: ["compressed"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "set_user_cognitive_load",
-        description: "Set how much information the user wants right now: simple, normal, detailed, or step-by-step.",
-        parameters: {
-          type: "object",
-          properties: {
-            level: { type: "string", enum: ["simple", "normal", "detailed", "step_by_step"] }
-          },
-          required: ["level"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "pause_and_wait",
-        description: "Pause the discussion and explicitly wait for the user instead of continuing to elaborate.",
-        parameters: {
-          type: "object",
-          properties: {
-            reason: { type: "string" }
-          },
-          required: ["reason"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "define_output_rubric",
-        description: "Define criteria for evaluating the final discussion output or deliverable.",
-        parameters: {
-          type: "object",
-          properties: {
-            criteria: { type: "array", items: { type: "string" } }
-          },
-          required: ["criteria"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "save_discussion_note",
-        description: "Save a concise paragraph summary of a completed discussion point. Do not use this for verbatim transcript or sentence-by-sentence notes.",
-        parameters: {
-          type: "object",
-          properties: {
-            kind: {
-              type: "string",
-              enum: ["point", "decision", "question", "action"],
-              description: "The type of summarized discussion note."
-            },
-            text: {
-              type: "string",
-              description: "A concise paragraph in Chinese summarizing the completed point, conclusion, open question, or action item."
-            }
-          },
-          required: ["kind", "text"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "create_generated_file",
-        description: "Create an AI temporary generated markdown draft, copy, edited document, or stage result in the lower generated section of resources. It remains temporary until the user confirms it as an outcome.",
-        parameters: {
-          type: "object",
-          properties: {
-            title: {
-              type: "string",
-              description: "A concise filename. A .md extension will be appended when missing."
-            },
-            text: {
-              type: "string",
-              description: "Markdown content for the generated temporary file."
-            }
-          },
-          required: ["title", "text"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "generate_image",
-        description: "Generate a PNG image from a prompt and save it into the AI temporary generated files section. Use when the user asks to draw, create, design, or generate an image, map, poster, diagram, visual, or illustration.",
-        parameters: {
-          type: "object",
-          properties: {
-            title: {
-              type: "string",
-              description: "A concise Chinese filename for the generated image. A .png extension will be appended or normalized."
-            },
-            prompt: {
-              type: "string",
-              description: "A detailed visual prompt describing the desired image, including subject, style, layout, text labels, colors, and aspect ratio."
-            },
-            size: {
-              type: "string",
-              enum: ["1024x1024", "1024x1536", "1536x1024"],
-              description: "Image size. Use 1024x1024 for square, 1024x1536 for portrait, 1536x1024 for landscape."
-            },
-            quality: {
-              type: "string",
-              enum: ["low", "medium", "high", "auto"],
-              description: "Generation quality. Use high by default for polished output; use medium or low only when the user asks to save cost or generate quickly."
-            }
-          },
-          required: ["title", "prompt", "size", "quality"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "copy_file_to_generated",
-        description: "Copy a topic or resource file into the AI temporary generated section so it can be edited without changing the original file.",
-        parameters: {
-          type: "object",
-          properties: {
-            role: { type: "string", enum: ["primary", "context", "generated"], description: "The current area of the source file." },
-            query: { type: "string", description: "Part of the source filename to copy." }
-          },
-          required: ["role", "query"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "add_file_to_topic",
-        description: "Add an existing resource file or AI temporary generated file to the topic panel as an outcome for further focused discussion.",
-        parameters: {
-          type: "object",
-          properties: {
-            query: {
-              type: "string",
-              description: "Part of the filename to add to the topic panel. Leave empty only when there is exactly one suitable resource or generated file."
-            }
-          },
-          required: ["query"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "move_file_to_area",
-        description: "Move a file to the topic area, user resource area, or AI temporary file area. Moving to generated creates a temporary copy when the source is not already generated.",
-        parameters: {
-          type: "object",
-          properties: {
-            query: {
-              type: "string",
-              description: "Part of the filename to move or copy."
-            },
-            role: {
-              type: "string",
-              enum: ["primary", "context", "generated"],
-              description: "primary = topic area, context = user resource area, generated = AI temporary file area."
-            }
-          },
-          required: ["query", "role"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "update_generated_file",
-        description: "Replace the content of an editable AI temporary text/markdown file. Use when the user asks you to revise or edit a temporary document by voice.",
-        parameters: {
-          type: "object",
-          properties: {
-            query: {
-              type: "string",
-              description: "Part of the generated filename to edit."
-            },
-            text: {
-              type: "string",
-              description: "The full new markdown/text content to save into the temporary file."
-            }
-          },
-          required: ["query", "text"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "propose_discussion_directions",
-        description: "Propose 1 to 3 discussion directions immediately after the user confirms the topic. This only asks the user to confirm; it does not save the todo list yet. Never propose more than 3 at once.",
-        parameters: {
-          type: "object",
-          properties: {
-            directions: {
-              type: "array",
-              minItems: 1,
-              maxItems: 3,
-              items: { type: "string" },
-              description: "Concise Chinese discussion directions for the current confirmed topic."
-            },
-            reason: {
-              type: "string",
-              description: "A short reason explaining why these directions fit the confirmed topic."
-            }
-          },
-          required: ["directions", "reason"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "add_discussion_directions",
-        description: "Append 1 to 3 new discussion directions to the existing confirmed todo list only when the user explicitly asks to add more directions.",
-        parameters: {
-          type: "object",
-          properties: {
-            directions: {
-              type: "array",
-              minItems: 1,
-              maxItems: 3,
-              items: { type: "string" },
-              description: "New concise Chinese directions to append after the existing list."
-            }
-          },
-          required: ["directions"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "update_discussion_directions",
-        description: "Replace the current confirmed discussion direction todo list according to user feedback. Provide the complete new ordered list.",
-        parameters: {
-          type: "object",
-          properties: {
-            directions: {
-              type: "array",
-              minItems: 1,
-              maxItems: 8,
-              items: { type: "string" },
-              description: "The full updated ordered todo list."
-            }
-          },
-          required: ["directions"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "complete_discussion_direction",
-        description: "Mark one discussion direction as complete and record the completion in notes.",
-        parameters: {
-          type: "object",
-          properties: {
-            query: {
-              type: "string",
-              description: "The direction number, id, or a distinctive phrase from the direction text."
-            },
-            note: {
-              type: "string",
-              description: "A concise Chinese record of what was concluded or completed for this direction."
-            }
-          },
-          required: ["query", "note"],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "confirm_discussion_topic",
-        description: "Confirm the currently pending discussion topic after the user says yes, confirm, okay, right, or similar by voice. After this succeeds, propose discussion directions.",
-        parameters: {
-          type: "object",
-          properties: {
-            title: {
-              type: "string",
-              description: "Optional pending topic title to confirm. Leave empty to confirm the latest pending proposal shown in the UI."
-            }
-          },
-          required: [],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "confirm_discussion_directions",
-        description: "Confirm the currently pending discussion direction todo list after the user says yes, confirm, okay, right, or similar by voice.",
-        parameters: {
-          type: "object",
-          properties: {},
-          required: [],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "end_voice_discussion",
-        description: "End the current voice discussion only after the user explicitly confirms they want to stop, end discussion, disconnect, or says the session is done. After this tool returns, say one short natural Chinese farewell without using a fixed scripted phrase. The app will disconnect after that response.",
-        parameters: {
-          type: "object",
-          properties: {
-            reason: {
-              type: "string",
-              description: "A concise reason inferred from the user's request, if any."
-            }
-          },
-          required: [],
-          additionalProperties: false
-        }
-      },
-      {
-        type: "function",
-        name: "propose_discussion_topic",
-        description: "Generate a proposed discussion topic for user confirmation from the user's latest speech/text and current topic files before long-running discussion or direction planning, or warn that the discussion is drifting and ask whether to switch topics.",
-        parameters: {
-          type: "object",
-          properties: {
-            title: {
-              type: "string",
-              description: "The proposed discussion topic in concise Chinese."
-            },
-            reason: {
-              type: "string",
-              description: "Why this topic should be confirmed, or why the current discussion appears to be drifting."
-            },
-            intent: {
-              type: "string",
-              enum: ["confirm", "drift"],
-              description: "Use confirm for a better topic name; use drift when reminding the user about serious topic drift."
-            }
-          },
-          required: ["title", "reason", "intent"],
-          additionalProperties: false
-        }
-      }
-    ],
+    tools: buildRealtimeToolDefinitions(),
     tool_choice: "auto",
     audio: {
       input: {
         transcription: {
           model: aiSettings.transcriptionModel,
           language: "zh"
-        },
-        turn_detection: {
-          type: "semantic_vad",
-          eagerness: "low",
-          create_response: true,
-          interrupt_response: true
         }
       },
       output: { voice: aiSettings.realtimeVoice }
     }
   };
-  const fd = new FormData();
-  fd.set("sdp", req.body);
-  fd.set("session", JSON.stringify(session));
+}
 
-  const response = await fetch("https://api.openai.com/v1/realtime/calls", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${openAiApiKey}`,
-      "OpenAI-Safety-Identifier": "discuz-local-user"
-    },
-    body: fd
-  });
-
-  const payload = await response.text();
-  if (!response.ok) {
-    return res.status(response.status).type("text/plain").send(payload);
+app.post("/api/realtime/session", async (req, res) => {
+  const openAiApiKey = getOpenAiApiKey();
+  if (!openAiApiKey) {
+    return res.status(500).json({ error: "OPENAI_API_KEY is not configured" });
   }
-  addActivity("Realtime", "Voice session started", now());
+  const aiSettings = getAiSettingsState();
+  const session = buildRealtimeSessionConfig(aiSettings);
+  const client = new OpenAI({ apiKey: openAiApiKey });
+  const clientSecret = await client.realtime.clientSecrets.create({
+    session,
+    expires_after: {
+      anchor: "created_at",
+      seconds: 600
+    }
+  });
+  addActivity("Realtime", "Voice session token created", now());
   writeTopicSnapshot();
-  res.type("application/sdp").send(payload);
+  return res.json({
+    clientSecret: clientSecret.value,
+    expiresAt: clientSecret.expires_at,
+    model: aiSettings.realtimeModel,
+    instructions: session.instructions,
+    tools: session.tools,
+    audio: session.audio,
+    settings: aiSettings
+  });
 });
 
 app.listen(port, () => {

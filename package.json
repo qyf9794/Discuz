@@ -13,6 +13,7 @@
     "lint": "eslint ."
   },
   "dependencies": {
+    "@openai/agents": "^0.11.6",
     "@vitejs/plugin-react": "^5.1.1",
     "concurrently": "^9.2.1",
     "cors": "^2.8.5",
@@ -26,7 +27,8 @@
     "pdf-parse": "^2.4.5",
     "react": "^19.2.3",
     "react-dom": "^19.2.3",
-    "vite": "^7.2.7"
+    "vite": "^7.2.7",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.2",

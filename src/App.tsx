@@ -22,6 +22,7 @@ import {
   Trash2,
   X
 } from "lucide-react";
+import { OpenAIRealtimeWebRTC, RealtimeAgent, RealtimeSession, tool } from "@openai/agents/realtime";
 import { ChangeEvent, DragEvent, forwardRef, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, Dispatch, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, ReactNode, RefObject, SetStateAction } from "react";
 import type { AiSettings, AppState, DiscussionDirection, DiscussionRecord, DiscussionTopic, DiscuzFile, MeetingMessage, Note } from "./types";
@@ -48,9 +49,7 @@ const emptyState: AppState = {
       transcriptionModel: "gpt-4o-transcribe",
       imageModel: "gpt-image-1.5",
       imageQuality: "high",
-      responseLength: "short",
-      responseTone: "活泼、简洁、有一点笑意",
-      visualStyle: "清晰、精致、可用于讨论"
+      webSearchProviders: "brave,bing,google,serpapi,tavily,duckduckgo,wikipedia"
     }
   }
 };
@@ -64,7 +63,21 @@ type ToolId = "whiteboard" | "draft" | "image" | "video" | "audio";
 type StatusLogEntry = { id: string; kind: "status" | "error"; text: string; createdAt: string };
 type TaskItem = { id: string; label: string; startedAt: string };
 type ToolActivity = { id: string; label: string; status: "running" | "done" | "failed" | "cancelled"; startedAt: string; endedAt?: string; detail?: string; result?: string };
-type RealtimeToolCall = { name?: string; arguments?: string; call_id?: string };
+type RealtimeToolDefinition = { type: "function"; name: string; description: string; parameters: Record<string, unknown> };
+type RealtimeSessionBootstrap = {
+  clientSecret: string;
+  expiresAt: number;
+  model: string;
+  instructions: string;
+  tools: RealtimeToolDefinition[];
+    audio: {
+      input?: {
+        transcription?: { model?: string; language?: string };
+      };
+      output?: { voice?: string };
+  };
+  settings: AiSettings;
+};
 type PendingVoiceStop = "none" | "awaiting_closing" | "closing_started";
 type BoardItem = { id: string; kind: "text" | "image"; value: string; x: number; y: number };
 type BoardLink = { id: string; from: string; to: string };
@@ -199,6 +212,7 @@ function toolCallLabel(name = "任务") {
   return ({
     search_context: "检索本地材料",
     web_search: "联网搜索",
+    read_web_page: "读取网页",
     open_web_page: "打开网页",
     analyze_word_file: "分析Word文件",
     analyze_spreadsheet_file: "分析Excel表格",
@@ -223,7 +237,6 @@ function toolCallLabel(name = "任务") {
     download_file: "下载文件",
     create_diagram: "生成图表",
     schedule_followup: "安排跟进",
-    set_response_style: "设置回答风格",
     set_discussion_contract: "设置讨论契约",
     check_topic_alignment: "检查主题对齐",
     advance_discussion_step: "推进讨论步骤",
@@ -538,22 +551,21 @@ export function App() {
   const topicPanelRef = useRef<HTMLElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const statusLogRef = useRef<HTMLDivElement | null>(null);
-  const peerRef = useRef<RTCPeerConnection | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const dataChannelRef = useRef<RTCDataChannel | null>(null);
-  const handleToolCallRef = useRef<((_message: RealtimeToolCall) => Promise<void>) | null>(null);
+  const realtimeSessionRef = useRef<RealtimeSession | null>(null);
+  const executeRealtimeToolRef = useRef<((_name: string, _args: Record<string, any>) => Promise<unknown>) | null>(null);
   const responseActiveRef = useRef(false);
   const responsePendingRef = useRef(false);
   const topicFileChangeBlocksTopicProposalRef = useRef(false);
   const voiceSessionRef = useRef(0);
   const voiceSessionStartedAtRef = useRef<string | null>(null);
   const voiceReconnectTimerRef = useRef<number | null>(null);
+  const responseWatchdogTimerRef = useRef<number | null>(null);
   const voiceMeterRef = useRef<VoiceMeter | null>(null);
   const pendingVoiceStopAfterResponseRef = useRef<PendingVoiceStop>("none");
   const pendingTaskCountRef = useRef(0);
   const activeTaskLabelRef = useRef("");
   const backgroundParsingActiveRef = useRef(false);
-  const assistantRespondedSinceUserRef = useRef(true);
   const lastStatusLogRef = useRef("Ready");
   const lastErrorLogRef = useRef("");
   const assistantTranscriptRef = useRef("");
@@ -997,6 +1009,18 @@ export function App() {
   const summarizeToolResult = (value: unknown) => {
     const result = value as Record<string, unknown>;
     if (result?.error) return String(result.error);
+    if (typeof result?.resultText === "string") {
+      if (typeof result.title === "string" && typeof result.url === "string") {
+        return `已读取：${result.title}，${compactText(result.resultText, 220)}`;
+      }
+      const count = typeof result.count === "number" ? `找到 ${result.count} 条结果` : "搜索完成";
+      return `${count}：${compactText(result.resultText, 260)}`;
+    }
+    if (Array.isArray(result?.results)) {
+      const items = result.results as Array<{ title?: string; url?: string }>;
+      const titles = items.slice(0, 3).map((item, index) => `${index + 1}. ${item.title || item.url || "Untitled"}`).join("；");
+      return items.length ? `找到 ${items.length} 条结果：${titles}` : "没有找到可用搜索结果";
+    }
     if (result?.opened) return `已打开：${String(result.opened)}`;
     if (result?.generated) return `已生成：${String(result.generated)}`;
     if (result?.downloaded) return `已下载：${String(result.downloaded)}`;
@@ -1243,9 +1267,30 @@ export function App() {
     }
   };
 
+  const clearResponseWatchdog = useCallback(() => {
+    if (responseWatchdogTimerRef.current) window.clearTimeout(responseWatchdogTimerRef.current);
+    responseWatchdogTimerRef.current = null;
+  }, []);
+
+  const startResponseWatchdog = useCallback(() => {
+    clearResponseWatchdog();
+    responseWatchdogTimerRef.current = window.setTimeout(() => {
+      if (!responseActiveRef.current) return;
+      realtimeSessionRef.current?.interrupt();
+      responseActiveRef.current = false;
+      responsePendingRef.current = false;
+      pendingTaskCountRef.current = 0;
+      activeTaskLabelRef.current = "";
+      setPendingTasks([]);
+      setStatusText("上一轮响应超时，已恢复");
+      setVoiceState((state) => state === "thinking" ? "live" : state);
+    }, 30000);
+  }, [clearResponseWatchdog]);
+
   const requestRealtimeResponse = useCallback(() => {
-    const channel = dataChannelRef.current;
-    if (!channel || channel.readyState !== "open") return false;
+    const session = realtimeSessionRef.current;
+    const requestResponse = () => session?.transport.requestResponse?.();
+    if (!session || typeof session.transport.requestResponse !== "function") return false;
     if (responseActiveRef.current) {
       responsePendingRef.current = true;
       setStatusText("上一轮还在处理");
@@ -1253,28 +1298,22 @@ export function App() {
     }
     responseActiveRef.current = true;
     responsePendingRef.current = false;
-    channel.send(JSON.stringify({ type: "response.create" }));
+    requestResponse();
+    startResponseWatchdog();
     return true;
-  }, []);
+  }, [startResponseWatchdog]);
 
   const sendRealtimeSystemEvent = (text: string, options: { blockTopicProposal?: boolean } = {}) => {
-    const channel = dataChannelRef.current;
-    if (!channel || channel.readyState !== "open") return false;
+    const session = realtimeSessionRef.current;
+    if (!session) return false;
     if (options.blockTopicProposal) {
       topicFileChangeBlocksTopicProposalRef.current = true;
       window.setTimeout(() => {
         topicFileChangeBlocksTopicProposalRef.current = false;
       }, 18000);
     }
-    channel.send(JSON.stringify({
-      type: "conversation.item.create",
-      item: {
-        type: "message",
-        role: "user",
-        content: [{ type: "input_text", text }]
-      }
-    }));
-    return requestRealtimeResponse();
+    session.sendMessage(text);
+    return true;
   };
 
   const flushRealtimeResponse = useCallback(() => {
@@ -1283,20 +1322,7 @@ export function App() {
   }, [requestRealtimeResponse]);
 
   const notifyForegroundDiscussion = (title: string, text: string) => {
-    const channel = dataChannelRef.current;
-    if (!channel || channel.readyState !== "open") return;
-    channel.send(JSON.stringify({
-      type: "conversation.item.create",
-      item: {
-        type: "message",
-        role: "user",
-        content: [{
-          type: "input_text",
-          text: `系统事件：用户打开了前台讨论窗口《${title}》。这个窗口现在是当前临时讨论对象，请先阅读以下内容，再围绕它继续讨论。\n\n${text.slice(0, 6000)}`
-        }]
-      }
-    }));
-    requestRealtimeResponse();
+    realtimeSessionRef.current?.sendMessage(`系统事件：用户打开了前台讨论窗口《${title}》。这个窗口现在是当前临时讨论对象，请先阅读以下内容，再围绕它继续讨论。\n\n${text.slice(0, 6000)}`);
   };
 
   const describeFileForDiscussion = (file: DiscuzFile) => {
@@ -1434,20 +1460,16 @@ export function App() {
         discussionInputs: payload.discussionInputs ?? current.discussionInputs,
         activities: payload.activities ?? current.activities
       }));
-      assistantRespondedSinceUserRef.current = false;
       saveMeetingMessage(text, "user").catch((err) => setError(err instanceof Error ? err.message : "Unable to save meeting record"));
 
-      const channel = dataChannelRef.current;
-      if (channel?.readyState === "open") {
-        channel.send(JSON.stringify({
-          type: "conversation.item.create",
-          item: {
-            type: "message",
-            role: "user",
-            content: [{ type: "input_text", text: `用户文字输入：${text}` }]
-          }
-        }));
-        requestRealtimeResponse();
+      const session = realtimeSessionRef.current;
+      if (session) {
+        if (responseActiveRef.current) {
+          session.interrupt();
+          responseActiveRef.current = false;
+          clearResponseWatchdog();
+        }
+        session.sendMessage(`用户文字输入：${text}`);
       } else {
         setStatusText("Saved for next discussion");
       }
@@ -1475,20 +1497,14 @@ export function App() {
     setTopicProposal(null);
     setDirectionProposal(null);
     setStatusText(`已确认主题：${confirmedTitle}`);
-    const channel = dataChannelRef.current;
-    if (options.notifyRealtime !== false && channel?.readyState === "open") {
-      channel.send(JSON.stringify({
-        type: "conversation.item.create",
-        item: {
-          type: "message",
-          role: "user",
-          content: [{
-            type: "input_text",
-            text: `系统事件：用户已确认讨论主题《${confirmedTitle}》。请立即基于当前主题、主题文件和用户输入调用 propose_discussion_directions，提出 1 到 3 个讨论方向供用户确认，一次最多 3 个。语音只用自然短句说明你会列出方向并请用户删改，不要使用固定话术。如果用户明确要求增加方向，调用 add_discussion_directions 追加 1 到 3 个；如果用户不满意，优先调用 update_discussion_directions 快速替换完整列表；如果用户只是不想要某一条，提醒他可以直接点圆圈右侧删除。`
-          }]
-        }
-      }));
-      requestRealtimeResponse();
+    const session = realtimeSessionRef.current;
+    if (options.notifyRealtime !== false && session) {
+      if (responseActiveRef.current) {
+        session.interrupt();
+        responseActiveRef.current = false;
+        clearResponseWatchdog();
+      }
+      session.sendMessage(`系统事件：用户已确认讨论主题《${confirmedTitle}》。请立即基于当前主题、主题文件和用户输入调用 propose_discussion_directions，提出 1 到 3 个讨论方向供用户确认，一次最多 3 个。语音只用自然短句说明你会列出方向并请用户删改，不要使用固定话术。如果用户明确要求增加方向，调用 add_discussion_directions 追加 1 到 3 个；如果用户不满意，优先调用 update_discussion_directions 快速替换完整列表；如果用户只是不想要某一条，提醒他可以直接点圆圈右侧删除。`);
     }
   };
 
@@ -1559,7 +1575,7 @@ export function App() {
   };
 
   const cancelCurrentTask = useCallback(() => {
-    dataChannelRef.current?.send(JSON.stringify({ type: "response.cancel" }));
+    realtimeSessionRef.current?.interrupt();
     responseActiveRef.current = false;
     responsePendingRef.current = false;
     pendingTaskCountRef.current = 0;
@@ -1569,30 +1585,35 @@ export function App() {
     setStatusText("已取消当前任务");
   }, []);
 
-  const handleToolCall = async (message: RealtimeToolCall) => {
-    const channel = dataChannelRef.current;
-    if (!channel || channel.readyState !== "open" || !message.call_id || !message.name) return;
-    const args = JSON.parse(message.arguments || "{}");
-    const label = toolCallLabel(message.name);
-    if (!assistantRespondedSinceUserRef.current) {
-      assistantRespondedSinceUserRef.current = true;
-    }
-    const activityId = createToolActivity(label, message.name);
+  const executeRealtimeTool = async (name: string, args: Record<string, any> = {}) => {
+    const label = toolCallLabel(name);
+    const activityId = createToolActivity(label, name);
     const finishTask = beginTask(label);
     let output = {};
     try {
-      if (message.name === "search_context") {
+      if (name === "search_context") {
         const response = await fetch(`/api/context/search?q=${encodeURIComponent(args.query || "")}`);
         output = await response.json();
       }
-      if (message.name === "web_search") {
+      if (name === "web_search") {
         if (!webEnabled) output = { error: "Web search is disabled by the user." };
         else {
-          const response = await fetch(`/api/web/search?q=${encodeURIComponent(args.query || "")}`);
+          const query = encodeURIComponent(args.query || "");
+          const limit = args.limit ? `&limit=${encodeURIComponent(args.limit)}` : "";
+          const response = await fetch(`/api/web/search?q=${query}${limit}`);
           output = await response.json();
         }
       }
-      if (message.name === "open_web_page") {
+      if (name === "read_web_page") {
+        if (!webEnabled) output = { error: "Web reading is disabled by the user." };
+        else {
+          const rawUrl = String(args.url || "").trim();
+          const maxChars = args.maxChars ? `&maxChars=${encodeURIComponent(args.maxChars)}` : "";
+          const response = await fetch(`/api/web/read?url=${encodeURIComponent(rawUrl)}${maxChars}`);
+          output = await response.json();
+        }
+      }
+      if (name === "open_web_page") {
         const rawUrl = String(args.url || "").trim();
         const url = rawUrl && !/^https?:\/\//i.test(rawUrl) ? `https://${rawUrl}` : rawUrl;
         try {
@@ -1608,16 +1629,16 @@ export function App() {
           output = { ok: false, error: "Invalid web URL. Use an http or https URL." };
         }
       }
-      if (message.name === "set_layout") {
+      if (name === "set_layout") {
         applyLayoutCommand(args.target || "reset", args.mode || "reset");
         output = { ok: true, layout: args };
       }
-      if (message.name === "open_discussion_tool") {
+      if (name === "open_discussion_tool") {
         const tool = (args.tool || "whiteboard") as ToolId;
         openToolDiscussionWindow(tool);
         output = { ok: true, opened: args.tool };
       }
-      if (message.name === "save_discussion_tool") {
+      if (name === "save_discussion_tool") {
         const tool = (args.tool === "whiteboard" || args.tool === "draft" ? args.tool : activeTool) as ToolId | null;
         if (tool === "whiteboard" || tool === "draft") {
           await saveToolToGenerated(tool);
@@ -1626,7 +1647,7 @@ export function App() {
           output = { ok: false, error: "No savable tool is open." };
         }
       }
-      if (message.name === "clear_discussion_tool") {
+      if (name === "clear_discussion_tool") {
         const tool = (args.tool === "whiteboard" || args.tool === "draft" ? args.tool : activeTool) as ToolId | null;
         if (tool === "whiteboard" || tool === "draft") {
           clearToolContent(tool);
@@ -1635,7 +1656,7 @@ export function App() {
           output = { ok: false, error: "No clearable tool is open." };
         }
       }
-      if (message.name === "close_foreground_window") {
+      if (name === "close_foreground_window") {
         const target = String(args.target || "all");
         if (target === "tool" || target === "all") setActiveTool(null);
         if (target === "web" || target === "all") setWebPreview(null);
@@ -1646,7 +1667,7 @@ export function App() {
         if (target === "record" || target === "all") setPreviewRecordId(null);
         output = { ok: true, closed: target };
       }
-      if (message.name === "open_file_preview") {
+      if (name === "open_file_preview") {
         const role = args.role === "primary" || args.role === "context" || args.role === "generated" ? args.role : undefined;
         const queryText = String(args.query || "").trim().toLowerCase();
         const candidate = state.files.find((file) => {
@@ -1661,13 +1682,13 @@ export function App() {
           output = { ok: false, error: "No matching file found." };
         }
       }
-      if (message.name === "analyze_word_file" || message.name === "analyze_spreadsheet_file" || message.name === "analyze_presentation_file") {
+      if (name === "analyze_word_file" || name === "analyze_spreadsheet_file" || name === "analyze_presentation_file") {
         const role = args.role === "primary" || args.role === "context" || args.role === "generated" ? args.role as DiscuzFile["role"] : undefined;
         const queryText = String(args.query || "").trim();
         const focus = String(args.focus || "").trim();
         const analysisKind: OfficeAnalysisKind =
-          message.name === "analyze_word_file" ? "word" :
-            message.name === "analyze_spreadsheet_file" ? "spreadsheet" :
+          name === "analyze_word_file" ? "word" :
+            name === "analyze_spreadsheet_file" ? "spreadsheet" :
               "presentation";
         const candidate = selectOfficeFile(state.files, analysisKind, role, queryText);
         if (!candidate) {
@@ -1683,7 +1704,7 @@ export function App() {
           output = buildPresentationAnalysisPayload(candidate, focus);
         }
       }
-      if (message.name === "analyze_image_file") {
+      if (name === "analyze_image_file") {
         const role = args.role === "primary" || args.role === "context" || args.role === "generated" ? args.role as DiscuzFile["role"] : undefined;
         const candidate = selectFileByQuery(state.files, String(args.query || ""), role, ["image"]);
         if (!candidate) {
@@ -1705,7 +1726,7 @@ export function App() {
           };
         }
       }
-      if (message.name === "read_current_focus") {
+      if (name === "read_current_focus") {
         output = {
           ok: true,
           activeTool,
@@ -1720,7 +1741,7 @@ export function App() {
           topic: state.discussionTopic || state.topics.find((topic) => topic.active)?.title || ""
         };
       }
-      if (message.name === "get_discussion_state") {
+      if (name === "get_discussion_state") {
         output = {
           ok: true,
           topic: state.discussionTopic,
@@ -1744,13 +1765,13 @@ export function App() {
           }
         };
       }
-      if (message.name === "ask_user_confirmation") {
+      if (name === "ask_user_confirmation") {
         const prompt = String(args.prompt || "").trim();
         const options = normalizeLines(args.options).slice(0, 4);
         setStatusText(prompt ? `等待用户确认：${prompt}` : "等待用户确认");
         output = { ok: true, needsConfirmation: true, prompt, options };
       }
-      if (message.name === "queue_task") {
+      if (name === "queue_task") {
         const title = String(args.title || "待处理任务").trim();
         const detail = String(args.detail || "").trim();
         setStatusLog((items) => [...items, {
@@ -1761,7 +1782,7 @@ export function App() {
         }]);
         output = { ok: true, queued: title, detail };
       }
-      if (message.name === "start_break") {
+      if (name === "start_break") {
         const minutes = Math.max(1, Math.min(30, Number(args.minutes || args.durationMinutes || 5)));
         const until = new Date(Date.now() + minutes * 60000).toISOString();
         setBreakUntil(until);
@@ -1769,13 +1790,13 @@ export function App() {
         setStatusText(`休息中 ${minutes}:00`);
         output = { ok: true, breakUntil: until, minutes };
       }
-      if (message.name === "resume_discussion") {
+      if (name === "resume_discussion") {
         setBreakUntil(null);
         setAmbientMode(false);
         setStatusText("已回到讨论");
         output = { ok: true, resumed: true };
       }
-      if (message.name === "open_media_url") {
+      if (name === "open_media_url") {
         const rawUrl = String(args.url || "").trim();
         const url = rawUrl && !/^https?:\/\//i.test(rawUrl) ? `https://${rawUrl}` : rawUrl;
         try {
@@ -1789,7 +1810,7 @@ export function App() {
           output = { ok: false, error: "Invalid media URL. Use an http or https URL." };
         }
       }
-      if (message.name === "set_ambient_mode") {
+      if (name === "set_ambient_mode") {
         const enabled = args.enabled !== false;
         setAmbientMode(enabled);
         const musicUrl = String(args.musicUrl || "").trim();
@@ -1800,14 +1821,14 @@ export function App() {
         setStatusText(enabled ? "氛围模式已开启" : "氛围模式已关闭");
         output = { ok: true, ambientMode: enabled, musicUrl: musicUrl || "" };
       }
-      if (message.name === "show_tool_activity") {
+      if (name === "show_tool_activity") {
         output = { ok: true, activities: toolActivities.slice(0, 8) };
       }
-      if (message.name === "cancel_current_task") {
+      if (name === "cancel_current_task") {
         cancelCurrentTask();
         output = { ok: true, cancelled: true };
       }
-      if (message.name === "edit_spreadsheet_file") {
+      if (name === "edit_spreadsheet_file") {
         const role = args.role === "primary" || args.role === "context" || args.role === "generated" ? args.role as DiscuzFile["role"] : "generated";
         const candidate = selectFileByQuery(state.files, String(args.query || ""), role, ["spreadsheet"]);
         const editPlan = String(args.editPlan || args.instructions || "").trim();
@@ -1833,7 +1854,7 @@ export function App() {
           output = { ok: true, generated: file.originalName, sourceFile: fileBrief(candidate) };
         }
       }
-      if (message.name === "create_outline") {
+      if (name === "create_outline") {
         const title = String(args.title || "讨论大纲.md").trim();
         const sections = normalizeLines(args.sections);
         const text = String(args.text || "").trim() || sections.map((section, index) => `${index + 1}. ${section}`).join("\n");
@@ -1843,7 +1864,7 @@ export function App() {
           output = { ok: true, generated: file.originalName };
         }
       }
-      if (message.name === "compare_files") {
+      if (name === "compare_files") {
         const firstRole = args.firstRole === "primary" || args.firstRole === "context" || args.firstRole === "generated" ? args.firstRole as DiscuzFile["role"] : undefined;
         const secondRole = args.secondRole === "primary" || args.secondRole === "context" || args.secondRole === "generated" ? args.secondRole as DiscuzFile["role"] : undefined;
         const first = selectFileByQuery(state.files, String(args.firstQuery || ""), firstRole, undefined);
@@ -1860,7 +1881,7 @@ export function App() {
           };
         }
       }
-      if (message.name === "extract_action_items") {
+      if (name === "extract_action_items") {
         const items = (Array.isArray(args.items) ? args.items : []).map((item: unknown) => {
           const value = item as { task?: unknown; owner?: unknown; due?: unknown };
           return [String(value.task || "").trim(), String(value.owner || "").trim(), String(value.due || "").trim()];
@@ -1877,7 +1898,7 @@ export function App() {
           output = { ok: true, generated: file.originalName, count: items.length };
         }
       }
-      if (message.name === "create_table_summary") {
+      if (name === "create_table_summary") {
         const headers = normalizeLines(args.headers).slice(0, 8);
         const rows = (Array.isArray(args.rows) ? args.rows : []).map((row: unknown) => Array.isArray(row) ? row.map((cell) => String(cell || "")) : []);
         const title = String(args.title || "讨论表格总结.md").trim();
@@ -1887,12 +1908,12 @@ export function App() {
           output = { ok: true, generated: file.originalName, rows: rows.length };
         }
       }
-      if (message.name === "export_discussion_record") {
+      if (name === "export_discussion_record") {
         const title = String(args.title || `讨论记录-${shortTime(new Date().toISOString()).replace(":", "-")}.md`).trim();
         const file = await createGeneratedFile(title, buildDiscussionRecordMarkdown(title));
         output = { ok: true, generated: file.originalName };
       }
-      if (message.name === "download_file") {
+      if (name === "download_file") {
         const target = ["selected_file", "foreground_file", "file", "meeting_record", "notes", "discussion_record"].includes(args.target) ? String(args.target) : "selected_file";
         const title = String(args.title || "").trim();
         if (target === "meeting_record") {
@@ -1924,7 +1945,7 @@ export function App() {
           }
         }
       }
-      if (message.name === "create_diagram") {
+      if (name === "create_diagram") {
         const title = String(args.title || "讨论图表.md").trim();
         const diagramType = String(args.diagramType || "mermaid").trim();
         const content = String(args.content || "").trim();
@@ -1937,21 +1958,14 @@ export function App() {
           output = { ok: true, generated: file.originalName, diagramType };
         }
       }
-      if (message.name === "schedule_followup") {
+      if (name === "schedule_followup") {
         const title = String(args.title || "后续跟进").trim();
         const when = String(args.when || "").trim();
         const detail = String(args.detail || "").trim();
         await saveNote(`${title}${when ? `｜时间：${when}` : ""}${detail ? `｜${detail}` : ""}`, "action", "AI follow-up");
         output = { ok: true, scheduled: title, when, detail, noteSaved: true };
       }
-      if (message.name === "set_response_style") {
-        const length = ["short", "medium", "long"].includes(args.length) ? args.length : "short";
-        const tone = String(args.tone || "活泼、简洁").trim();
-        const askFirst = args.askFirst !== false;
-        localStorage.setItem("discuz-response-style", JSON.stringify({ length, tone, askFirst }));
-        output = { ok: true, style: { length, tone, askFirst }, note: "Style is saved locally and should be followed by the assistant in future responses." };
-      }
-      if (message.name === "set_discussion_contract") {
+      if (name === "set_discussion_contract") {
         const goal = String(args.goal || "").trim();
         const boundaries = normalizeLines(args.boundaries).slice(0, 8);
         const outputFormat = String(args.outputFormat || "阶段性结论 + 下一步").trim();
@@ -1965,7 +1979,7 @@ export function App() {
           output = { ok: true, contract };
         }
       }
-      if (message.name === "check_topic_alignment") {
+      if (name === "check_topic_alignment") {
         const aligned = args.aligned !== false;
         const score = Math.max(0, Math.min(100, Number(args.score ?? (aligned ? 90 : 45))));
         const issue = String(args.issue || "").trim();
@@ -1973,7 +1987,7 @@ export function App() {
         if (!aligned || score < 70) setStatusText(`主题偏离提醒：${recommendation || issue || "请回到当前主题"}`);
         output = { ok: true, aligned, score, issue, recommendation, topic: state.discussionTopic };
       }
-      if (message.name === "advance_discussion_step") {
+      if (name === "advance_discussion_step") {
         const nextIndex = Number.isFinite(Number(args.stepIndex)) ? Number(args.stepIndex) : currentAgendaIndex + 1;
         const note = String(args.note || "").trim();
         setCurrentAgendaIndex(Math.max(0, nextIndex));
@@ -1984,7 +1998,7 @@ export function App() {
         if (note) await saveNote(note, "point", "Discussion step");
         output = { ok: true, currentAgendaIndex: Math.max(0, nextIndex), note };
       }
-      if (message.name === "mark_uncertainty") {
+      if (name === "mark_uncertainty") {
         const text = String(args.text || "").trim();
         const reason = String(args.reason || "").trim();
         const needed = normalizeLines(args.needed).slice(0, 5);
@@ -1994,7 +2008,7 @@ export function App() {
           output = { ok: true, text, reason, needed };
         }
       }
-      if (message.name === "limit_response_scope") {
+      if (name === "limit_response_scope") {
         const maxSentences = Math.max(1, Math.min(8, Number(args.maxSentences || 2)));
         const onePointOnly = args.onePointOnly !== false;
         const mustAskFirst = args.mustAskFirst === true;
@@ -2002,7 +2016,7 @@ export function App() {
         setResponseScope(scope);
         output = { ok: true, scope };
       }
-      if (message.name === "create_discussion_agenda") {
+      if (name === "create_discussion_agenda") {
         const items = (Array.isArray(args.items) ? args.items : []).map((item: unknown) => {
           const value = item as { title?: unknown; objective?: unknown; output?: unknown };
           return {
@@ -2021,26 +2035,26 @@ export function App() {
           output = { ok: true, agenda, locked: false };
         }
       }
-      if (message.name === "lock_discussion_agenda") {
+      if (name === "lock_discussion_agenda") {
         setAgendaLocked(true);
         const reason = String(args.reason || "").trim();
         await saveNote(`讨论议程已锁定${reason ? `：${reason}` : "。"}`, "decision", "Agenda");
         output = { ok: true, locked: true, agenda: discussionAgenda };
       }
-      if (message.name === "request_agenda_change") {
+      if (name === "request_agenda_change") {
         const change = String(args.change || "").trim();
         const reason = String(args.reason || "").trim();
         setStatusText(change ? `等待议程变更确认：${change}` : "等待议程变更确认");
         output = { ok: true, needsConfirmation: true, change, reason, locked: agendaLocked };
       }
-      if (message.name === "score_discussion_progress") {
+      if (name === "score_discussion_progress") {
         const score = Math.max(0, Math.min(100, Number(args.score || 0)));
         const completed = normalizeLines(args.completed).slice(0, 8);
         const blocked = normalizeLines(args.blocked).slice(0, 8);
         const next = normalizeLines(args.next).slice(0, 8);
         output = { ok: true, score, completed, blocked, next };
       }
-      if (message.name === "summarize_current_step") {
+      if (name === "summarize_current_step") {
         const summary = String(args.summary || "").trim();
         const next = String(args.next || "").trim();
         if (!summary) output = { ok: false, error: "Missing step summary." };
@@ -2049,7 +2063,7 @@ export function App() {
           output = { ok: true, summary, next };
         }
       }
-      if (message.name === "detect_overlong_answer") {
+      if (name === "detect_overlong_answer") {
         const original = String(args.original || "").trim();
         const compressed = String(args.compressed || "").trim();
         const maxSentences = Math.max(1, Math.min(8, Number(args.maxSentences || responseScope.maxSentences)));
@@ -2060,18 +2074,18 @@ export function App() {
           compressed
         };
       }
-      if (message.name === "set_user_cognitive_load") {
+      if (name === "set_user_cognitive_load") {
         const level = ["simple", "normal", "detailed", "step_by_step"].includes(args.level) ? args.level as CognitiveLoad : "step_by_step";
         setUserCognitiveLoad(level);
         if (level === "simple" || level === "step_by_step") setResponseScope((scope) => ({ ...scope, maxSentences: 2, onePointOnly: true }));
         output = { ok: true, level };
       }
-      if (message.name === "pause_and_wait") {
+      if (name === "pause_and_wait") {
         const reason = String(args.reason || "等待用户继续").trim();
         setStatusText(reason);
         output = { ok: true, paused: true, reason };
       }
-      if (message.name === "define_output_rubric") {
+      if (name === "define_output_rubric") {
         const criteria = normalizeLines(args.criteria).slice(0, 10);
         if (!criteria.length) output = { ok: false, error: "Missing rubric criteria." };
         else {
@@ -2080,7 +2094,7 @@ export function App() {
           output = { ok: true, criteria, generated: file.originalName };
         }
       }
-      if (message.name === "save_discussion_note") {
+      if (name === "save_discussion_note") {
         const kind = ["point", "decision", "question", "action"].includes(args.kind) ? args.kind as Note["kind"] : "point";
         const text = String(args.text || "").trim();
         if (text) {
@@ -2090,7 +2104,7 @@ export function App() {
           output = { ok: false, error: "Missing note text." };
         }
       }
-      if (message.name === "create_generated_file") {
+      if (name === "create_generated_file") {
         const title = String(args.title || "AI临时文案.md").trim();
         const text = String(args.text || "").trim();
         if (text) {
@@ -2100,7 +2114,7 @@ export function App() {
           output = { ok: false, error: "Missing generated file text." };
         }
       }
-      if (message.name === "generate_image") {
+      if (name === "generate_image") {
         const title = String(args.title || "AI生成图片.png").trim();
         const prompt = String(args.prompt || "").trim();
         const size = ["1024x1024", "1024x1536", "1536x1024"].includes(args.size) ? args.size : "1024x1024";
@@ -2112,7 +2126,7 @@ export function App() {
           output = { ok: false, error: "Missing image prompt." };
         }
       }
-      if (message.name === "copy_file_to_generated") {
+      if (name === "copy_file_to_generated") {
         const role = args.role === "primary" || args.role === "context" || args.role === "generated" ? args.role : undefined;
         const queryText = String(args.query || "").trim().toLowerCase();
         const candidate = state.files.find((file) => {
@@ -2127,7 +2141,7 @@ export function App() {
           output = { ok: false, error: "No matching file found to copy." };
         }
       }
-      if (message.name === "add_file_to_topic") {
+      if (name === "add_file_to_topic") {
         const queryText = String(args.query || "").trim().toLowerCase();
         const candidates = state.files.filter((file) => file.role === "context" || file.role === "generated");
         const file = (queryText
@@ -2140,7 +2154,7 @@ export function App() {
           output = { ok: false, error: "No matching resource or AI generated file found." };
         }
       }
-      if (message.name === "move_file_to_area") {
+      if (name === "move_file_to_area") {
         const role = args.role === "primary" || args.role === "context" || args.role === "generated" ? args.role as DiscuzFile["role"] : undefined;
         const queryText = String(args.query || "").trim().toLowerCase();
         const candidate = state.files.find((file) => {
@@ -2159,7 +2173,7 @@ export function App() {
           output = { ok: false, error: "No matching file or target area found." };
         }
       }
-      if (message.name === "update_generated_file") {
+      if (name === "update_generated_file") {
         const queryText = String(args.query || "").trim().toLowerCase();
         const text = String(args.text || "").trim();
         const candidate = state.files.find((file) => {
@@ -2175,7 +2189,7 @@ export function App() {
           output = { ok: false, error: "No editable generated text file or replacement text found." };
         }
       }
-      if (message.name === "propose_discussion_directions") {
+      if (name === "propose_discussion_directions") {
         const directions = (Array.isArray(args.directions) ? args.directions : [])
           .map((item: unknown) => String(item || "").trim())
           .filter(Boolean)
@@ -2187,7 +2201,7 @@ export function App() {
           output = { ok: false, error: "Missing discussion directions." };
         }
       }
-      if (message.name === "update_discussion_directions") {
+      if (name === "update_discussion_directions") {
         const directions = (Array.isArray(args.directions) ? args.directions : [])
           .map((item: unknown) => String(item || "").trim())
           .filter(Boolean)
@@ -2199,7 +2213,7 @@ export function App() {
           output = { ok: false, error: "Missing discussion directions." };
         }
       }
-      if (message.name === "add_discussion_directions") {
+      if (name === "add_discussion_directions") {
         const directions = (Array.isArray(args.directions) ? args.directions : [])
           .map((item: unknown) => String(item || "").trim())
           .filter(Boolean)
@@ -2211,7 +2225,7 @@ export function App() {
           output = { ok: false, error: "Missing discussion directions to add." };
         }
       }
-      if (message.name === "complete_discussion_direction") {
+      if (name === "complete_discussion_direction") {
         const queryText = String(args.query || "").trim().toLowerCase();
         const candidate = state.directions.find((direction, index) => {
           return direction.id === queryText || String(index + 1) === queryText || direction.text.toLowerCase().includes(queryText);
@@ -2223,7 +2237,7 @@ export function App() {
           output = { ok: false, error: "No matching discussion direction found." };
         }
       }
-      if (message.name === "confirm_discussion_topic") {
+      if (name === "confirm_discussion_topic") {
         const title = String(args.title || topicProposal?.title || "").trim();
         if (title) {
           await confirmDiscussionTopic(title, { notifyRealtime: false });
@@ -2236,7 +2250,7 @@ export function App() {
           output = { ok: false, error: "No pending discussion topic to confirm." };
         }
       }
-      if (message.name === "confirm_discussion_directions") {
+      if (name === "confirm_discussion_directions") {
         const directions = directionProposal?.directions ?? [];
         if (directions.length) {
           await confirmDirectionProposal(directions);
@@ -2249,7 +2263,7 @@ export function App() {
           output = { ok: false, error: "No pending discussion directions to confirm." };
         }
       }
-      if (message.name === "end_voice_discussion") {
+      if (name === "end_voice_discussion") {
         pendingVoiceStopAfterResponseRef.current = "awaiting_closing";
         setStatusText("正在结束讨论");
         output = {
@@ -2258,7 +2272,7 @@ export function App() {
           next: "Give one short Chinese closing response to the user. The app will disconnect voice after this response is done."
         };
       }
-      if (message.name === "propose_discussion_topic") {
+      if (name === "propose_discussion_topic") {
         const title = String(args.title || "").trim();
         const reason = String(args.reason || "").trim();
         const intent = args.intent === "drift" ? "drift" : "confirm";
@@ -2288,19 +2302,11 @@ export function App() {
       });
       finishTask();
     }
-    channel.send(JSON.stringify({
-      type: "conversation.item.create",
-      item: {
-        type: "function_call_output",
-        call_id: message.call_id,
-        output: JSON.stringify(output)
-      }
-    }));
-    requestRealtimeResponse();
+    return output;
   };
 
   useEffect(() => {
-    handleToolCallRef.current = handleToolCall;
+    executeRealtimeToolRef.current = executeRealtimeTool;
   });
 
   const finalizeDiscussionRecord = useCallback(async () => {
@@ -2385,18 +2391,18 @@ export function App() {
     voiceSessionRef.current += 1;
     if (voiceReconnectTimerRef.current) window.clearTimeout(voiceReconnectTimerRef.current);
     voiceReconnectTimerRef.current = null;
+    clearResponseWatchdog();
     pendingVoiceStopAfterResponseRef.current = "none";
     responseActiveRef.current = false;
     responsePendingRef.current = false;
-    dataChannelRef.current = null;
-    peerRef.current?.close();
-    peerRef.current = null;
+    realtimeSessionRef.current?.close();
+    realtimeSessionRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     stopVoiceMeter();
     setVoiceState("idle");
     setStatusText("Ready");
-  }, [stopVoiceMeter]);
+  }, [clearResponseWatchdog, stopVoiceMeter]);
 
   const stopVoice = useCallback(() => {
     disconnectVoice();
@@ -2409,8 +2415,8 @@ export function App() {
       pendingVoiceStopAfterResponseRef.current = "none";
       responseActiveRef.current = false;
       responsePendingRef.current = false;
-      dataChannelRef.current = null;
-      peerRef.current?.close();
+      realtimeSessionRef.current?.close();
+      realtimeSessionRef.current = null;
       streamRef.current?.getTracks().forEach((track) => track.stop());
       const startedAt = voiceSessionStartedAtRef.current;
       if (startedAt) {
@@ -2459,45 +2465,87 @@ export function App() {
       if (inputLabel) setStatusText(`使用输入设备：${inputLabel}`);
       streamRef.current = stream;
       startVoiceMeter(stream);
-      const peer = new RTCPeerConnection();
-      peerRef.current = peer;
-      stream.getTracks().forEach((track) => peer.addTrack(track, stream));
-      peer.ontrack = (event) => {
-        if (audioRef.current) {
-          audioRef.current.srcObject = event.streams[0];
-          audioRef.current.play().catch(() => undefined);
+      const bootstrapResponse = await fetch("/api/realtime/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ transport: "webrtc", sdk: "@openai/agents/realtime" })
+      });
+      const bootstrap = await bootstrapResponse.json() as RealtimeSessionBootstrap | { error?: string };
+      if (!bootstrapResponse.ok || !("clientSecret" in bootstrap)) {
+        const errorPayload = bootstrap as { error?: string };
+        throw new Error(errorPayload.error || "Unable to create realtime session");
+      }
+      if (sessionId !== voiceSessionRef.current) return;
+
+      const realtimeTools = bootstrap.tools.map((definition) => tool({
+        name: definition.name,
+        description: definition.description,
+        parameters: definition.parameters as any,
+        execute: async (args) => {
+          const executor = executeRealtimeToolRef.current;
+          if (!executor) return { ok: false, error: "Realtime tool executor is not ready." };
+          return executor(definition.name, (args ?? {}) as Record<string, any>);
         }
-        addVoiceOutputMeter(event.streams[0]);
-      };
-      peer.onconnectionstatechange = () => {
-        if (sessionId !== voiceSessionRef.current) return;
-        if (peer.connectionState === "connected") {
-          if (voiceReconnectTimerRef.current) window.clearTimeout(voiceReconnectTimerRef.current);
-          voiceReconnectTimerRef.current = null;
-          voiceSessionStartedAtRef.current ||= new Date().toISOString();
-          setVoiceState("live");
-          setStatusText("Live");
-        }
-        if (peer.connectionState === "disconnected") {
-          setStatusText("连接波动，正在恢复");
-          if (!voiceReconnectTimerRef.current) {
-            voiceReconnectTimerRef.current = window.setTimeout(() => {
+      }));
+      const agent = new RealtimeAgent({
+        name: bootstrap.settings.assistantName || "Discuz",
+        instructions: bootstrap.instructions,
+        voice: bootstrap.settings.realtimeVoice,
+        tools: realtimeTools
+      });
+      const transport = new OpenAIRealtimeWebRTC({
+        mediaStream: stream,
+        audioElement: audioRef.current ?? undefined,
+        changePeerConnection: (peer) => {
+          peer.addEventListener("track", (event) => {
+            if (event.streams[0]) addVoiceOutputMeter(event.streams[0]);
+          });
+          peer.addEventListener("connectionstatechange", () => {
+            if (sessionId !== voiceSessionRef.current) return;
+            if (peer.connectionState === "connected") {
+              if (voiceReconnectTimerRef.current) window.clearTimeout(voiceReconnectTimerRef.current);
               voiceReconnectTimerRef.current = null;
-              if (sessionId === voiceSessionRef.current && peer.connectionState === "disconnected") stopVoice();
-            }, 8000);
+              voiceSessionStartedAtRef.current ||= new Date().toISOString();
+              setVoiceState("live");
+              setStatusText("Live");
+            }
+            if (peer.connectionState === "disconnected") {
+              setStatusText("连接波动，正在恢复");
+              if (!voiceReconnectTimerRef.current) {
+                voiceReconnectTimerRef.current = window.setTimeout(() => {
+                  voiceReconnectTimerRef.current = null;
+                  if (sessionId === voiceSessionRef.current && peer.connectionState === "disconnected") stopVoice();
+                }, 8000);
+              }
+            }
+            if (["failed", "closed"].includes(peer.connectionState)) stopVoice();
+          });
+          return peer;
+        }
+      });
+      const session = new RealtimeSession(agent, {
+        model: bootstrap.model,
+        transport,
+        config: {
+          outputModalities: ["audio"],
+          toolChoice: "auto",
+          parallelToolCalls: true,
+          audio: {
+            input: {
+              transcription: bootstrap.audio.input?.transcription ?? { model: bootstrap.settings.transcriptionModel, language: "zh" }
+            },
+            output: { voice: bootstrap.audio.output?.voice ?? bootstrap.settings.realtimeVoice }
           }
         }
-        if (["failed", "closed"].includes(peer.connectionState)) stopVoice();
-      };
+      });
+      realtimeSessionRef.current = session;
 
-      const channel = peer.createDataChannel("oai-events");
-      dataChannelRef.current = channel;
-      channel.onmessage = (event) => {
+      session.on("transport_event", (message) => {
         if (sessionId !== voiceSessionRef.current) return;
         try {
-          const message = JSON.parse(event.data);
           if (message.type === "response.created") {
             responseActiveRef.current = true;
+            startResponseWatchdog();
             if (pendingVoiceStopAfterResponseRef.current === "awaiting_closing") {
               pendingVoiceStopAfterResponseRef.current = "closing_started";
             }
@@ -2505,6 +2553,7 @@ export function App() {
           }
           if (message.type === "response.done") {
             responseActiveRef.current = false;
+            clearResponseWatchdog();
             setVoiceState("live");
             if (pendingTaskCountRef.current === 0 && !backgroundParsingActiveRef.current) setStatusText("Live");
             if (pendingVoiceStopAfterResponseRef.current === "closing_started") {
@@ -2517,14 +2566,18 @@ export function App() {
             }
             window.setTimeout(() => flushRealtimeResponse(), 0);
           }
+          if (message.type === "response.cancelled" || message.type === "response.incomplete") {
+            responseActiveRef.current = false;
+            clearResponseWatchdog();
+            setVoiceState("live");
+            window.setTimeout(() => flushRealtimeResponse(), 0);
+          }
           if (message.type === "response.output_audio_transcript.delta") {
-            assistantRespondedSinceUserRef.current = true;
             assistantTranscriptRef.current += message.delta;
             setTranscript(assistantTranscriptRef.current.slice(-220));
           }
           if (message.type === "response.output_audio_transcript.done") {
             const text = String(message.transcript || assistantTranscriptRef.current || "").trim();
-            if (text) assistantRespondedSinceUserRef.current = true;
             if (text) saveMeetingMessage(text, "assistant").catch((err) => setError(err instanceof Error ? err.message : "Unable to save meeting record"));
             assistantTranscriptRef.current = "";
           }
@@ -2535,36 +2588,50 @@ export function App() {
           if (message.type === "conversation.item.input_audio_transcription.completed") {
             const text = String(message.transcript || userTranscriptRef.current || "").trim();
             if (text) {
-              assistantRespondedSinceUserRef.current = false;
               saveMeetingMessage(text, "user").catch((err) => setError(err instanceof Error ? err.message : "Unable to save meeting record"));
             }
             userTranscriptRef.current = "";
           }
-          if (message.type === "response.function_call_arguments.done") {
-            handleToolCallRef.current?.(message).catch((err) => setError(err.message));
-          }
           if (message.type === "error") {
             responseActiveRef.current = false;
+            clearResponseWatchdog();
             if (/active response in progress/i.test(message.error?.message || "")) responsePendingRef.current = true;
             setError(message.error?.message || "Realtime error");
             setVoiceState("error");
           }
         } catch {
-          setTranscript(String(event.data).slice(-220));
+          setTranscript(JSON.stringify(message).slice(-220));
         }
-      };
-
-      const offer = await peer.createOffer();
-      if (sessionId !== voiceSessionRef.current) return;
-      await peer.setLocalDescription(offer);
-      const response = await fetch("/api/realtime/session", {
-        method: "POST",
-        headers: { "Content-Type": "application/sdp" },
-        body: offer.sdp
       });
+      session.on("audio_start", () => {
+        if (sessionId !== voiceSessionRef.current) return;
+        responseActiveRef.current = true;
+        setVoiceState("thinking");
+        startResponseWatchdog();
+      });
+      session.on("audio_stopped", () => {
+        if (sessionId !== voiceSessionRef.current) return;
+        setVoiceState(responseActiveRef.current ? "thinking" : "live");
+      });
+      session.on("audio_interrupted", () => {
+        if (sessionId !== voiceSessionRef.current) return;
+        responseActiveRef.current = false;
+        clearResponseWatchdog();
+        setVoiceState("live");
+      });
+      session.on("error", (sessionError) => {
+        if (sessionId !== voiceSessionRef.current) return;
+        responseActiveRef.current = false;
+        clearResponseWatchdog();
+        setError(sessionError.error instanceof Error ? sessionError.error.message : "Realtime error");
+        setVoiceState("error");
+      });
+
+      await session.connect({ apiKey: bootstrap.clientSecret, model: bootstrap.model });
       if (sessionId !== voiceSessionRef.current) return;
-      if (!response.ok) throw new Error(await response.text());
-      await peer.setRemoteDescription({ type: "answer", sdp: await response.text() });
+      voiceSessionStartedAtRef.current ||= new Date().toISOString();
+      setVoiceState("live");
+      setStatusText("Live");
     } catch (err) {
       if (sessionId !== voiceSessionRef.current) return;
       stopVoice();
@@ -4194,24 +4261,32 @@ const SettingsPopover = forwardRef<HTMLElement, {
     }
   };
 
-  const saveAiSettings = async () => {
+  const saveAiSettings = async (patch: Record<string, unknown> = {}) => {
     setSaving(true);
     setMessage("");
     try {
+      const payload = { ...aiDraft, ...patch };
       const response = await fetch("/api/settings/ai", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(aiDraft)
+        body: JSON.stringify(payload)
       });
       if (!response.ok) throw new Error(await response.text());
       const nextSettings = await response.json();
       onSettingsSaved(nextSettings);
+      setAiDraft(nextSettings.ai);
       setMessage("AI 设定已保存");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "AI 设定保存失败");
     } finally {
       setSaving(false);
     }
+  };
+
+  const secretStatus = (configured?: boolean, source?: "local" | "env" | "none") => configured ? `已配置：${source}` : "未配置";
+
+  const clearSearchKey = (secretName: string, fieldName: keyof AiSettings) => {
+    void saveAiSettings({ clearWebSearchKeys: [secretName], [fieldName]: "" });
   };
 
   const uploadWallpaper = async (files: FileList | null) => {
@@ -4350,35 +4425,126 @@ const SettingsPopover = forwardRef<HTMLElement, {
               onChange={(value) => setAiDraft((draft) => ({ ...draft, imageQuality: value as AiSettings["imageQuality"] }))}
             />
           </label>
-          <label>
-            回答长度
-            <GlassSelect
-              value={aiDraft.responseLength}
-              options={[
-                { value: "short", label: "短" },
-                { value: "medium", label: "中" },
-                { value: "long", label: "长" }
-              ]}
-              onChange={(value) => setAiDraft((draft) => ({ ...draft, responseLength: value as AiSettings["responseLength"] }))}
-            />
-          </label>
           <label className="wide">
-            语气风格
+            搜索提供方顺序
             <input
-              value={aiDraft.responseTone}
-              onChange={(event) => setAiDraft((draft) => ({ ...draft, responseTone: event.target.value }))}
-            />
-          </label>
-          <label className="wide">
-            图片风格
-            <input
-              value={aiDraft.visualStyle}
-              onChange={(event) => setAiDraft((draft) => ({ ...draft, visualStyle: event.target.value }))}
+              value={aiDraft.webSearchProviders}
+              onChange={(event) => setAiDraft((draft) => ({ ...draft, webSearchProviders: event.target.value }))}
+              placeholder="brave,bing,google,serpapi,tavily,duckduckgo,wikipedia"
             />
           </label>
         </div>
+
+        <div className="settings-section-title search-settings-title">
+          <strong>搜索 API Key</strong>
+          <span>留空不变，输入可替换</span>
+        </div>
+        <div className="ai-settings-grid search-key-grid">
+          <label>
+            Brave
+            <input
+              type="password"
+              value={aiDraft.braveSearchApiKey || ""}
+              onChange={(event) => setAiDraft((draft) => ({ ...draft, braveSearchApiKey: event.target.value }))}
+              placeholder={secretStatus(aiDraft.braveSearchApiKeyConfigured, aiDraft.braveSearchApiKeySource)}
+              autoComplete="off"
+            />
+            <button
+              type="button"
+              disabled={saving || aiDraft.braveSearchApiKeySource !== "local"}
+              onClick={() => clearSearchKey("brave", "braveSearchApiKey")}
+            >
+              清除
+            </button>
+          </label>
+          <label>
+            Bing
+            <input
+              type="password"
+              value={aiDraft.bingSearchApiKey || ""}
+              onChange={(event) => setAiDraft((draft) => ({ ...draft, bingSearchApiKey: event.target.value }))}
+              placeholder={secretStatus(aiDraft.bingSearchApiKeyConfigured, aiDraft.bingSearchApiKeySource)}
+              autoComplete="off"
+            />
+            <button
+              type="button"
+              disabled={saving || aiDraft.bingSearchApiKeySource !== "local"}
+              onClick={() => clearSearchKey("bing", "bingSearchApiKey")}
+            >
+              清除
+            </button>
+          </label>
+          <label>
+            Google API Key
+            <input
+              type="password"
+              value={aiDraft.googleSearchApiKey || ""}
+              onChange={(event) => setAiDraft((draft) => ({ ...draft, googleSearchApiKey: event.target.value }))}
+              placeholder={secretStatus(aiDraft.googleSearchApiKeyConfigured, aiDraft.googleSearchApiKeySource)}
+              autoComplete="off"
+            />
+            <button
+              type="button"
+              disabled={saving || aiDraft.googleSearchApiKeySource !== "local"}
+              onClick={() => clearSearchKey("google", "googleSearchApiKey")}
+            >
+              清除
+            </button>
+          </label>
+          <label>
+            Google Engine ID
+            <input
+              type="password"
+              value={aiDraft.googleSearchEngineId || ""}
+              onChange={(event) => setAiDraft((draft) => ({ ...draft, googleSearchEngineId: event.target.value }))}
+              placeholder={secretStatus(aiDraft.googleSearchEngineIdConfigured, aiDraft.googleSearchEngineIdSource)}
+              autoComplete="off"
+            />
+            <button
+              type="button"
+              disabled={saving || aiDraft.googleSearchEngineIdSource !== "local"}
+              onClick={() => clearSearchKey("googleEngine", "googleSearchEngineId")}
+            >
+              清除
+            </button>
+          </label>
+          <label>
+            SerpAPI
+            <input
+              type="password"
+              value={aiDraft.serpApiKey || ""}
+              onChange={(event) => setAiDraft((draft) => ({ ...draft, serpApiKey: event.target.value }))}
+              placeholder={secretStatus(aiDraft.serpApiKeyConfigured, aiDraft.serpApiKeySource)}
+              autoComplete="off"
+            />
+            <button
+              type="button"
+              disabled={saving || aiDraft.serpApiKeySource !== "local"}
+              onClick={() => clearSearchKey("serpapi", "serpApiKey")}
+            >
+              清除
+            </button>
+          </label>
+          <label>
+            Tavily
+            <input
+              type="password"
+              value={aiDraft.tavilyApiKey || ""}
+              onChange={(event) => setAiDraft((draft) => ({ ...draft, tavilyApiKey: event.target.value }))}
+              placeholder={secretStatus(aiDraft.tavilyApiKeyConfigured, aiDraft.tavilyApiKeySource)}
+              autoComplete="off"
+            />
+            <button
+              type="button"
+              disabled={saving || aiDraft.tavilyApiKeySource !== "local"}
+              onClick={() => clearSearchKey("tavily", "tavilyApiKey")}
+            >
+              清除
+            </button>
+          </label>
+        </div>
         <div className="settings-actions">
-          <button disabled={saving} onClick={saveAiSettings}>保存 AI 设定</button>
+          <button disabled={saving} onClick={() => saveAiSettings()}>保存 AI 设定</button>
         </div>
       </section>
 
