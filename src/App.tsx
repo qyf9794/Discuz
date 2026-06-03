@@ -275,6 +275,29 @@ function toolCallLabel(name = "任务") {
   } as Record<string, string>)[name] || name;
 }
 
+function realtimeEventToolName(...values: unknown[]) {
+  const queue = [...values];
+  while (queue.length) {
+    const value = queue.shift();
+    if (!value || typeof value !== "object") continue;
+    const record = value as Record<string, unknown>;
+    const direct = record.name || record.toolName || record.tool_name;
+    if (typeof direct === "string" && direct.trim()) return direct.trim();
+    const tool = record.tool;
+    if (tool && typeof tool === "object") {
+      const toolRecord = tool as Record<string, unknown>;
+      const name = toolRecord.name || toolRecord.toolName || toolRecord.tool_name;
+      if (typeof name === "string" && name.trim()) return name.trim();
+      queue.push(tool);
+    }
+    ["item", "call", "details", "info"].forEach((key) => {
+      const nested = record[key];
+      if (nested && typeof nested === "object") queue.push(nested);
+    });
+  }
+  return "";
+}
+
 type OfficeAnalysisKind = "word" | "spreadsheet" | "presentation";
 
 function selectOfficeFile(files: DiscuzFile[], kind: OfficeAnalysisKind, role?: DiscuzFile["role"], query = "") {
@@ -554,6 +577,7 @@ export function App() {
   const streamRef = useRef<MediaStream | null>(null);
   const realtimeSessionRef = useRef<RealtimeSession | null>(null);
   const executeRealtimeToolRef = useRef<((_name: string, _args: Record<string, any>) => Promise<unknown>) | null>(null);
+  const requestRealtimeResponseRef = useRef<() => boolean>(() => false);
   const responseActiveRef = useRef(false);
   const responsePendingRef = useRef(false);
   const topicFileChangeBlocksTopicProposalRef = useRef(false);
@@ -561,6 +585,9 @@ export function App() {
   const voiceSessionStartedAtRef = useRef<string | null>(null);
   const voiceReconnectTimerRef = useRef<number | null>(null);
   const responseWatchdogTimerRef = useRef<number | null>(null);
+  const responseTaskTimerRef = useRef<number | null>(null);
+  const continuationNudgeTimerRef = useRef<number | null>(null);
+  const activeTaskFinishersRef = useRef<Record<string, () => void>>({});
   const voiceMeterRef = useRef<VoiceMeter | null>(null);
   const pendingVoiceStopAfterResponseRef = useRef<PendingVoiceStop>("none");
   const pendingTaskCountRef = useRef(0);
@@ -1006,6 +1033,50 @@ export function App() {
     };
   }, []);
 
+  const beginUniqueTask = useCallback((key: string, label: string) => {
+    const existing = activeTaskFinishersRef.current[key];
+    if (existing) return existing;
+    const finishTask = beginTask(label);
+    const finish = () => {
+      if (!activeTaskFinishersRef.current[key]) return;
+      delete activeTaskFinishersRef.current[key];
+      finishTask();
+    };
+    activeTaskFinishersRef.current[key] = finish;
+    return finish;
+  }, [beginTask]);
+
+  const finishUniqueTask = useCallback((key: string) => {
+    activeTaskFinishersRef.current[key]?.();
+  }, []);
+
+  const finishAllVisibleTasks = useCallback(() => {
+    Object.values(activeTaskFinishersRef.current).forEach((finish) => finish());
+    activeTaskFinishersRef.current = {};
+    if (responseTaskTimerRef.current) window.clearTimeout(responseTaskTimerRef.current);
+    responseTaskTimerRef.current = null;
+    if (continuationNudgeTimerRef.current) window.clearTimeout(continuationNudgeTimerRef.current);
+    continuationNudgeTimerRef.current = null;
+    pendingTaskCountRef.current = 0;
+    activeTaskLabelRef.current = "";
+    setPendingTasks([]);
+  }, []);
+
+  const scheduleResponseTask = useCallback((label = "AI整理结果") => {
+    if (responseTaskTimerRef.current || activeTaskFinishersRef.current.response) return;
+    responseTaskTimerRef.current = window.setTimeout(() => {
+      responseTaskTimerRef.current = null;
+      if (!responseActiveRef.current || pendingTaskCountRef.current > 0) return;
+      beginUniqueTask("response", label);
+    }, 650);
+  }, [beginUniqueTask]);
+
+  const finishResponseTask = useCallback(() => {
+    if (responseTaskTimerRef.current) window.clearTimeout(responseTaskTimerRef.current);
+    responseTaskTimerRef.current = null;
+    finishUniqueTask("response");
+  }, [finishUniqueTask]);
+
   const summarizeToolResult = (value: unknown) => {
     const result = value as Record<string, unknown>;
     if (result?.error) return String(result.error);
@@ -1279,13 +1350,11 @@ export function App() {
       realtimeSessionRef.current?.interrupt();
       responseActiveRef.current = false;
       responsePendingRef.current = false;
-      pendingTaskCountRef.current = 0;
-      activeTaskLabelRef.current = "";
-      setPendingTasks([]);
+      finishAllVisibleTasks();
       setStatusText("上一轮响应超时，已恢复");
       setVoiceState((state) => state === "thinking" ? "live" : state);
     }, 30000);
-  }, [clearResponseWatchdog]);
+  }, [clearResponseWatchdog, finishAllVisibleTasks]);
 
   const requestRealtimeResponse = useCallback(() => {
     const session = realtimeSessionRef.current;
@@ -1299,9 +1368,14 @@ export function App() {
     responseActiveRef.current = true;
     responsePendingRef.current = false;
     requestResponse();
+    scheduleResponseTask("AI处理中");
     startResponseWatchdog();
     return true;
-  }, [startResponseWatchdog]);
+  }, [scheduleResponseTask, startResponseWatchdog]);
+
+  useEffect(() => {
+    requestRealtimeResponseRef.current = requestRealtimeResponse;
+  }, [requestRealtimeResponse]);
 
   const sendRealtimeSystemEvent = (text: string, options: { blockTopicProposal?: boolean } = {}) => {
     const session = realtimeSessionRef.current;
@@ -1320,6 +1394,18 @@ export function App() {
     if (!responsePendingRef.current) return;
     requestRealtimeResponse();
   }, [requestRealtimeResponse]);
+
+  const scheduleContinuationResponse = useCallback((label = "AI继续回答") => {
+    if (continuationNudgeTimerRef.current) window.clearTimeout(continuationNudgeTimerRef.current);
+    continuationNudgeTimerRef.current = window.setTimeout(() => {
+      continuationNudgeTimerRef.current = null;
+      const session = realtimeSessionRef.current;
+      if (!session || typeof session.transport.requestResponse !== "function") return;
+      if (responseActiveRef.current || pendingVoiceStopAfterResponseRef.current !== "none") return;
+      beginUniqueTask("response", label);
+      requestRealtimeResponse();
+    }, 850);
+  }, [beginUniqueTask, requestRealtimeResponse]);
 
   const notifyForegroundDiscussion = (title: string, text: string) => {
     realtimeSessionRef.current?.sendMessage(`系统事件：用户打开了前台讨论窗口《${title}》。这个窗口现在是当前临时讨论对象，请先阅读以下内容，再围绕它继续讨论。\n\n${text.slice(0, 6000)}`);
@@ -1505,10 +1591,11 @@ export function App() {
         clearResponseWatchdog();
       }
       session.sendMessage(`系统事件：用户已确认讨论主题《${confirmedTitle}》。请立即基于当前主题、主题文件和用户输入调用 propose_discussion_directions，提出 1 到 3 个讨论方向供用户确认，一次最多 3 个。语音只用自然短句说明你会列出方向并请用户删改，不要使用固定话术。如果用户明确要求增加方向，调用 add_discussion_directions 追加 1 到 3 个；如果用户不满意，优先调用 update_discussion_directions 快速替换完整列表；如果用户只是不想要某一条，提醒他可以直接点圆圈右侧删除。`);
+      window.setTimeout(() => requestRealtimeResponseRef.current(), 0);
     }
   };
 
-  const confirmDirectionProposal = async (directions: string[]) => {
+  const confirmDirectionProposal = async (directions: string[], options: { notifyRealtime?: boolean } = {}) => {
     const response = await fetch("/api/directions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1525,6 +1612,24 @@ export function App() {
     }));
     setDirectionProposal(null);
     setStatusText("讨论方向已确认");
+    const confirmedDirections = (payload.directions ?? []).map((direction: DiscussionDirection, index: number) => (
+      `${index + 1}. ${direction.completed ? "已完成" : "未完成"}｜${direction.text}`
+    )).join("\n");
+    const session = realtimeSessionRef.current;
+    if (options.notifyRealtime !== false && session) {
+      if (responseActiveRef.current) {
+        session.interrupt();
+        responseActiveRef.current = false;
+        clearResponseWatchdog();
+      }
+      session.sendMessage([
+        "系统事件：用户已点击确认讨论方向 todo。",
+        `当前已确认讨论主题：${state.discussionTopic || "未命名主题"}`,
+        confirmedDirections ? `当前讨论方向与完成状态：\n${confirmedDirections}` : "当前没有讨论方向。",
+        "请立即承接这个状态，只用一句自然短句确认已记录，并询问用户想先从哪个方向开始。不要再次要求用户确认这些方向，除非用户提出修改。"
+      ].join("\n\n"));
+      window.setTimeout(() => requestRealtimeResponseRef.current(), 0);
+    }
   };
 
   const addDiscussionDirections = async (directions: string[]) => {
@@ -1578,17 +1683,15 @@ export function App() {
     realtimeSessionRef.current?.interrupt();
     responseActiveRef.current = false;
     responsePendingRef.current = false;
-    pendingTaskCountRef.current = 0;
-    activeTaskLabelRef.current = "";
-    setPendingTasks([]);
+    finishAllVisibleTasks();
     setToolActivities((items) => items.map((item) => item.status === "running" ? { ...item, status: "cancelled", endedAt: new Date().toISOString(), result: "用户取消" } : item));
     setStatusText("已取消当前任务");
-  }, []);
+  }, [finishAllVisibleTasks]);
 
   const executeRealtimeTool = async (name: string, args: Record<string, any> = {}) => {
     const label = toolCallLabel(name);
     const activityId = createToolActivity(label, name);
-    const finishTask = beginTask(label);
+    const finishTask = beginUniqueTask(`tool-${name}`, label);
     let output = {};
     try {
       if (name === "search_context") {
@@ -2207,7 +2310,7 @@ export function App() {
           .filter(Boolean)
           .slice(0, 8);
         if (directions.length) {
-          await confirmDirectionProposal(directions);
+          await confirmDirectionProposal(directions, { notifyRealtime: false });
           output = { ok: true, directions };
         } else {
           output = { ok: false, error: "Missing discussion directions." };
@@ -2253,7 +2356,7 @@ export function App() {
       if (name === "confirm_discussion_directions") {
         const directions = directionProposal?.directions ?? [];
         if (directions.length) {
-          await confirmDirectionProposal(directions);
+          await confirmDirectionProposal(directions, { notifyRealtime: false });
           output = {
             ok: true,
             confirmed: directions,
@@ -2301,6 +2404,8 @@ export function App() {
         result: summarizeToolResult(output)
       });
       finishTask();
+      scheduleResponseTask("AI整理结果");
+      scheduleContinuationResponse("AI继续回答");
     }
     return output;
   };
@@ -2395,6 +2500,7 @@ export function App() {
     pendingVoiceStopAfterResponseRef.current = "none";
     responseActiveRef.current = false;
     responsePendingRef.current = false;
+    finishAllVisibleTasks();
     realtimeSessionRef.current?.close();
     realtimeSessionRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
@@ -2402,7 +2508,7 @@ export function App() {
     stopVoiceMeter();
     setVoiceState("idle");
     setStatusText("Ready");
-  }, [clearResponseWatchdog, stopVoiceMeter]);
+  }, [clearResponseWatchdog, finishAllVisibleTasks, stopVoiceMeter]);
 
   const stopVoice = useCallback(() => {
     disconnectVoice();
@@ -2540,20 +2646,47 @@ export function App() {
       });
       realtimeSessionRef.current = session;
 
+      session.on("agent_tool_start", (...values: unknown[]) => {
+        if (sessionId !== voiceSessionRef.current) return;
+        const name = realtimeEventToolName(...values);
+        const label = toolCallLabel(name || "任务");
+        finishUniqueTask(`approval-${name || "tool"}`);
+        finishResponseTask();
+        beginUniqueTask(`tool-${name || label}`, label);
+      });
+      session.on("agent_tool_end", (...values: unknown[]) => {
+        if (sessionId !== voiceSessionRef.current) return;
+        const name = realtimeEventToolName(...values);
+        const label = toolCallLabel(name || "任务");
+        finishUniqueTask(`tool-${name || label}`);
+        if (responseActiveRef.current) scheduleResponseTask("AI整理结果");
+        scheduleContinuationResponse("AI继续回答");
+      });
+      session.on("tool_approval_requested", (...values: unknown[]) => {
+        if (sessionId !== voiceSessionRef.current) return;
+        const name = realtimeEventToolName(...values);
+        beginUniqueTask(`approval-${name || "tool"}`, `${toolCallLabel(name || "工具")}等待确认`);
+      });
       session.on("transport_event", (message) => {
         if (sessionId !== voiceSessionRef.current) return;
         try {
           if (message.type === "response.created") {
+            if (continuationNudgeTimerRef.current) window.clearTimeout(continuationNudgeTimerRef.current);
+            continuationNudgeTimerRef.current = null;
             responseActiveRef.current = true;
             startResponseWatchdog();
+            scheduleResponseTask("AI处理中");
             if (pendingVoiceStopAfterResponseRef.current === "awaiting_closing") {
               pendingVoiceStopAfterResponseRef.current = "closing_started";
             }
             setVoiceState("thinking");
           }
           if (message.type === "response.done") {
+            if (continuationNudgeTimerRef.current) window.clearTimeout(continuationNudgeTimerRef.current);
+            continuationNudgeTimerRef.current = null;
             responseActiveRef.current = false;
             clearResponseWatchdog();
+            finishResponseTask();
             setVoiceState("live");
             if (pendingTaskCountRef.current === 0 && !backgroundParsingActiveRef.current) setStatusText("Live");
             if (pendingVoiceStopAfterResponseRef.current === "closing_started") {
@@ -2567,8 +2700,11 @@ export function App() {
             window.setTimeout(() => flushRealtimeResponse(), 0);
           }
           if (message.type === "response.cancelled" || message.type === "response.incomplete") {
+            if (continuationNudgeTimerRef.current) window.clearTimeout(continuationNudgeTimerRef.current);
+            continuationNudgeTimerRef.current = null;
             responseActiveRef.current = false;
             clearResponseWatchdog();
+            finishResponseTask();
             setVoiceState("live");
             window.setTimeout(() => flushRealtimeResponse(), 0);
           }
@@ -2595,6 +2731,7 @@ export function App() {
           if (message.type === "error") {
             responseActiveRef.current = false;
             clearResponseWatchdog();
+            finishAllVisibleTasks();
             if (/active response in progress/i.test(message.error?.message || "")) responsePendingRef.current = true;
             setError(message.error?.message || "Realtime error");
             setVoiceState("error");
@@ -2605,7 +2742,10 @@ export function App() {
       });
       session.on("audio_start", () => {
         if (sessionId !== voiceSessionRef.current) return;
+        if (continuationNudgeTimerRef.current) window.clearTimeout(continuationNudgeTimerRef.current);
+        continuationNudgeTimerRef.current = null;
         responseActiveRef.current = true;
+        finishResponseTask();
         setVoiceState("thinking");
         startResponseWatchdog();
       });
@@ -2617,12 +2757,14 @@ export function App() {
         if (sessionId !== voiceSessionRef.current) return;
         responseActiveRef.current = false;
         clearResponseWatchdog();
+        finishResponseTask();
         setVoiceState("live");
       });
       session.on("error", (sessionError) => {
         if (sessionId !== voiceSessionRef.current) return;
         responseActiveRef.current = false;
         clearResponseWatchdog();
+        finishAllVisibleTasks();
         setError(sessionError.error instanceof Error ? sessionError.error.message : "Realtime error");
         setVoiceState("error");
       });
@@ -2846,12 +2988,7 @@ export function App() {
       <div className="light-wash" />
       <div className="bottom-discussion-bar">
         <StatusLogPanel ref={statusLogRef} entries={statusLog} transcript={transcript} />
-        {visibleTasks.length ? (
-          <TaskIndicator tasks={visibleTasks} />
-        ) : (
-          <VoiceStatusBubble state={voiceState} statusText={statusText} ambientMode={ambientMode} />
-        )}
-        <ToolActivityPanel activities={toolActivities} onCancel={cancelCurrentTask} />
+        {visibleTasks.length ? <TaskIndicator tasks={visibleTasks} /> : null}
         <form
           className="discussion-text-form"
           onSubmit={(event) => {
@@ -3463,54 +3600,6 @@ function TaskIndicator({ tasks }: { tasks: TaskItem[] }) {
           ))}
         </ul>
       )}
-    </div>
-  );
-}
-
-function VoiceStatusBubble({ state, statusText, ambientMode }: { state: VoiceState; statusText: string; ambientMode: boolean }) {
-  const text = (() => {
-    const status = statusText.trim();
-    if (status && !["Ready", "Live", "Connecting", "Error"].includes(status)) return status;
-    if (ambientMode) return "氛围模式";
-    if (state === "connecting") return "连接中";
-    if (state === "thinking") return "思考中";
-    if (state === "live") return "听取中";
-    if (state === "error") return "连接错误";
-    return "待机";
-  })();
-  if (text === "待机") return null;
-  return (
-    <div className={`voice-status-bubble ${state}`}>
-      <span />
-      {text}
-    </div>
-  );
-}
-
-function ToolActivityPanel({ activities, onCancel }: { activities: ToolActivity[]; onCancel: () => void }) {
-  const visible = activities.slice(0, 1);
-  if (!visible.length) return null;
-  return (
-    <div className="tool-activity-panel" aria-label="AI工具活动">
-      {visible.map((activity) => (
-        <details key={activity.id} className={`tool-activity-card ${activity.status}`} open={activity.status === "running"}>
-          <summary>
-            <span className="tool-activity-dot" />
-            <strong>{activity.label}</strong>
-            <em>{activity.status === "running" ? "执行中" : activity.status === "done" ? "完成" : activity.status === "failed" ? "失败" : "已取消"}</em>
-            {activity.status === "running" && (
-              <button type="button" title="取消当前任务" onClick={(event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                onCancel();
-              }}>
-                <X size={12} />
-              </button>
-            )}
-          </summary>
-          <p>{activity.result || activity.detail || "等待结果..."}</p>
-        </details>
-      ))}
     </div>
   );
 }

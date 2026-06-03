@@ -2316,8 +2316,7 @@ a.icon-button {
   font-weight: 720;
 }
 
-.task-indicator,
-.voice-status-bubble {
+.task-indicator {
   position: relative;
   grid-column: 1;
   grid-row: 1;
@@ -2363,36 +2362,6 @@ a.icon-button {
   cursor: pointer;
 }
 
-.voice-status-bubble {
-  bottom: calc(var(--discussion-input-lift) + 44px + var(--voice-input-gap) + 54px);
-  gap: 8px;
-  padding: 0 11px;
-  border-color: transparent;
-  background: transparent;
-  color: rgba(58, 72, 84, 0.86);
-  box-shadow: none;
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
-}
-
-.voice-status-bubble span {
-  width: 8px;
-  height: 8px;
-  border-radius: 999px;
-  background: rgba(133, 145, 154, 0.75);
-}
-
-.voice-status-bubble.live span {
-  background: #22c55e;
-  box-shadow: 0 0 12px rgba(34, 197, 94, 0.36);
-}
-
-.voice-status-bubble.thinking span,
-.voice-status-bubble.connecting span {
-  background: #087d8c;
-  animation: task-indicator-pulse 1s ease-in-out infinite;
-}
-
 .task-indicator svg {
   flex: 0 0 auto;
   animation: task-indicator-pulse 1s ease-in-out infinite;
@@ -2431,99 +2400,6 @@ a.icon-button {
   background: rgba(8, 125, 140, 0.68);
 }
 
-.tool-activity-panel {
-  position: absolute;
-  left: 50%;
-  bottom: 190px;
-  display: grid;
-  width: min(380px, calc(100vw - 32px));
-  gap: 7px;
-  pointer-events: auto;
-  transform: translateX(-50%);
-}
-
-.tool-activity-card {
-  overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.42);
-  border-radius: 14px;
-  background: rgba(255, 255, 255, 0.5);
-  box-shadow: 0 10px 28px rgba(9, 18, 28, 0.1);
-  backdrop-filter: blur(16px) saturate(1.08);
-  -webkit-backdrop-filter: blur(16px) saturate(1.08);
-}
-
-.tool-activity-card summary {
-  display: grid;
-  grid-template-columns: 10px minmax(0, 1fr) auto auto;
-  align-items: center;
-  gap: 8px;
-  min-height: 34px;
-  padding: 0 10px;
-  cursor: pointer;
-  list-style: none;
-}
-
-.tool-activity-card summary::-webkit-details-marker {
-  display: none;
-}
-
-.tool-activity-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 999px;
-  background: #087d8c;
-}
-
-.tool-activity-card.running .tool-activity-dot {
-  animation: task-indicator-pulse 1s ease-in-out infinite;
-}
-
-.tool-activity-card.done .tool-activity-dot {
-  background: #22c55e;
-}
-
-.tool-activity-card.failed .tool-activity-dot {
-  background: #b42318;
-}
-
-.tool-activity-card.cancelled .tool-activity-dot {
-  background: rgba(91, 105, 116, 0.72);
-}
-
-.tool-activity-card strong {
-  overflow: hidden;
-  color: rgba(28, 42, 55, 0.9);
-  font-size: 12px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.tool-activity-card em {
-  color: rgba(83, 99, 112, 0.72);
-  font-size: 11px;
-  font-style: normal;
-  font-weight: 760;
-}
-
-.tool-activity-card button {
-  display: grid;
-  width: 22px;
-  height: 22px;
-  place-items: center;
-  border: 0;
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.48);
-  color: rgba(88, 46, 38, 0.82);
-}
-
-.tool-activity-card p {
-  margin: 0;
-  padding: 0 10px 10px 28px;
-  color: rgba(56, 70, 82, 0.82);
-  font-size: 11px;
-  line-height: 1.45;
-}
-
 @keyframes task-indicator-pulse {
   0%,
   100% {
@@ -2546,9 +2422,7 @@ a.icon-button {
   }
 
   .status-log-panel,
-  .task-indicator,
-  .voice-status-bubble,
-  .tool-activity-panel {
+  .task-indicator {
     display: none;
   }
 
