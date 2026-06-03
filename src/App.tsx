@@ -62,6 +62,7 @@ type PanelId = "topic" | "resources" | "generated" | "record";
 type ToolId = "whiteboard" | "draft" | "image" | "video" | "audio";
 type StatusLogEntry = { id: string; kind: "status" | "error"; text: string; createdAt: string };
 type TaskItem = { id: string; label: string; startedAt: string };
+type ToolActivity = { id: string; label: string; status: "running" | "done" | "failed" | "cancelled"; startedAt: string; endedAt?: string; detail?: string; result?: string };
 type RealtimeToolCall = { name?: string; arguments?: string; call_id?: string };
 type BoardItem = { id: string; kind: "text" | "image"; value: string; x: number; y: number };
 type BoardLink = { id: string; from: string; to: string };
@@ -187,6 +188,12 @@ function toolCallLabel(name = "任务") {
     get_discussion_state: "读取讨论状态",
     ask_user_confirmation: "请求用户确认",
     queue_task: "加入任务队列",
+    start_break: "开始休息",
+    resume_discussion: "继续讨论",
+    open_media_url: "打开媒体",
+    set_ambient_mode: "设置氛围模式",
+    show_tool_activity: "查看工具活动",
+    cancel_current_task: "取消当前任务",
     edit_spreadsheet_file: "编辑表格请求",
     create_outline: "生成大纲",
     compare_files: "比较文件",
@@ -488,6 +495,9 @@ export function App() {
   const [statusText, setStatusText] = useState("Ready");
   const [error, setError] = useState("");
   const [pendingTasks, setPendingTasks] = useState<TaskItem[]>([]);
+  const [toolActivities, setToolActivities] = useState<ToolActivity[]>([]);
+  const [breakUntil, setBreakUntil] = useState<string | null>(null);
+  const [ambientMode, setAmbientMode] = useState(false);
   const [statusLog, setStatusLog] = useState<StatusLogEntry[]>(() => [{
     id: crypto.randomUUID(),
     kind: "status",
@@ -711,6 +721,24 @@ export function App() {
   }, [outputRubric]);
 
   useEffect(() => {
+    if (!breakUntil) return;
+    const updateBreakStatus = () => {
+      const remainingMs = new Date(breakUntil).getTime() - Date.now();
+      if (remainingMs <= 0) {
+        setBreakUntil(null);
+        setStatusText("休息结束，可以继续讨论");
+        return;
+      }
+      const minutes = Math.floor(remainingMs / 60000);
+      const seconds = Math.ceil((remainingMs % 60000) / 1000);
+      setStatusText(`休息中 ${minutes}:${String(seconds).padStart(2, "0")}`);
+    };
+    updateBreakStatus();
+    const timer = window.setInterval(updateBreakStatus, 1000);
+    return () => window.clearInterval(timer);
+  }, [breakUntil]);
+
+  useEffect(() => {
     if (!settingsOpen) return;
     const closeOnOutsidePointer = (event: PointerEvent) => {
       const target = event.target as Node | null;
@@ -918,6 +946,36 @@ export function App() {
     utterance.pitch = 1.08;
     window.speechSynthesis.speak(utterance);
   }, []);
+
+  const summarizeToolResult = (value: unknown) => {
+    const result = value as Record<string, unknown>;
+    if (result?.error) return String(result.error);
+    if (result?.opened) return `已打开：${String(result.opened)}`;
+    if (result?.generated) return `已生成：${String(result.generated)}`;
+    if (result?.downloaded) return `已下载：${String(result.downloaded)}`;
+    if (result?.saved) return `已保存：${String(result.saved)}`;
+    if (result?.analysis) return compactText(String(result.analysis), 120);
+    if (result?.paused) return "已暂停等待";
+    if (result?.breakUntil) return "休息计时已开始";
+    return compactText(JSON.stringify(value), 140);
+  };
+
+  const createToolActivity = (label: string, detail = "") => {
+    const id = crypto.randomUUID();
+    const activity: ToolActivity = {
+      id,
+      label,
+      status: "running",
+      startedAt: new Date().toISOString(),
+      detail
+    };
+    setToolActivities((items) => [activity, ...items].slice(0, 12));
+    return id;
+  };
+
+  const updateToolActivity = (id: string, patch: Partial<ToolActivity>) => {
+    setToolActivities((items) => items.map((item) => item.id === id ? { ...item, ...patch, endedAt: patch.endedAt ?? item.endedAt } : item));
+  };
 
   const setPrimary = async (files: FileList | File[]) => {
     const list = Array.from(files);
@@ -1433,6 +1491,17 @@ export function App() {
     }));
   };
 
+  const cancelCurrentTask = useCallback(() => {
+    dataChannelRef.current?.send(JSON.stringify({ type: "response.cancel" }));
+    responseActiveRef.current = false;
+    responsePendingRef.current = false;
+    pendingTaskCountRef.current = 0;
+    activeTaskLabelRef.current = "";
+    setPendingTasks([]);
+    setToolActivities((items) => items.map((item) => item.status === "running" ? { ...item, status: "cancelled", endedAt: new Date().toISOString(), result: "用户取消" } : item));
+    setStatusText("已取消当前任务");
+  }, []);
+
   const handleToolCall = async (message: RealtimeToolCall) => {
     const channel = dataChannelRef.current;
     if (!channel || channel.readyState !== "open" || !message.call_id || !message.name) return;
@@ -1442,6 +1511,7 @@ export function App() {
       acknowledgeImmediately(`我在执行${label}，稍等。`, true);
       assistantRespondedSinceUserRef.current = true;
     }
+    const activityId = createToolActivity(label, message.name);
     const finishTask = beginTask(label);
     let output = {};
     try {
@@ -1624,6 +1694,52 @@ export function App() {
           createdAt: new Date().toISOString()
         }]);
         output = { ok: true, queued: title, detail };
+      }
+      if (message.name === "start_break") {
+        const minutes = Math.max(1, Math.min(30, Number(args.minutes || args.durationMinutes || 5)));
+        const until = new Date(Date.now() + minutes * 60000).toISOString();
+        setBreakUntil(until);
+        setAmbientMode(args.ambientMode === true ? true : ambientMode);
+        setStatusText(`休息中 ${minutes}:00`);
+        output = { ok: true, breakUntil: until, minutes };
+      }
+      if (message.name === "resume_discussion") {
+        setBreakUntil(null);
+        setAmbientMode(false);
+        setStatusText("已回到讨论");
+        output = { ok: true, resumed: true };
+      }
+      if (message.name === "open_media_url") {
+        const rawUrl = String(args.url || "").trim();
+        const url = rawUrl && !/^https?:\/\//i.test(rawUrl) ? `https://${rawUrl}` : rawUrl;
+        try {
+          const parsed = new URL(url);
+          if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("Unsupported protocol");
+          const mediaType = String(args.mediaType || "media").trim();
+          setWebPreview({ url: parsed.toString(), title: String(args.title || (mediaType === "music" ? "在线音乐" : mediaType === "video" ? "视频" : "媒体")).trim() });
+          setStatusText("媒体窗口已打开");
+          output = { ok: true, opened: parsed.toString(), mediaType };
+        } catch {
+          output = { ok: false, error: "Invalid media URL. Use an http or https URL." };
+        }
+      }
+      if (message.name === "set_ambient_mode") {
+        const enabled = args.enabled !== false;
+        setAmbientMode(enabled);
+        const musicUrl = String(args.musicUrl || "").trim();
+        if (enabled && musicUrl) {
+          const url = /^https?:\/\//i.test(musicUrl) ? musicUrl : `https://${musicUrl}`;
+          setWebPreview({ url, title: String(args.title || "氛围音乐").trim() });
+        }
+        setStatusText(enabled ? "氛围模式已开启" : "氛围模式已关闭");
+        output = { ok: true, ambientMode: enabled, musicUrl: musicUrl || "" };
+      }
+      if (message.name === "show_tool_activity") {
+        output = { ok: true, activities: toolActivities.slice(0, 8) };
+      }
+      if (message.name === "cancel_current_task") {
+        cancelCurrentTask();
+        output = { ok: true, cancelled: true };
       }
       if (message.name === "edit_spreadsheet_file") {
         const role = args.role === "primary" || args.role === "context" || args.role === "generated" ? args.role as DiscuzFile["role"] : "generated";
@@ -2051,6 +2167,12 @@ export function App() {
       setError(messageText);
       output = { ok: false, error: messageText };
     } finally {
+      const failed = Boolean((output as { error?: unknown; ok?: unknown }).error) || (output as { ok?: unknown }).ok === false;
+      updateToolActivity(activityId, {
+        status: failed ? "failed" : "done",
+        endedAt: new Date().toISOString(),
+        result: summarizeToolResult(output)
+      });
       finishTask();
     }
     channel.send(JSON.stringify({
@@ -2527,7 +2649,12 @@ export function App() {
       <div className="light-wash" />
       <div className="bottom-discussion-bar">
         <StatusLogPanel ref={statusLogRef} entries={statusLog} transcript={transcript} />
-        <TaskIndicator tasks={visibleTasks} />
+        {visibleTasks.length ? (
+          <TaskIndicator tasks={visibleTasks} />
+        ) : (
+          <VoiceStatusBubble state={voiceState} statusText={statusText} ambientMode={ambientMode} />
+        )}
+        <ToolActivityPanel activities={toolActivities} onCancel={cancelCurrentTask} />
         <form
           className="discussion-text-form"
           onSubmit={(event) => {
@@ -3099,6 +3226,54 @@ function TaskIndicator({ tasks }: { tasks: TaskItem[] }) {
     <div className="task-indicator" title={tasks.map((task) => task.label).join(" / ")}>
       <Sparkles size={14} />
       <span>{tasks.length > 1 ? `AI正在执行 ${tasks.length} 个任务` : `AI正在执行：${active.label}`}</span>
+    </div>
+  );
+}
+
+function VoiceStatusBubble({ state, statusText, ambientMode }: { state: VoiceState; statusText: string; ambientMode: boolean }) {
+  const text = (() => {
+    const status = statusText.trim();
+    if (status && !["Ready", "Live", "Connecting", "Error"].includes(status)) return status;
+    if (ambientMode) return "氛围模式";
+    if (state === "connecting") return "连接中";
+    if (state === "thinking") return "思考中";
+    if (state === "live") return "听取中";
+    if (state === "error") return "连接错误";
+    return "待机";
+  })();
+  if (text === "待机") return null;
+  return (
+    <div className={`voice-status-bubble ${state}`}>
+      <span />
+      {text}
+    </div>
+  );
+}
+
+function ToolActivityPanel({ activities, onCancel }: { activities: ToolActivity[]; onCancel: () => void }) {
+  const visible = activities.slice(0, 4);
+  if (!visible.length) return null;
+  return (
+    <div className="tool-activity-panel" aria-label="AI工具活动">
+      {visible.map((activity) => (
+        <details key={activity.id} className={`tool-activity-card ${activity.status}`} open={activity.status === "running"}>
+          <summary>
+            <span className="tool-activity-dot" />
+            <strong>{activity.label}</strong>
+            <em>{activity.status === "running" ? "执行中" : activity.status === "done" ? "完成" : activity.status === "failed" ? "失败" : "已取消"}</em>
+            {activity.status === "running" && (
+              <button type="button" title="取消当前任务" onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                onCancel();
+              }}>
+                <X size={12} />
+              </button>
+            )}
+          </summary>
+          <p>{activity.result || activity.detail || "等待结果..."}</p>
+        </details>
+      ))}
     </div>
   );
 }

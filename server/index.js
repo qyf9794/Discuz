@@ -1312,6 +1312,8 @@ function buildDiscussionContext() {
     "每次重新打开语音时，你必须先读取下面的讨论记忆，承接此前已经形成的要点、结论、问题和行动项。不要让用户重复已经讨论过的背景；如果记忆和当前文件冲突，以当前文件为准并说明差异。",
     "记录窗口保存的是讨论要点，不是逐句转写。不要把自己或用户的原话逐句写入记录；只有在形成一个完整观点、阶段性结论、待确认问题或行动项后，才调用 save_discussion_note 保存一段简洁总结。每条记录应是一小段话，优先概括“讨论了什么、形成了什么判断、下一步是什么”。",
     "讨论推进工具：需要确认当前界面焦点时调用 read_current_focus；需要完整讨论状态时调用 get_discussion_state；需要用户确认时调用 ask_user_confirmation；用户临时追加任务时调用 queue_task；需要设置回答长短和语气时调用 set_response_style。",
+    "实时存在感工具：用户说休息、暂停、继续、播放用户给出的媒体链接、进入氛围模式、查看工具进度或取消当前任务时，分别调用 start_break、resume_discussion、open_media_url、set_ambient_mode、show_tool_activity、cancel_current_task。调用前后都要用短句告诉用户状态。",
+    "媒体与陪伴边界：open_media_url 只打开用户提供的合法 http/https 音乐、视频、直播或网页链接，或应用内置的安全休息页面；不要编造直播电视、音乐平台或受版权限制的播放源。氛围模式只降低打扰和显示状态，不替用户做未经确认的外部播放。",
     "讨论治理工具：需要更有约束时，先调用 set_discussion_contract 设定目标、边界和输出形式；再调用 create_discussion_agenda 生成议程，并在用户确认后 lock_discussion_agenda。讨论中用 check_topic_alignment 防止偏题，用 limit_response_scope 控制每次只讲一个点，用 advance_discussion_step 推进步骤，用 summarize_current_step 做阶段小结。信息不足时调用 mark_uncertainty，不要装作确定。",
     "整理输出工具：需要大纲、表格总结、行动项、导出记录或 Mermaid 图表时，调用 create_outline、create_table_summary、extract_action_items、export_discussion_record 或 create_diagram，把结果保存到 AI 临时生成区。用户要求下载当前文件、指定文件、会议记录、要点或完整讨论记录时，调用 download_file 直接触发下载。",
     "你可以按需调用工具打开白板、临时草稿、媒体窗口，或打开某个主题/资源文件的重点预览窗口辅助讨论。临时窗口用于当次讨论，关闭后视为临时内容；只有用户明确要求保存时，才把内容作为成果或资源延续。",
@@ -2042,6 +2044,86 @@ app.post("/api/realtime/session", async (req, res) => {
       },
       {
         type: "function",
+        name: "start_break",
+        description: "Start a short discussion break with a visible countdown. Use when the user asks to pause, rest, or take a 3/5/10 minute break.",
+        parameters: {
+          type: "object",
+          properties: {
+            minutes: { type: "number", description: "Break duration in minutes. Prefer 3, 5, or 10; the client clamps it to a safe range." },
+            reason: { type: "string", description: "Optional short reason for the break." },
+            ambientMode: { type: "boolean", description: "Whether to enable ambient mode during the break." }
+          },
+          required: ["minutes"],
+          additionalProperties: false
+        }
+      },
+      {
+        type: "function",
+        name: "resume_discussion",
+        description: "Resume the discussion after a break, ambient pause, media pause, or user request to continue.",
+        parameters: {
+          type: "object",
+          properties: {},
+          required: [],
+          additionalProperties: false
+        }
+      },
+      {
+        type: "function",
+        name: "open_media_url",
+        description: "Open a user-provided legal online music, video, live, or media webpage in the foreground media/web popup. Do not invent streaming sources.",
+        parameters: {
+          type: "object",
+          properties: {
+            url: { type: "string", description: "User-provided http or https URL to open." },
+            title: { type: "string", description: "Optional window title." },
+            mediaType: { type: "string", enum: ["music", "video", "live", "media"], description: "Type of media being opened." }
+          },
+          required: ["url"],
+          additionalProperties: false
+        }
+      },
+      {
+        type: "function",
+        name: "set_ambient_mode",
+        description: "Enable or disable ambient mode. Ambient mode lowers AI interruption frequency while keeping subtitles and discussion records.",
+        parameters: {
+          type: "object",
+          properties: {
+            enabled: { type: "boolean", description: "Whether ambient mode should be enabled." },
+            title: { type: "string", description: "Optional title if a user-provided music URL is opened." },
+            musicUrl: { type: "string", description: "Optional user-provided http or https URL for background music." }
+          },
+          required: ["enabled"],
+          additionalProperties: false
+        }
+      },
+      {
+        type: "function",
+        name: "show_tool_activity",
+        description: "Return recent visible tool activity cards and their execution status so the user can see what is running, complete, failed, or cancelled.",
+        parameters: {
+          type: "object",
+          properties: {},
+          required: [],
+          additionalProperties: false
+        }
+      },
+      {
+        type: "function",
+        name: "cancel_current_task",
+        description: "Cancel the current AI response or running task when the user interrupts, asks to stop, or wants to change direction.",
+        parameters: {
+          type: "object",
+          properties: {
+            reason: { type: "string", description: "Optional user reason for cancellation." }
+          },
+          required: [],
+          additionalProperties: false
+        }
+      },
+      {
+        type: "function",
         name: "analyze_word_file",
         description: "Load structured discussion context for a Word .doc/.docx file using the Documents skill bridge. Use before answering requests to discuss, review, summarize, or improve a Word document.",
         parameters: {
@@ -2731,7 +2813,7 @@ app.post("/api/realtime/session", async (req, res) => {
           type: "semantic_vad",
           eagerness: "low",
           create_response: true,
-          interrupt_response: false
+          interrupt_response: true
         }
       },
       output: { voice: aiSettings.realtimeVoice }
