@@ -63,6 +63,21 @@ type ToolId = "whiteboard" | "draft" | "image" | "video" | "audio";
 type StatusLogEntry = { id: string; kind: "status" | "error"; text: string; createdAt: string };
 type TaskItem = { id: string; label: string; startedAt: string };
 type ToolActivity = { id: string; label: string; status: "running" | "done" | "failed" | "cancelled"; startedAt: string; endedAt?: string; detail?: string; result?: string };
+type DiagnosticEvent = { type: "task:start" | "task:finish"; id: string; label: string; at: string; elapsedMs?: number };
+type DiagnosticSnapshot = {
+  statusText: string;
+  pendingTasks: TaskItem[];
+  visibleTasks: TaskItem[];
+  toolActivities: ToolActivity[];
+  taskEvents: DiagnosticEvent[];
+};
+type ToolDiagnosticResult = DiagnosticSnapshot & {
+  name: string;
+  ok: boolean;
+  elapsedMs: number;
+  result: unknown;
+  observedTask: boolean;
+};
 type RealtimeToolDefinition = { type: "function"; name: string; description: string; parameters: Record<string, unknown> };
 type RealtimeSessionBootstrap = {
   clientSecret: string;
@@ -88,6 +103,13 @@ type CognitiveLoad = "simple" | "normal" | "detailed" | "step_by_step";
 type GlassSelectOption = { value: string; label: string };
 const fileDragType = "application/x-discuz-file-id";
 type AudioContextConstructor = typeof AudioContext;
+type DiscuzDiagnostics = {
+  snapshot: () => DiagnosticSnapshot;
+  clearEvents: () => void;
+  runTool: (_name: string, _args?: Record<string, unknown>) => Promise<ToolDiagnosticResult>;
+  runTools: (_items: Array<{ name: string; args?: Record<string, unknown> }>) => Promise<ToolDiagnosticResult[]>;
+};
+type DiscuzDiagnosticWindow = Window & { __discuzDiagnostics?: DiscuzDiagnostics };
 type VoiceMeter = {
   context: AudioContext;
   inputAnalyser?: AnalyserNode;
@@ -325,6 +347,30 @@ function compactText(value: string, maxChars = 18000) {
   return text.length > maxChars ? `${text.slice(0, maxChars)}\n\n... 已截断，以上为前 ${maxChars} 字。` : text;
 }
 
+function isDiagnosticsEnabled() {
+  if (typeof window === "undefined") return false;
+  return import.meta.env.DEV && ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname);
+}
+
+function isAffirmativeConfirmation(text: string) {
+  const normalized = text.replace(/[，。！？、,.!?\s]/g, "").toLowerCase();
+  if (!normalized) return false;
+  return [
+    "确认",
+    "可以",
+    "好的",
+    "好",
+    "对",
+    "没问题",
+    "就这个",
+    "就这样",
+    "同意",
+    "确认一下",
+    "我确认",
+    "确定"
+  ].some((phrase) => normalized === phrase || normalized.includes(phrase));
+}
+
 function buildWordAnalysisPayload(file: DiscuzFile, focus: string) {
   const paragraphs = file.extractedText
     .split(/\n+/)
@@ -521,6 +567,7 @@ export function App() {
   const [generatedEditorId, setGeneratedEditorId] = useState<string | null>(null);
   const [webPreview, setWebPreview] = useState<WebPreview | null>(null);
   const [discussionText, setDiscussionText] = useState("");
+  const [diagnosticInput, setDiagnosticInput] = useState("");
   const [topicProposal, setTopicProposal] = useState<TopicProposal | null>(null);
   const [draftText, setDraftText] = useState(() => localStorage.getItem("discuz-draft") || "");
   const [boardItems, setBoardItems] = useState<BoardItem[]>(
@@ -578,6 +625,15 @@ export function App() {
   const realtimeSessionRef = useRef<RealtimeSession | null>(null);
   const executeRealtimeToolRef = useRef<((_name: string, _args: Record<string, any>) => Promise<unknown>) | null>(null);
   const requestRealtimeResponseRef = useRef<() => boolean>(() => false);
+  const topicProposalRef = useRef<TopicProposal | null>(null);
+  const directionProposalRef = useRef<DirectionProposal | null>(null);
+  const discussionTopicRef = useRef("");
+  const directionsRef = useRef<DiscussionDirection[]>([]);
+  const statusTextRef = useRef(statusText);
+  const pendingTasksRef = useRef<TaskItem[]>([]);
+  const visibleTasksRef = useRef<TaskItem[]>([]);
+  const toolActivitiesRef = useRef<ToolActivity[]>([]);
+  const diagnosticEventsRef = useRef<DiagnosticEvent[]>([]);
   const responseActiveRef = useRef(false);
   const responsePendingRef = useRef(false);
   const topicFileChangeBlocksTopicProposalRef = useRef(false);
@@ -587,7 +643,7 @@ export function App() {
   const responseWatchdogTimerRef = useRef<number | null>(null);
   const responseTaskTimerRef = useRef<number | null>(null);
   const continuationNudgeTimerRef = useRef<number | null>(null);
-  const activeTaskFinishersRef = useRef<Record<string, () => void>>({});
+  const activeTaskFinishersRef = useRef<Record<string, (_failed?: boolean) => void>>({});
   const voiceMeterRef = useRef<VoiceMeter | null>(null);
   const pendingVoiceStopAfterResponseRef = useRef<PendingVoiceStop>("none");
   const pendingTaskCountRef = useRef(0);
@@ -624,6 +680,12 @@ export function App() {
     () => [...backgroundParsingTasks, ...pendingTasks],
     [backgroundParsingTasks, pendingTasks]
   );
+  useEffect(() => {
+    statusTextRef.current = statusText;
+    pendingTasksRef.current = pendingTasks;
+    visibleTasksRef.current = visibleTasks;
+    toolActivitiesRef.current = toolActivities;
+  }, [pendingTasks, statusText, toolActivities, visibleTasks]);
   const selectedFile = useMemo(
     () => state.files.find((file) => file.id === selectedId) ?? primaryFiles[0] ?? null,
     [state.files, selectedId, primaryFiles]
@@ -636,6 +698,16 @@ export function App() {
     () => state.records.find((record) => record.id === previewRecordId) ?? null,
     [state.records, previewRecordId]
   );
+  useEffect(() => {
+    topicProposalRef.current = topicProposal;
+  }, [topicProposal]);
+  useEffect(() => {
+    directionProposalRef.current = directionProposal;
+  }, [directionProposal]);
+  useEffect(() => {
+    discussionTopicRef.current = state.discussionTopic;
+    directionsRef.current = state.directions;
+  }, [state.discussionTopic, state.directions]);
   const generatedEditorFile = useMemo(
     () => state.files.find((file) => file.id === generatedEditorId) ?? null,
     [state.files, generatedEditorId]
@@ -1014,22 +1086,43 @@ export function App() {
   const beginTask = useCallback((label: string) => {
     const id = crypto.randomUUID();
     const startedAt = new Date().toISOString();
+    const startedAtMs = Date.now();
     pendingTaskCountRef.current += 1;
     activeTaskLabelRef.current = label;
+    if (isDiagnosticsEnabled()) {
+      diagnosticEventsRef.current = [
+        ...diagnosticEventsRef.current.slice(-199),
+        { type: "task:start", id, label, at: startedAt }
+      ];
+    }
     setPendingTasks((current) => [...current.filter((task) => task.id !== id), { id, label, startedAt }]);
     setStatusText(`${label}进行中`);
-    let finished = false;
-    return () => {
-      if (finished) return;
-      finished = true;
-      pendingTaskCountRef.current = Math.max(0, pendingTaskCountRef.current - 1);
-      setPendingTasks((current) => current.filter((task) => task.id !== id));
-      if (pendingTaskCountRef.current > 0) {
-        setStatusText(`${activeTaskLabelRef.current || "任务"}进行中`);
-      } else {
-        activeTaskLabelRef.current = "";
-        setStatusText(`${label}完成`);
-      }
+    let finishing = false;
+    let completed = false;
+    return (failed = false) => {
+      if (finishing || completed) return;
+      finishing = true;
+      const complete = () => {
+        if (completed) return;
+        completed = true;
+        if (isDiagnosticsEnabled()) {
+          diagnosticEventsRef.current = [
+            ...diagnosticEventsRef.current.slice(-199),
+            { type: "task:finish", id, label, at: new Date().toISOString(), elapsedMs: Date.now() - startedAtMs }
+          ];
+        }
+        pendingTaskCountRef.current = Math.max(0, pendingTaskCountRef.current - 1);
+        setPendingTasks((current) => current.filter((task) => task.id !== id));
+        if (pendingTaskCountRef.current > 0) {
+          setStatusText(`${activeTaskLabelRef.current || "任务"}进行中`);
+        } else {
+          activeTaskLabelRef.current = "";
+          setStatusText(`${label}${failed ? "失败" : "完成"}`);
+        }
+      };
+      const remainingMs = Math.max(0, 900 - (Date.now() - startedAtMs));
+      if (remainingMs > 0) window.setTimeout(complete, remainingMs);
+      else complete();
     };
   }, []);
 
@@ -1037,10 +1130,10 @@ export function App() {
     const existing = activeTaskFinishersRef.current[key];
     if (existing) return existing;
     const finishTask = beginTask(label);
-    const finish = () => {
+    const finish = (failed = false) => {
       if (!activeTaskFinishersRef.current[key]) return;
       delete activeTaskFinishersRef.current[key];
-      finishTask();
+      finishTask(failed);
     };
     activeTaskFinishersRef.current[key] = finish;
     return finish;
@@ -1565,71 +1658,104 @@ export function App() {
   };
 
   const confirmDiscussionTopic = async (title: string, options: { notifyRealtime?: boolean } = {}) => {
+    const finishTask = options.notifyRealtime !== false ? beginUniqueTask("confirm-topic", "确认讨论主题") : null;
     const confirmedTitle = title.trim();
-    if (!confirmedTitle) throw new Error("Missing discussion topic title.");
-    const response = await fetch("/api/discussion-topic", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ topic: confirmedTitle })
-    });
-    if (!response.ok) throw new Error(await response.text());
-    const payload = await response.json();
-    setState((current) => ({
-      ...current,
-      discussionTopic: payload.discussionTopic ?? current.discussionTopic,
-      directions: payload.directions ?? current.directions,
-      activities: payload.activities ?? current.activities
-    }));
-    setTopicProposal(null);
-    setDirectionProposal(null);
-    setStatusText(`已确认主题：${confirmedTitle}`);
-    const session = realtimeSessionRef.current;
-    if (options.notifyRealtime !== false && session) {
-      if (responseActiveRef.current) {
-        session.interrupt();
-        responseActiveRef.current = false;
-        clearResponseWatchdog();
+    let failed = false;
+    try {
+      if (!confirmedTitle) throw new Error("Missing discussion topic title.");
+      const response = await fetch("/api/discussion-topic", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ topic: confirmedTitle })
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = await response.json();
+      setState((current) => ({
+        ...current,
+        discussionTopic: payload.discussionTopic ?? current.discussionTopic,
+        directions: payload.directions ?? current.directions,
+        activities: payload.activities ?? current.activities
+      }));
+      setTopicProposal(null);
+      setDirectionProposal(null);
+      setStatusText(`已确认主题：${confirmedTitle}`);
+      const session = realtimeSessionRef.current;
+      if (options.notifyRealtime !== false && session) {
+        if (responseActiveRef.current) {
+          session.interrupt();
+          responseActiveRef.current = false;
+          clearResponseWatchdog();
+        }
+        session.sendMessage(`系统事件：用户已确认讨论主题《${confirmedTitle}》。请立即基于当前主题、主题文件和用户输入调用 propose_discussion_directions，提出 1 到 3 个讨论方向供用户确认，一次最多 3 个。语音只用自然短句说明你会列出方向并请用户删改，不要使用固定话术。如果用户明确要求增加方向，调用 add_discussion_directions 追加 1 到 3 个；如果用户不满意，优先调用 update_discussion_directions 快速替换完整列表；如果用户只是不想要某一条，提醒他可以直接点圆圈右侧删除。`);
+        window.setTimeout(() => requestRealtimeResponseRef.current(), 0);
       }
-      session.sendMessage(`系统事件：用户已确认讨论主题《${confirmedTitle}》。请立即基于当前主题、主题文件和用户输入调用 propose_discussion_directions，提出 1 到 3 个讨论方向供用户确认，一次最多 3 个。语音只用自然短句说明你会列出方向并请用户删改，不要使用固定话术。如果用户明确要求增加方向，调用 add_discussion_directions 追加 1 到 3 个；如果用户不满意，优先调用 update_discussion_directions 快速替换完整列表；如果用户只是不想要某一条，提醒他可以直接点圆圈右侧删除。`);
-      window.setTimeout(() => requestRealtimeResponseRef.current(), 0);
+    } catch (err) {
+      failed = true;
+      throw err;
+    } finally {
+      finishTask?.(failed);
     }
   };
 
   const confirmDirectionProposal = async (directions: string[], options: { notifyRealtime?: boolean } = {}) => {
-    const response = await fetch("/api/directions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ directions })
-    });
-    if (!response.ok) throw new Error(await response.text());
-    const payload = await response.json();
-    setState((current) => ({
-      ...current,
-      directions: payload.directions ?? current.directions,
-      notes: payload.notes ?? current.notes,
-      activities: payload.activities ?? current.activities,
-      topics: payload.topics ?? current.topics
-    }));
-    setDirectionProposal(null);
-    setStatusText("讨论方向已确认");
-    const confirmedDirections = (payload.directions ?? []).map((direction: DiscussionDirection, index: number) => (
-      `${index + 1}. ${direction.completed ? "已完成" : "未完成"}｜${direction.text}`
-    )).join("\n");
-    const session = realtimeSessionRef.current;
-    if (options.notifyRealtime !== false && session) {
-      if (responseActiveRef.current) {
-        session.interrupt();
-        responseActiveRef.current = false;
-        clearResponseWatchdog();
+    const finishTask = options.notifyRealtime !== false ? beginUniqueTask("confirm-directions", "确认讨论方向") : null;
+    let failed = false;
+    try {
+      const response = await fetch("/api/directions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ directions })
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = await response.json();
+      setState((current) => ({
+        ...current,
+        directions: payload.directions ?? current.directions,
+        notes: payload.notes ?? current.notes,
+        activities: payload.activities ?? current.activities,
+        topics: payload.topics ?? current.topics
+      }));
+      setDirectionProposal(null);
+      setStatusText("讨论方向已确认");
+      const confirmedDirections = (payload.directions ?? []).map((direction: DiscussionDirection, index: number) => (
+        `${index + 1}. ${direction.completed ? "已完成" : "未完成"}｜${direction.text}`
+      )).join("\n");
+      const session = realtimeSessionRef.current;
+      if (options.notifyRealtime !== false && session) {
+        if (responseActiveRef.current) {
+          session.interrupt();
+          responseActiveRef.current = false;
+          clearResponseWatchdog();
+        }
+        session.sendMessage([
+          "系统事件：用户已点击确认讨论方向 todo。",
+          `当前已确认讨论主题：${discussionTopicRef.current || "未命名主题"}`,
+          confirmedDirections ? `当前讨论方向与完成状态：\n${confirmedDirections}` : "当前没有讨论方向。",
+          "请立即承接这个状态，只用一句自然短句确认已记录，并询问用户想先从哪个方向开始。不要再次要求用户确认这些方向，除非用户提出修改。"
+        ].join("\n\n"));
+        window.setTimeout(() => requestRealtimeResponseRef.current(), 0);
       }
-      session.sendMessage([
-        "系统事件：用户已点击确认讨论方向 todo。",
-        `当前已确认讨论主题：${state.discussionTopic || "未命名主题"}`,
-        confirmedDirections ? `当前讨论方向与完成状态：\n${confirmedDirections}` : "当前没有讨论方向。",
-        "请立即承接这个状态，只用一句自然短句确认已记录，并询问用户想先从哪个方向开始。不要再次要求用户确认这些方向，除非用户提出修改。"
-      ].join("\n\n"));
-      window.setTimeout(() => requestRealtimeResponseRef.current(), 0);
+    } catch (err) {
+      failed = true;
+      throw err;
+    } finally {
+      finishTask?.(failed);
     }
+  };
+
+  const handleSpokenConfirmation = async (text: string) => {
+    if (!isAffirmativeConfirmation(text)) return false;
+    const pendingTopic = topicProposalRef.current;
+    if (pendingTopic?.title) {
+      await confirmDiscussionTopic(pendingTopic.title);
+      return true;
+    }
+    const pendingDirections = directionProposalRef.current?.directions ?? [];
+    if (pendingDirections.length) {
+      await confirmDirectionProposal(pendingDirections);
+      return true;
+    }
+    return false;
   };
 
   const addDiscussionDirections = async (directions: string[]) => {
@@ -1650,21 +1776,45 @@ export function App() {
     setStatusText("已追加讨论方向");
   };
 
-  const completeDirection = async (direction: DiscussionDirection, note = "") => {
-    const response = await fetch(`/api/directions/${encodeURIComponent(direction.id)}/complete`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ note })
-    });
-    if (!response.ok) throw new Error(await response.text());
-    const payload = await response.json();
-    setState((current) => ({
-      ...current,
-      directions: payload.directions ?? current.directions,
-      notes: payload.notes ?? current.notes,
-      activities: payload.activities ?? current.activities,
-      topics: payload.topics ?? current.topics
-    }));
+  const completeDirection = async (direction: DiscussionDirection, note = "", options: { notifyRealtime?: boolean } = {}) => {
+    const finishTask = options.notifyRealtime !== false ? beginUniqueTask("complete-direction", "完成讨论方向") : null;
+    let failed = false;
+    try {
+      const response = await fetch(`/api/directions/${encodeURIComponent(direction.id)}/complete`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ note })
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = await response.json();
+      setState((current) => ({
+        ...current,
+        directions: payload.directions ?? current.directions,
+        notes: payload.notes ?? current.notes,
+        activities: payload.activities ?? current.activities,
+        topics: payload.topics ?? current.topics
+      }));
+      const updatedDirections = (payload.directions ?? directionsRef.current) as DiscussionDirection[];
+      const directionLines = updatedDirections.map((item, index) => `${index + 1}. ${item.completed ? "已完成" : "未完成"}｜${item.text}`).join("\n");
+      if (options.notifyRealtime !== false && realtimeSessionRef.current) {
+        if (responseActiveRef.current) {
+          realtimeSessionRef.current.interrupt();
+          responseActiveRef.current = false;
+          clearResponseWatchdog();
+        }
+        realtimeSessionRef.current.sendMessage([
+          `系统事件：用户已将讨论方向标记为完成：${direction.text}`,
+          directionLines ? `当前讨论方向与完成状态：\n${directionLines}` : "当前没有讨论方向。",
+          "请承接这个状态，只用一句自然短句确认进度，并建议继续下一个未完成方向。"
+        ].join("\n\n"));
+        window.setTimeout(() => requestRealtimeResponseRef.current(), 0);
+      }
+    } catch (err) {
+      failed = true;
+      throw err;
+    } finally {
+      finishTask?.(failed);
+    }
   };
 
   const deleteDirection = async (direction: DiscussionDirection) => {
@@ -2334,7 +2484,7 @@ export function App() {
           return direction.id === queryText || String(index + 1) === queryText || direction.text.toLowerCase().includes(queryText);
         });
         if (candidate) {
-          await completeDirection(candidate, String(args.note || "").trim());
+          await completeDirection(candidate, String(args.note || "").trim(), { notifyRealtime: false });
           output = { ok: true, completed: candidate.text };
         } else {
           output = { ok: false, error: "No matching discussion direction found." };
@@ -2403,7 +2553,7 @@ export function App() {
         endedAt: new Date().toISOString(),
         result: summarizeToolResult(output)
       });
-      finishTask();
+      finishTask(failed);
       scheduleResponseTask("AI整理结果");
       scheduleContinuationResponse("AI继续回答");
     }
@@ -2413,6 +2563,104 @@ export function App() {
   useEffect(() => {
     executeRealtimeToolRef.current = executeRealtimeTool;
   });
+
+  useEffect(() => {
+    if (!isDiagnosticsEnabled()) return;
+    const snapshot = (): DiagnosticSnapshot => ({
+      statusText: statusTextRef.current,
+      pendingTasks: pendingTasksRef.current,
+      visibleTasks: visibleTasksRef.current,
+      toolActivities: toolActivitiesRef.current.slice(0, 12),
+      taskEvents: diagnosticEventsRef.current.slice(-60)
+    });
+    const runTool = async (name: string, args: Record<string, unknown> = {}) => {
+      const startedAt = performance.now();
+      const eventStartIndex = diagnosticEventsRef.current.length;
+      const result = await executeRealtimeTool(name, args);
+      await new Promise((resolve) => window.setTimeout(resolve, 960));
+      const taskEvents = diagnosticEventsRef.current.slice(eventStartIndex);
+      const failed = Boolean((result as { error?: unknown; ok?: unknown })?.error) || (result as { ok?: unknown })?.ok === false;
+      return {
+        ...snapshot(),
+        taskEvents,
+        name,
+        ok: !failed,
+        elapsedMs: Math.round(performance.now() - startedAt),
+        result,
+        observedTask: taskEvents.some((event) => event.type === "task:start")
+      };
+    };
+    const publishResult = (payload: unknown) => {
+      document.documentElement.dataset.discuzDiagnosticResult = JSON.stringify(payload);
+    };
+    const handleRunTool = (event: Event) => {
+      const detail = (event as CustomEvent<{ id?: string; name?: string; args?: Record<string, unknown> }>).detail ?? {};
+      const id = detail.id || crypto.randomUUID();
+      const name = String(detail.name || "").trim();
+      if (!name) {
+        publishResult({ id, ok: false, error: "Missing tool name." });
+        return;
+      }
+      runTool(name, detail.args ?? {})
+        .then((result) => {
+          const payload = { id, ...result };
+          publishResult(payload);
+          document.dispatchEvent(new CustomEvent("discuz:tool-result", { detail: payload }));
+        })
+        .catch((err) => {
+          const payload = { id, ok: false, error: err instanceof Error ? err.message : "Diagnostic tool run failed." };
+          publishResult(payload);
+          document.dispatchEvent(new CustomEvent("discuz:tool-result", { detail: payload }));
+        });
+    };
+    document.addEventListener("discuz:run-tool", handleRunTool);
+    const diagnosticWindow = window as DiscuzDiagnosticWindow;
+    diagnosticWindow.__discuzDiagnostics = {
+      snapshot,
+      clearEvents: () => {
+        diagnosticEventsRef.current = [];
+      },
+      runTool,
+      runTools: async (items) => {
+        const results: ToolDiagnosticResult[] = [];
+        for (const item of items) {
+          results.push(await runTool(item.name, item.args ?? {}));
+        }
+        return results;
+      }
+    };
+    return () => {
+      document.removeEventListener("discuz:run-tool", handleRunTool);
+      if (diagnosticWindow.__discuzDiagnostics?.runTool === runTool) delete diagnosticWindow.__discuzDiagnostics;
+    };
+  });
+
+  const runDiagnosticBridge = async () => {
+    const payload = JSON.parse(diagnosticInput || "{}") as { id?: string; name?: string; args?: Record<string, unknown> };
+    const id = payload.id || crypto.randomUUID();
+    const name = String(payload.name || "").trim();
+    if (!name) throw new Error("Missing diagnostic tool name.");
+    const startedAt = performance.now();
+    const eventStartIndex = diagnosticEventsRef.current.length;
+    const result = await executeRealtimeTool(name, payload.args ?? {});
+    await new Promise((resolve) => window.setTimeout(resolve, 960));
+    const taskEvents = diagnosticEventsRef.current.slice(eventStartIndex);
+    const failed = Boolean((result as { error?: unknown; ok?: unknown })?.error) || (result as { ok?: unknown })?.ok === false;
+    const diagnosticResult: ToolDiagnosticResult & { id: string } = {
+      id,
+      name,
+      ok: !failed,
+      elapsedMs: Math.round(performance.now() - startedAt),
+      result,
+      statusText: statusTextRef.current,
+      pendingTasks: pendingTasksRef.current,
+      visibleTasks: visibleTasksRef.current,
+      toolActivities: toolActivitiesRef.current.slice(0, 12),
+      taskEvents,
+      observedTask: taskEvents.some((event) => event.type === "task:start")
+    };
+    document.documentElement.dataset.discuzDiagnosticResult = JSON.stringify(diagnosticResult);
+  };
 
   const finalizeDiscussionRecord = useCallback(async () => {
     const startedAt = voiceSessionStartedAtRef.current;
@@ -2725,6 +2973,7 @@ export function App() {
             const text = String(message.transcript || userTranscriptRef.current || "").trim();
             if (text) {
               saveMeetingMessage(text, "user").catch((err) => setError(err instanceof Error ? err.message : "Unable to save meeting record"));
+              handleSpokenConfirmation(text).catch((err) => setError(err instanceof Error ? err.message : "Unable to handle confirmation"));
             }
             userTranscriptRef.current = "";
           }
@@ -3439,6 +3688,31 @@ export function App() {
           onPromote={() => promoteGeneratedFile(generatedEditorFile)}
           onClose={() => setGeneratedEditorId(null)}
         />
+      )}
+      {isDiagnosticsEnabled() && (
+        <form
+          data-testid="discuz-diagnostic-form"
+          aria-label="Discuz diagnostic runner"
+          style={{ position: "fixed", left: 0, bottom: 0, zIndex: 10000, width: 120, height: 48, opacity: 0.01, overflow: "hidden" }}
+          onSubmit={(event) => {
+            event.preventDefault();
+            runDiagnosticBridge().catch((err) => {
+              document.documentElement.dataset.discuzDiagnosticResult = JSON.stringify({
+                ok: false,
+                error: err instanceof Error ? err.message : "Diagnostic bridge failed."
+              });
+            });
+          }}
+        >
+          <textarea
+            data-testid="discuz-diagnostic-input"
+            aria-label="Diagnostic input"
+            value={diagnosticInput}
+            onChange={(event) => setDiagnosticInput(event.target.value)}
+            style={{ width: 80, height: 32 }}
+          />
+          <button data-testid="discuz-diagnostic-run" type="submit" style={{ width: 32, height: 32 }}>Run</button>
+        </form>
       )}
     </main>
   );
