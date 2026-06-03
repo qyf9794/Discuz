@@ -1475,12 +1475,14 @@ a.icon-button {
   right: 24px;
   top: 24px;
   z-index: 8;
-  width: 460px;
+  box-sizing: border-box;
+  width: min(460px, calc(100vw - 24px));
   max-width: calc(100vw - 24px);
-  max-height: calc(100vh - 36px);
+  max-height: calc(100dvh - 24px);
   padding: 14px;
   border-radius: 20px;
   overflow: auto;
+  overscroll-behavior: contain;
 }
 
 .permission-window {
@@ -1489,10 +1491,15 @@ a.icon-button {
   top: 50%;
   z-index: 11;
   display: grid;
+  box-sizing: border-box;
   width: min(440px, calc(100vw - 40px));
+  max-width: calc(100vw - 24px);
+  max-height: calc(100dvh - 24px);
   gap: 13px;
+  overflow: auto;
   padding: 18px;
   border-radius: 22px;
+  overscroll-behavior: contain;
   transform: translate(-50%, -50%);
 }
 
@@ -1817,8 +1824,11 @@ a.icon-button {
   top: 50%;
   z-index: 9;
   display: flex;
+  box-sizing: border-box;
   width: min(960px, calc(100vw - 48px));
-  height: min(680px, calc(100vh - 48px));
+  max-width: calc(100vw - 24px);
+  height: min(680px, calc(100dvh - 48px));
+  max-height: calc(100dvh - 24px);
   flex-direction: column;
   overflow: hidden;
   transform: translate(-50%, -50%);
@@ -1831,8 +1841,11 @@ a.icon-button {
   top: 50%;
   z-index: 9;
   display: flex;
+  box-sizing: border-box;
   width: min(760px, calc(100vw - 48px));
-  height: min(620px, calc(100vh - 48px));
+  max-width: calc(100vw - 24px);
+  height: min(620px, calc(100dvh - 48px));
+  max-height: calc(100dvh - 24px);
   flex-direction: column;
   overflow: hidden;
   transform: translate(-50%, -50%);
@@ -2480,8 +2493,9 @@ a.icon-button {
   .file-preview-window,
   .web-preview-window,
   .generated-editor-window,
+  .record-preview-window,
   .whiteboard-window {
     width: calc(100vw - 24px);
-    height: calc(100vh - 24px);
+    height: calc(100dvh - 24px);
   }
 }

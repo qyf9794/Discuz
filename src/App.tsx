@@ -782,13 +782,21 @@ export function App() {
     if (!button) return;
     const scale = Math.max(layoutScale, 0.01);
     const rect = button.getBoundingClientRect();
-    const physicalWidth = Math.min(360 * scale, window.innerWidth - 24);
-    const left = Math.min(Math.max(12, rect.right - physicalWidth), window.innerWidth - physicalWidth - 12);
-    const top = Math.min(rect.bottom + 8 * scale, window.innerHeight - 24);
+    const margin = 12;
+    const preferredWidth = 460 * scale;
+    const physicalWidth = Math.min(preferredWidth, Math.max(240, window.innerWidth - margin * 2));
+    const measuredHeight = settingsPopoverRef.current?.getBoundingClientRect().height;
+    const fallbackHeight = Math.min(620 * scale, Math.max(220, window.innerHeight - margin * 2));
+    const physicalHeight = Math.min(measuredHeight || fallbackHeight, window.innerHeight - margin * 2);
+    const left = Math.min(Math.max(margin, rect.right - physicalWidth), window.innerWidth - physicalWidth - margin);
+    const preferredTop = rect.bottom + 8 * scale;
+    const top = Math.min(Math.max(margin, preferredTop), window.innerHeight - physicalHeight - margin);
     setSettingsPopoverStyle({
       left: left / scale,
       right: "auto",
-      top: top / scale
+      top: top / scale,
+      maxWidth: (window.innerWidth - margin * 2) / scale,
+      maxHeight: (window.innerHeight - margin * 2) / scale
     });
   }, [layoutScale]);
 
@@ -798,7 +806,14 @@ export function App() {
   };
 
   useEffect(() => {
-    if (settingsOpen) positionSettingsPopover();
+    if (!settingsOpen) return;
+    positionSettingsPopover();
+    const frameId = window.requestAnimationFrame(positionSettingsPopover);
+    window.addEventListener("resize", positionSettingsPopover);
+    return () => {
+      window.cancelAnimationFrame(frameId);
+      window.removeEventListener("resize", positionSettingsPopover);
+    };
   }, [layoutScale, positionSettingsPopover, settingsOpen]);
 
   useEffect(() => {
