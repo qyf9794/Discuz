@@ -1645,9 +1645,8 @@ a.icon-button {
 }
 
 .api-key-row input,
-.device-row select,
 .ai-settings-grid input,
-.ai-settings-grid select {
+.glass-select-button {
   min-width: 0;
   height: 38px;
   border: 0;
@@ -1658,14 +1657,86 @@ a.icon-button {
   color: #17212b;
 }
 
-.device-row select,
-.ai-settings-grid select {
-  appearance: none;
-  -webkit-appearance: none;
-  padding-right: 42px;
+.glass-select {
+  position: relative;
+  min-width: 0;
+}
+
+.glass-select-button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  text-align: left;
+}
+
+.glass-select-button span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.glass-select-button svg {
+  flex: 0 0 auto;
+  opacity: 0.78;
+  transition: transform 160ms ease;
+}
+
+.glass-select.open .glass-select-button svg {
+  transform: rotate(180deg);
+}
+
+.glass-select-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 20;
+  display: grid;
+  width: 100%;
+  max-height: min(236px, calc(100dvh - 40px));
+  gap: 3px;
+  overflow: auto;
+  padding: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.46);
+  border-radius: 14px;
   background:
-    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M4 6.25 8 10l4-3.75' stroke='%231a2a38' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") calc(100% - 20px) 50% / 16px 16px no-repeat,
-    rgba(255, 255, 255, 0.52);
+    linear-gradient(145deg, rgba(255, 255, 255, 0.62), rgba(255, 255, 255, 0.2)),
+    rgba(224, 243, 252, 0.42);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.62),
+    0 16px 38px rgba(12, 37, 55, 0.18);
+  backdrop-filter: blur(18px) saturate(1.12);
+  -webkit-backdrop-filter: blur(18px) saturate(1.12);
+}
+
+.glass-select-menu button,
+.device-row .glass-select-menu button {
+  display: block;
+  width: 100%;
+  min-height: 32px;
+  height: auto;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: rgba(23, 33, 43, 0.92);
+  font-size: 12px;
+  font-weight: 720;
+  line-height: 1.25;
+  text-align: left;
+}
+
+.glass-select-menu button:hover,
+.glass-select-menu button:focus-visible {
+  background: rgba(255, 255, 255, 0.48);
+  outline: none;
+}
+
+.glass-select-menu button.selected {
+  background: rgba(8, 125, 140, 0.16);
+  color: #087d8c;
 }
 
 .api-key-row button,
@@ -1850,6 +1921,12 @@ a.icon-button {
   overflow: hidden;
   transform: translate(-50%, -50%);
   border-radius: 26px;
+}
+
+.file-preview-window.topic-file-preview-window {
+  right: auto;
+  max-width: calc(100vw - 24px);
+  transform: translateY(-50%);
 }
 
 .generated-editor-window .tool-head > div:first-child {
@@ -2170,13 +2247,16 @@ a.icon-button {
 
 .task-indicator,
 .voice-status-bubble {
-  position: absolute;
-  left: 50%;
-  bottom: 154px;
+  position: relative;
+  grid-column: 1;
+  grid-row: 1;
+  align-self: end;
+  justify-self: center;
+  bottom: calc(var(--discussion-input-lift) + 44px + var(--voice-input-gap) + 58px);
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  max-width: min(360px, calc(100vw - 32px));
+  max-width: min(300px, calc(100vw - 32px));
   height: 30px;
   padding: 0 11px;
   border: 1px solid rgba(255, 255, 255, 0.48);
@@ -2189,11 +2269,11 @@ a.icon-button {
   box-shadow: 0 10px 28px rgba(9, 18, 28, 0.11);
   backdrop-filter: blur(16px) saturate(1.08);
   -webkit-backdrop-filter: blur(16px) saturate(1.08);
-  transform: translateX(-50%);
+  transform: translateX(calc(50% + 56px));
 }
 
 .voice-status-bubble {
-  bottom: 134px;
+  bottom: calc(var(--discussion-input-lift) + 44px + var(--voice-input-gap) + 54px);
   gap: 8px;
   border-color: transparent;
   background: transparent;

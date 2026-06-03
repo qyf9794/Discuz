@@ -1,5 +1,6 @@
 import {
   ChartNoAxesColumn,
+  ChevronDown,
   Check,
   CheckCircle2,
   Copy,
@@ -71,6 +72,7 @@ type DiscussionContract = { goal: string; boundaries: string[]; outputFormat: st
 type DiscussionAgendaItem = { title: string; objective: string; output: string; status: "pending" | "active" | "done" };
 type ResponseScope = { maxSentences: number; onePointOnly: boolean; mustAskFirst: boolean };
 type CognitiveLoad = "simple" | "normal" | "detailed" | "step_by_step";
+type GlassSelectOption = { value: string; label: string };
 const fileDragType = "application/x-discuz-file-id";
 type AudioContextConstructor = typeof AudioContext;
 type VoiceMeter = {
@@ -267,7 +269,7 @@ function selectOfficeFile(files: DiscuzFile[], kind: OfficeAnalysisKind, role?: 
   const allowedKinds: Record<OfficeAnalysisKind, DiscuzFile["kind"][]> = {
     word: ["doc", "docx"],
     spreadsheet: ["spreadsheet"],
-    presentation: ["pptx"]
+    presentation: ["ppt", "pptx"]
   };
   const candidates = files.filter((file) => {
     const roleMatches = !role || file.role === role;
@@ -445,7 +447,7 @@ function downloadUploadedFile(file: DiscuzFile) {
 function fileExtractionLabel(file: DiscuzFile) {
   if (file.kind === "image") return "后台识别图片";
   if (file.kind === "spreadsheet") return "后台解析表格";
-  if (file.kind === "pptx") return "后台解析PPT";
+  if (file.kind === "ppt" || file.kind === "pptx") return "后台解析PPT";
   if (file.kind === "doc" || file.kind === "docx") return "后台解析Word";
   if (file.kind === "pdf") return "后台解析PDF";
   return "后台解析文字";
@@ -533,6 +535,7 @@ export function App() {
   const generatedInputRef = useRef<HTMLInputElement | null>(null);
   const settingsButtonRef = useRef<HTMLButtonElement | null>(null);
   const settingsPopoverRef = useRef<HTMLElement | null>(null);
+  const topicPanelRef = useRef<HTMLElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const statusLogRef = useRef<HTMLDivElement | null>(null);
   const peerRef = useRef<RTCPeerConnection | null>(null);
@@ -558,6 +561,7 @@ export function App() {
   const userTranscriptRef = useRef("");
   const boardRef = useRef<HTMLDivElement | null>(null);
   const recordStreamRef = useRef<HTMLDivElement | null>(null);
+  const [topicPreviewFrame, setTopicPreviewFrame] = useState<{ left: number; width: number } | null>(null);
 
   const primaryFiles = useMemo(() => state.files.filter((file) => file.role === "primary"), [state.files]);
   const contextFiles = useMemo(() => state.files.filter((file) => file.role === "context"), [state.files]);
@@ -821,6 +825,25 @@ export function App() {
       recordStreamRef.current.scrollTop = recordStreamRef.current.scrollHeight;
     }
   }, [state.meetingMessages.length]);
+
+  useEffect(() => {
+    if (!previewFile || previewFile.role !== "primary") {
+      setTopicPreviewFrame(null);
+      return;
+    }
+    const updateTopicPreviewFrame = () => {
+      const rect = topicPanelRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      setTopicPreviewFrame({ left: rect.left, width: rect.width });
+    };
+    updateTopicPreviewFrame();
+    const frameId = window.requestAnimationFrame(updateTopicPreviewFrame);
+    window.addEventListener("resize", updateTopicPreviewFrame);
+    return () => {
+      window.cancelAnimationFrame(frameId);
+      window.removeEventListener("resize", updateTopicPreviewFrame);
+    };
+  }, [fullscreenPanel, layoutScale, leftWidth, previewFile]);
 
   const refreshAudioInputDevices = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) {
@@ -2806,6 +2829,7 @@ export function App() {
       </div>
 
       <section
+        ref={topicPanelRef}
         className={`panel topic-panel ${dragTarget === "primary" ? "dragging" : ""} ${fullscreenPanel === "topic" ? "fullscreen-panel" : ""}`}
         onDragEnter={(event) => {
           event.preventDefault();
@@ -3216,7 +3240,13 @@ export function App() {
           onClose={() => setActiveTool(null)}
         />
       )}
-      {previewFile && <FilePreviewWindow file={previewFile} onClose={() => setPreviewFileId(null)} />}
+      {previewFile && (
+        <FilePreviewWindow
+          file={previewFile}
+          topicFrame={previewFile.role === "primary" ? topicPreviewFrame : null}
+          onClose={() => setPreviewFileId(null)}
+        />
+      )}
       {webPreview && <WebPreviewWindow page={webPreview} onClose={() => setWebPreview(null)} />}
       {previewRecord && <RecordPreviewWindow record={previewRecord} onClose={() => setPreviewRecordId(null)} />}
       {generatedEditorFile && (
@@ -3561,9 +3591,21 @@ function FileThumb({
   );
 }
 
-function FilePreviewWindow({ file, onClose }: { file: DiscuzFile; onClose: () => void }) {
+function FilePreviewWindow({
+  file,
+  topicFrame,
+  onClose
+}: {
+  file: DiscuzFile;
+  topicFrame: { left: number; width: number } | null;
+  onClose: () => void;
+}) {
+  const topicStyle = topicFrame ? {
+    left: `${topicFrame.left}px`,
+    width: `${topicFrame.width}px`
+  } as CSSProperties : undefined;
   return (
-    <aside className="file-preview-window">
+    <aside className={`file-preview-window ${topicFrame ? "topic-file-preview-window" : ""}`} style={topicStyle}>
       <header className="tool-head">
         <strong>{file.originalName}</strong>
         <button className="icon-button" title="Close preview" onClick={onClose}>×</button>
@@ -3975,6 +4017,81 @@ function ClearDiscussionConfirm({
   );
 }
 
+function GlassSelect({
+  id,
+  value,
+  options,
+  onChange
+}: {
+  id?: string;
+  value: string;
+  options: GlassSelectOption[];
+  onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const selectedOption = options.find((option) => option.value === value) ?? options[0];
+
+  useEffect(() => {
+    if (!open) return;
+    const closeIfOutside = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (target && rootRef.current?.contains(target)) return;
+      setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("pointerdown", closeIfOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeIfOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+
+  const chooseOption = (event: ReactMouseEvent<HTMLButtonElement>, nextValue: string) => {
+    event.preventDefault();
+    onChange(nextValue);
+    setOpen(false);
+  };
+
+  return (
+    <div ref={rootRef} className={`glass-select ${open ? "open" : ""}`}>
+      <button
+        id={id}
+        type="button"
+        className="glass-select-button"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={(event) => {
+          event.preventDefault();
+          setOpen((current) => !current);
+        }}
+      >
+        <span>{selectedOption?.label || "选择"}</span>
+        <ChevronDown size={16} />
+      </button>
+      {open && (
+        <div className="glass-select-menu" role="listbox">
+          {options.map((option) => (
+            <button
+              key={option.value || "default"}
+              type="button"
+              className={option.value === value ? "selected" : ""}
+              role="option"
+              aria-selected={option.value === value}
+              onClick={(event) => chooseOption(event, option.value)}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 const SettingsPopover = forwardRef<HTMLElement, {
   settings: SettingsState;
   webEnabled: boolean;
@@ -4139,67 +4256,69 @@ const SettingsPopover = forwardRef<HTMLElement, {
           </label>
           <label>
             声音
-            <select
+            <GlassSelect
               value={aiDraft.realtimeVoice}
-              onChange={(event) => setAiDraft((draft) => ({ ...draft, realtimeVoice: event.target.value }))}
-            >
-              {["shimmer", "alloy", "ash", "ballad", "coral", "echo", "sage", "verse"].map((voice) => (
-                <option key={voice} value={voice}>{voice}</option>
-              ))}
-            </select>
+              options={["shimmer", "alloy", "ash", "ballad", "coral", "echo", "sage", "verse"].map((voice) => ({ value: voice, label: voice }))}
+              onChange={(value) => setAiDraft((draft) => ({ ...draft, realtimeVoice: value }))}
+            />
           </label>
           <label>
             语音模型
-            <select
+            <GlassSelect
               value={aiDraft.realtimeModel}
-              onChange={(event) => setAiDraft((draft) => ({ ...draft, realtimeModel: event.target.value }))}
-            >
-              <option value="gpt-realtime-2">gpt-realtime-2</option>
-              <option value="gpt-realtime">gpt-realtime</option>
-            </select>
+              options={[
+                { value: "gpt-realtime-2", label: "gpt-realtime-2" },
+                { value: "gpt-realtime", label: "gpt-realtime" }
+              ]}
+              onChange={(value) => setAiDraft((draft) => ({ ...draft, realtimeModel: value }))}
+            />
           </label>
           <label>
             转写模型
-            <select
+            <GlassSelect
               value={aiDraft.transcriptionModel}
-              onChange={(event) => setAiDraft((draft) => ({ ...draft, transcriptionModel: event.target.value }))}
-            >
-              <option value="gpt-4o-transcribe">gpt-4o-transcribe</option>
-              <option value="gpt-4o-mini-transcribe">gpt-4o-mini-transcribe</option>
-            </select>
+              options={[
+                { value: "gpt-4o-transcribe", label: "gpt-4o-transcribe" },
+                { value: "gpt-4o-mini-transcribe", label: "gpt-4o-mini-transcribe" }
+              ]}
+              onChange={(value) => setAiDraft((draft) => ({ ...draft, transcriptionModel: value }))}
+            />
           </label>
           <label>
             图片模型
-            <select
+            <GlassSelect
               value={aiDraft.imageModel}
-              onChange={(event) => setAiDraft((draft) => ({ ...draft, imageModel: event.target.value }))}
-            >
-              <option value="gpt-image-1.5">gpt-image-1.5</option>
-              <option value="gpt-image-1">gpt-image-1</option>
-            </select>
+              options={[
+                { value: "gpt-image-1.5", label: "gpt-image-1.5" },
+                { value: "gpt-image-1", label: "gpt-image-1" }
+              ]}
+              onChange={(value) => setAiDraft((draft) => ({ ...draft, imageModel: value }))}
+            />
           </label>
           <label>
             图片质量
-            <select
+            <GlassSelect
               value={aiDraft.imageQuality}
-              onChange={(event) => setAiDraft((draft) => ({ ...draft, imageQuality: event.target.value as AiSettings["imageQuality"] }))}
-            >
-              <option value="high">high</option>
-              <option value="auto">auto</option>
-              <option value="medium">medium</option>
-              <option value="low">low</option>
-            </select>
+              options={[
+                { value: "high", label: "high" },
+                { value: "auto", label: "auto" },
+                { value: "medium", label: "medium" },
+                { value: "low", label: "low" }
+              ]}
+              onChange={(value) => setAiDraft((draft) => ({ ...draft, imageQuality: value as AiSettings["imageQuality"] }))}
+            />
           </label>
           <label>
             回答长度
-            <select
+            <GlassSelect
               value={aiDraft.responseLength}
-              onChange={(event) => setAiDraft((draft) => ({ ...draft, responseLength: event.target.value as AiSettings["responseLength"] }))}
-            >
-              <option value="short">短</option>
-              <option value="medium">中</option>
-              <option value="long">长</option>
-            </select>
+              options={[
+                { value: "short", label: "短" },
+                { value: "medium", label: "中" },
+                { value: "long", label: "长" }
+              ]}
+              onChange={(value) => setAiDraft((draft) => ({ ...draft, responseLength: value as AiSettings["responseLength"] }))}
+            />
           </label>
           <label className="wide">
             语气风格
@@ -4224,18 +4343,18 @@ const SettingsPopover = forwardRef<HTMLElement, {
       <section className="settings-section">
         <label htmlFor="audio-input-device">输入设备</label>
         <div className="device-row">
-          <select
+          <GlassSelect
             id="audio-input-device"
             value={selectedAudioInputId}
-            onChange={(event) => setSelectedAudioInputId(event.target.value)}
-          >
-            <option value="">系统默认麦克风</option>
-            {audioInputDevices.map((device, index) => (
-              <option key={device.deviceId || index} value={device.deviceId}>
-                {device.label || `麦克风 ${index + 1}`}
-              </option>
-            ))}
-          </select>
+            options={[
+              { value: "", label: "系统默认麦克风" },
+              ...audioInputDevices.map((device, index) => ({
+                value: device.deviceId,
+                label: device.label || `麦克风 ${index + 1}`
+              }))
+            ]}
+            onChange={setSelectedAudioInputId}
+          />
           <button type="button" onClick={onRefreshAudioInputs}>刷新</button>
         </div>
         <p>{audioInputDevices.length ? "语音讨论会使用这里选择的输入设备。" : "授权麦克风后可显示完整设备名称。"}</p>

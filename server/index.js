@@ -3,6 +3,7 @@ import cors from "cors";
 import express from "express";
 import { execFile } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { promisify } from "node:util";
@@ -14,6 +15,14 @@ import JSZip from "jszip";
 import { XMLParser } from "fast-xml-parser";
 
 const execFileAsync = promisify(execFile);
+const officeConverterCandidates = [
+  process.env.LIBREOFFICE_PATH,
+  "/opt/homebrew/bin/soffice",
+  "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+  "soffice",
+  "libreoffice"
+].filter(Boolean);
+let cachedOfficeConverter;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
 const dataDir = path.join(rootDir, "data");
@@ -285,8 +294,9 @@ function detectKindFromMetadata(originalName, mimeType = "", storedName = "") {
   if (mime === "application/pdf" || ext === ".pdf") return "pdf";
   if (mime === "application/msword" || ext === ".doc") return "doc";
   if (ext === ".docx") return "docx";
+  if (mime === "application/vnd.ms-powerpoint" || ext === ".ppt") return "ppt";
   if (ext === ".pptx") return "pptx";
-  if ([".xlsx", ".xlsm", ".xls", ".csv", ".tsv"].includes(ext)) return "spreadsheet";
+  if (mime === "application/vnd.ms-excel" || [".xlsx", ".xlsm", ".xls", ".csv", ".tsv"].includes(ext)) return "spreadsheet";
   if ([".md", ".markdown"].includes(ext)) return "markdown";
   if ([".txt", ".json", ".log", ".xml", ".html", ".css", ".js", ".ts", ".tsx", ".jsx"].includes(ext)) return "text";
   return "unknown";
@@ -308,6 +318,55 @@ function cleanHtml(value) {
   return String(value || "")
     .replace(/\u0000/g, "")
     .trim();
+}
+
+async function resolveOfficeConverter() {
+  if (cachedOfficeConverter !== undefined) return cachedOfficeConverter;
+  for (const candidate of officeConverterCandidates) {
+    try {
+      if (path.isAbsolute(candidate)) {
+        if (fs.existsSync(candidate)) {
+          cachedOfficeConverter = candidate;
+          return cachedOfficeConverter;
+        }
+        continue;
+      }
+      const result = await execFileAsync("which", [candidate], { maxBuffer: 1024 * 1024 });
+      const resolved = cleanText(result.stdout).split("\n")[0];
+      if (resolved) {
+        cachedOfficeConverter = resolved;
+        return cachedOfficeConverter;
+      }
+    } catch {
+      // Try the next known LibreOffice command name/location.
+    }
+  }
+  cachedOfficeConverter = null;
+  return cachedOfficeConverter;
+}
+
+async function extractConvertedLegacyOffice(filePath, targetExtension, label, extractor) {
+  const command = await resolveOfficeConverter();
+  if (!command) {
+    throw new Error(`无法解析旧版 ${label}：未找到 LibreOffice/soffice 转换器。`);
+  }
+
+  const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "discuz-office-"));
+  try {
+    const target = targetExtension.replace(/^\./, "");
+    await execFileAsync(command, ["--headless", "--convert-to", target, "--outdir", outputDir, filePath], {
+      maxBuffer: 50 * 1024 * 1024,
+      timeout: 90_000
+    });
+    const convertedName = fs.readdirSync(outputDir)
+      .find((name) => path.extname(name).toLowerCase() === `.${target.toLowerCase()}`);
+    if (!convertedName) {
+      throw new Error(`LibreOffice 未生成 ${target} 转换结果。`);
+    }
+    return await extractor(path.join(outputDir, convertedName));
+  } finally {
+    fs.rmSync(outputDir, { recursive: true, force: true });
+  }
 }
 
 function topicUploadDir(topicId) {
@@ -433,11 +492,15 @@ async function extractDocx(filePath) {
 }
 
 async function extractDoc(filePath) {
-  const [text, html] = await Promise.all([
-    execFileAsync("textutil", ["-convert", "txt", "-stdout", filePath], { maxBuffer: 20 * 1024 * 1024 }),
-    execFileAsync("textutil", ["-convert", "html", "-stdout", filePath], { maxBuffer: 50 * 1024 * 1024 })
-  ]);
-  return { text: cleanText(text.stdout), html: cleanHtml(html.stdout) };
+  try {
+    const [text, html] = await Promise.all([
+      execFileAsync("textutil", ["-convert", "txt", "-stdout", filePath], { maxBuffer: 20 * 1024 * 1024 }),
+      execFileAsync("textutil", ["-convert", "html", "-stdout", filePath], { maxBuffer: 50 * 1024 * 1024 })
+    ]);
+    return { text: cleanText(text.stdout), html: cleanHtml(html.stdout) };
+  } catch {
+    return extractConvertedLegacyOffice(filePath, "docx", "Word .doc", extractDocx);
+  }
 }
 
 function collectText(value, output = []) {
@@ -474,6 +537,10 @@ async function extractPptx(filePath) {
     if (texts.length) slides.push(`Slide ${slides.length + 1}\n${texts.join("\n")}`);
   }
   return { text: cleanText(slides.join("\n\n")), html: "" };
+}
+
+async function extractPpt(filePath) {
+  return extractConvertedLegacyOffice(filePath, "pptx", "PowerPoint .ppt", extractPptx);
 }
 
 function asArray(value) {
@@ -602,11 +669,15 @@ function extractDelimitedSpreadsheet(filePath, delimiter, label) {
 
 async function extractSpreadsheet(filePath, metadata = {}) {
   const ext = path.extname(metadata.originalName || filePath).toLowerCase();
+  const mime = metadata.mimeType || "";
   if (ext === ".xlsx" || ext === ".xlsm") return extractXlsx(filePath);
+  if (ext === ".xls" || mime === "application/vnd.ms-excel") {
+    return extractConvertedLegacyOffice(filePath, "xlsx", "Excel .xls", extractXlsx);
+  }
   if (ext === ".csv") return extractDelimitedSpreadsheet(filePath, ",", "CSV 表格");
   if (ext === ".tsv") return extractDelimitedSpreadsheet(filePath, "\t", "TSV 表格");
   return {
-    text: "已识别为 Excel 表格，但当前仅支持直接读取 .xlsx、.xlsm、.csv 和 .tsv。请将旧版 .xls 转换为 .xlsx 或 .csv 后重新上传。",
+    text: "已识别为 Excel 表格，但当前仅支持直接读取 .xlsx、.xlsm、.csv、.tsv，并通过 LibreOffice 转换读取旧版 .xls。",
     html: ""
   };
 }
@@ -686,6 +757,7 @@ async function extractContentAtPath(filePath, kind, metadata = {}) {
   if (kind === "pdf") return extractPdf(filePath);
   if (kind === "doc") return extractDoc(filePath);
   if (kind === "docx") return extractDocx(filePath);
+  if (kind === "ppt") return extractPpt(filePath);
   if (kind === "pptx") return extractPptx(filePath);
   if (kind === "spreadsheet") return extractSpreadsheet(filePath, metadata);
   if (kind === "markdown" || kind === "text") {
@@ -702,7 +774,7 @@ async function extractContentFromFile(file, kind) {
 }
 
 function shouldExtractInBackground(kind) {
-  return ["image", "pdf", "doc", "docx", "pptx", "spreadsheet", "markdown", "text"].includes(kind);
+  return ["image", "pdf", "doc", "docx", "ppt", "pptx", "spreadsheet", "markdown", "text"].includes(kind);
 }
 
 function pendingExtractionSummary(kind) {
@@ -998,10 +1070,12 @@ async function refreshStoredFiles() {
     let renderedHtml = row.rendered_html || "";
     let extractionStatus = row.extraction_status || "complete";
     let extractionError = row.extraction_error || "";
+    const staleLegacyOfficeText = cleanText(extractedText).includes("请将旧版 .xls 转换")
+      || cleanText(extractedText).includes("当前仅支持直接读取 .xlsx");
 
     if (
       fs.existsSync(filePath) &&
-      (kind !== row.kind || !cleanText(extractedText) || (["doc", "docx"].includes(kind) && !cleanHtml(renderedHtml)))
+      (kind !== row.kind || !cleanText(extractedText) || staleLegacyOfficeText || (["doc", "docx"].includes(kind) && !cleanHtml(renderedHtml)))
     ) {
       try {
         const content = await extractContentAtPath(filePath, kind, {
@@ -1339,7 +1413,7 @@ function buildDiscussionContext() {
     "整理输出工具：需要大纲、表格总结、行动项、导出记录或 Mermaid 图表时，调用 create_outline、create_table_summary、extract_action_items、export_discussion_record 或 create_diagram，把结果保存到 AI 临时生成区。用户要求下载当前文件、指定文件、会议记录、要点或完整讨论记录时，调用 download_file 直接触发下载。",
     "你可以按需调用工具打开白板、临时草稿、媒体窗口，或打开某个主题/资源文件的重点预览窗口辅助讨论。临时窗口用于当次讨论，关闭后视为临时内容；只有用户明确要求保存时，才把内容作为成果或资源延续。",
     "主题区文件是阅读和主要讨论中心；如果需要修改主题文件内容，先调用 copy_file_to_generated，把副本放到 AI 临时生成文案区编辑，不要直接改原主题文件。",
-    "如果主题文件或背景材料是 Word、Excel/CSV 或 PPT，你可以基于已提取的正文、工作表、表头、行内容或幻灯片文本进行讨论。用户要求讨论 Office 文件时，优先调用 analyze_word_file、analyze_spreadsheet_file 或 analyze_presentation_file 获取结构化上下文，再用短句回答。",
+    "如果主题文件或背景材料是 Word、Excel/CSV 或 PPT（包括旧版 .doc/.xls/.ppt），你可以基于已提取的正文、工作表、表头、行内容或幻灯片文本进行讨论。用户要求讨论 Office 文件时，优先调用 analyze_word_file、analyze_spreadsheet_file 或 analyze_presentation_file 获取结构化上下文，再用短句回答。",
     "用户要求分析图片、截图、地图、海报或照片时，调用 analyze_image_file 获取视觉摘要；如果需要编辑 Excel 表格，调用 edit_spreadsheet_file 先生成可审核的修改方案，不要直接破坏原表。",
     "资源用户区文件只作为阅读和参考上下文，不纳入主要讨论对象，除非用户明确要求打开某个资源文件作为前台临时主题讨论。资源原件不能编辑；需要修改时必须先复制到 AI 临时生成文案区。",
     "AI 临时生成文案区的文件可以编辑、修改、迭代。所有文件都可以通过打开前台预览窗口临时成为当前讨论对象，但这不会改变它们所属区域或最终成果状态。",
@@ -2168,7 +2242,7 @@ app.post("/api/realtime/session", async (req, res) => {
       {
         type: "function",
         name: "analyze_spreadsheet_file",
-        description: "Load structured discussion context for an Excel/CSV/TSV spreadsheet using the Spreadsheets skill bridge. Use before answering requests about tables, sheets, fields, trends, anomalies, formulas, or analysis plans.",
+        description: "Load structured discussion context for an Excel .xls/.xlsx/.xlsm, CSV, or TSV spreadsheet using the Spreadsheets skill bridge. Use before answering requests about tables, sheets, fields, trends, anomalies, formulas, or analysis plans.",
         parameters: {
           type: "object",
           properties: {
@@ -2183,7 +2257,7 @@ app.post("/api/realtime/session", async (req, res) => {
       {
         type: "function",
         name: "analyze_presentation_file",
-        description: "Load structured discussion context for a PowerPoint .pptx file using the Presentations skill bridge. Use before answering requests to discuss deck story, slide flow, claims, evidence, audience fit, or improvements.",
+        description: "Load structured discussion context for a PowerPoint .ppt/.pptx file using the Presentations skill bridge. Use before answering requests to discuss deck story, slide flow, claims, evidence, audience fit, or improvements.",
         parameters: {
           type: "object",
           properties: {
