@@ -1140,6 +1140,25 @@ function replaceDirections(items) {
   return getDirections(topicId);
 }
 
+function appendDirections(items) {
+  const topicId = getActiveTopicId();
+  const cleaned = (Array.isArray(items) ? items : [])
+    .map((item) => cleanText(typeof item === "string" ? item : item?.text))
+    .filter(Boolean)
+    .slice(0, 3);
+  if (!cleaned.length) return getDirections(topicId);
+  const current = getDirections(topicId);
+  const createdAt = now();
+  const insert = db.prepare(`
+    INSERT INTO discussion_directions (id, topic_id, text, completed, sort_order, created_at, updated_at)
+    VALUES (?, ?, ?, 0, ?, ?, ?)
+  `);
+  cleaned.forEach((text, index) => insert.run(crypto.randomUUID(), topicId, text, current.length + index, createdAt, createdAt));
+  addActivity("Directions", `新增 ${cleaned.length} 个讨论方向`, createdAt);
+  writeTopicSnapshot(topicId);
+  return getDirections(topicId);
+}
+
 function completeDirection(directionIdOrQuery, noteText = "") {
   const topicId = getActiveTopicId();
   const query = cleanText(directionIdOrQuery).toLowerCase();
@@ -1306,7 +1325,9 @@ function buildDiscussionContext() {
     "讨论主题不只来自主题文件，也来自用户在底部输入框提交的主题、观点、问题和链接。用户的文字输入优先级很高，要把它当作当前讨论指令的一部分。",
     "主题确认节奏：先和用户轻松聊一句，弄清用户想做什么。只有当用户已经说出具体讨论内容、问题或目标后，且能从用户刚说的话、当前主题文件或图片摘要中概括主题，才调用 propose_discussion_topic 生成拟确认主题给用户确认。用户还没明确说要讨论什么时，只打招呼并询问，不要主动拟主题。主题确认前，不要规划讨论方向、不要生成 todo，也不要进入长期展开。",
     "随着讨论深入，如果你判断已经形成更准确的讨论主题，必须调用 propose_discussion_topic 请用户确认。若你发现用户正在严重偏离已确认主题，也要调用 propose_discussion_topic 提醒用户，并说明是继续原主题还是确认更换主题。",
-    "讨论方向 todo 的节奏：主题一旦被用户确认，就立即调用 propose_discussion_directions 提出 3 到 5 个方向等用户确认，不要再等待几轮讨论。语音只轻轻提示“我先列几个方向，你看要不要删改”。用户确认后，界面会在主题区显示 todo。用户不满意时，优先调用 update_discussion_directions 用完整新列表快速替换；用户只想删掉某一条时，可以提醒他点该条右侧删除按钮。每完成一个方向，调用 complete_discussion_direction 标记完成，并写一条简洁记录。",
+    "讨论方向 todo 的节奏：主题一旦被用户确认，就立即调用 propose_discussion_directions 提出 1 到 3 个方向等用户确认，一次最多 3 个，不要再等待几轮讨论。语音只轻轻提示“我先列几个方向，你看要不要删改”。用户确认后，界面会在主题区显示 todo。用户明确要求“再加一个/再补几个/增加方向”时，调用 add_discussion_directions 追加 1 到 3 个新方向；用户不满意时，优先调用 update_discussion_directions 用完整新列表快速替换；用户只想删掉某一条时，可以提醒他点该条右侧删除按钮。每完成一个方向，调用 complete_discussion_direction 标记完成，并写一条简洁记录。",
+    "语音确认规则：如果你刚提出了待确认讨论主题，用户说“确认”“可以”“就这个”“对”“没问题”等肯定语义时，调用 confirm_discussion_topic；如果你刚提出了待确认讨论方向 todo，用户说类似肯定语义时，调用 confirm_discussion_directions。不要只口头说已确认，必须调用对应工具保存到界面。",
+    "语音结束规则：如果用户说“结束讨论”“断开连接”“先到这”“停一下今天到这里”等结束语音会话的意图，先用一句中文回应你会收尾，然后调用 end_voice_discussion。工具返回后再说一句很短的收束回应；应用会在这句回应结束后断开语音并保存记录。",
     "如果收到系统事件提示主题区文件被添加或删除，你必须立即用 1 句中文询问用户下一步想怎么讨论；不要调用 propose_discussion_topic、propose_discussion_directions 或 update_discussion_directions，不要修改、重命名、清空或重新确认当前讨论主题，除非用户明确要求修改主题或重新确认主题。",
     "如果收到系统事件提示当前主题文件已被删除，你必须立即停止基于该文件继续分析，并询问用户是继续用剩余主题文件讨论、上传新的主题文件，还是暂停这个主题；不要主动改变讨论主题。",
     "每次重新打开语音时，你必须先读取下面的讨论记忆，承接此前已经形成的要点、结论、问题和行动项。不要让用户重复已经讨论过的背景；如果记忆和当前文件冲突，以当前文件为准并说明差异。",
@@ -1479,6 +1500,12 @@ app.post("/api/directions", (req, res) => {
   res.json({ directions: nextDirections, notes: getNotes(), activities: getActivities(), topics: getTopics() });
 });
 
+app.post("/api/directions/add", (req, res) => {
+  const directions = Array.isArray(req.body?.directions) ? req.body.directions : [];
+  const nextDirections = appendDirections(directions);
+  res.json({ directions: nextDirections, notes: getNotes(), activities: getActivities(), topics: getTopics() });
+});
+
 app.post("/api/directions/:id/complete", (req, res) => {
   const row = completeDirection(req.params.id, req.body?.note || "");
   if (!row) return res.status(404).json({ error: "Direction not found" });
@@ -1531,11 +1558,12 @@ app.post("/api/discussion/reset", (_req, res) => {
   db.prepare("SELECT * FROM files WHERE topic_id = ?").all(topicId).forEach(removeStoredFile);
   db.prepare("DELETE FROM files WHERE topic_id = ?").run(topicId);
   db.prepare("DELETE FROM notes WHERE topic_id = ?").run(topicId);
+  db.prepare("DELETE FROM discussion_records WHERE topic_id = ?").run(topicId);
   db.prepare("DELETE FROM discussion_inputs WHERE topic_id = ?").run(topicId);
   db.prepare("DELETE FROM meeting_messages WHERE topic_id = ?").run(topicId);
   db.prepare("DELETE FROM discussion_directions WHERE topic_id = ?").run(topicId);
   db.prepare("DELETE FROM activities WHERE topic_id = ?").run(topicId);
-  db.prepare("UPDATE topics SET title = ?, updated_at = ? WHERE id = ?").run(`新讨论 ${shortLocalTime(now())}`, now(), topicId);
+  db.prepare("UPDATE topics SET title = ?, updated_at = ? WHERE id = ?").run("", now(), topicId);
   writeTopicSnapshot(topicId);
   res.json({
     files: getFiles(),
@@ -2717,14 +2745,14 @@ app.post("/api/realtime/session", async (req, res) => {
       {
         type: "function",
         name: "propose_discussion_directions",
-        description: "Propose 3 to 5 discussion directions immediately after the user confirms the topic. This only asks the user to confirm; it does not save the todo list yet.",
+        description: "Propose 1 to 3 discussion directions immediately after the user confirms the topic. This only asks the user to confirm; it does not save the todo list yet. Never propose more than 3 at once.",
         parameters: {
           type: "object",
           properties: {
             directions: {
               type: "array",
-              minItems: 3,
-              maxItems: 5,
+              minItems: 1,
+              maxItems: 3,
               items: { type: "string" },
               description: "Concise Chinese discussion directions for the current confirmed topic."
             },
@@ -2734,6 +2762,25 @@ app.post("/api/realtime/session", async (req, res) => {
             }
           },
           required: ["directions", "reason"],
+          additionalProperties: false
+        }
+      },
+      {
+        type: "function",
+        name: "add_discussion_directions",
+        description: "Append 1 to 3 new discussion directions to the existing confirmed todo list only when the user explicitly asks to add more directions.",
+        parameters: {
+          type: "object",
+          properties: {
+            directions: {
+              type: "array",
+              minItems: 1,
+              maxItems: 3,
+              items: { type: "string" },
+              description: "New concise Chinese directions to append after the existing list."
+            }
+          },
+          required: ["directions"],
           additionalProperties: false
         }
       },
@@ -2773,6 +2820,49 @@ app.post("/api/realtime/session", async (req, res) => {
             }
           },
           required: ["query", "note"],
+          additionalProperties: false
+        }
+      },
+      {
+        type: "function",
+        name: "confirm_discussion_topic",
+        description: "Confirm the currently pending discussion topic after the user says yes, confirm, okay, right, or similar by voice. After this succeeds, propose discussion directions.",
+        parameters: {
+          type: "object",
+          properties: {
+            title: {
+              type: "string",
+              description: "Optional pending topic title to confirm. Leave empty to confirm the latest pending proposal shown in the UI."
+            }
+          },
+          required: [],
+          additionalProperties: false
+        }
+      },
+      {
+        type: "function",
+        name: "confirm_discussion_directions",
+        description: "Confirm the currently pending discussion direction todo list after the user says yes, confirm, okay, right, or similar by voice.",
+        parameters: {
+          type: "object",
+          properties: {},
+          required: [],
+          additionalProperties: false
+        }
+      },
+      {
+        type: "function",
+        name: "end_voice_discussion",
+        description: "End the current voice discussion only when the user asks to stop, end discussion, disconnect, or says the session is done. The app will disconnect after your short closing response.",
+        parameters: {
+          type: "object",
+          properties: {
+            reason: {
+              type: "string",
+              description: "A concise reason inferred from the user's request, if any."
+            }
+          },
+          required: [],
           additionalProperties: false
         }
       },

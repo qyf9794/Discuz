@@ -64,6 +64,7 @@ type StatusLogEntry = { id: string; kind: "status" | "error"; text: string; crea
 type TaskItem = { id: string; label: string; startedAt: string };
 type ToolActivity = { id: string; label: string; status: "running" | "done" | "failed" | "cancelled"; startedAt: string; endedAt?: string; detail?: string; result?: string };
 type RealtimeToolCall = { name?: string; arguments?: string; call_id?: string };
+type PendingVoiceStop = "none" | "awaiting_closing" | "closing_started";
 type BoardItem = { id: string; kind: "text" | "image"; value: string; x: number; y: number };
 type BoardLink = { id: string; from: string; to: string };
 type DiscussionContract = { goal: string; boundaries: string[]; outputFormat: string; responseLength: "short" | "medium" | "long"; updatedAt: string };
@@ -111,10 +112,9 @@ function readAnalyserLevel(analyser?: AnalyserNode, data?: Uint8Array<ArrayBuffe
     sum += centered * centered;
   }
   const rms = Math.sqrt(sum / data.length);
-  const noiseFloor = 0.018;
+  const noiseFloor = 0.012;
   if (rms <= noiseFloor) return 0;
-  const normalized = Math.min(1, (rms - noiseFloor) / 0.18);
-  return Math.pow(normalized, 0.72);
+  return Math.min(1, (rms - noiseFloor) / 0.28);
 }
 
 function voiceStartErrorMessage(error: unknown) {
@@ -166,13 +166,31 @@ async function uploadFiles(endpoint: string, field: string, files: File[]) {
 function setCardDragImage(event: DragEvent<HTMLElement>) {
   const source = event.currentTarget;
   const rect = source.getBoundingClientRect();
-  const ghost = source.cloneNode(true) as HTMLElement;
-  ghost.classList.add("drag-ghost");
+  const preview = source.querySelector(".topic-card-preview, .thumb-preview")?.cloneNode(true) as HTMLElement | undefined;
+  const kind = source.querySelector("footer span")?.textContent?.trim() || "";
+  const name = source.querySelector("footer strong")?.textContent?.trim() || "";
+  const ghost = document.createElement("div");
+  ghost.className = "drag-ghost";
   ghost.style.width = `${rect.width}px`;
   ghost.style.height = `${rect.height}px`;
+  if (preview) {
+    preview.classList.add("drag-ghost-preview");
+    ghost.appendChild(preview);
+  }
+  const footer = document.createElement("footer");
+  if (kind) {
+    const kindLabel = document.createElement("span");
+    kindLabel.textContent = kind;
+    footer.appendChild(kindLabel);
+  }
+  const nameLabel = document.createElement("strong");
+  nameLabel.textContent = name || "文件";
+  footer.appendChild(nameLabel);
+  ghost.appendChild(footer);
   document.body.appendChild(ghost);
+  window.getComputedStyle(ghost).opacity;
   event.dataTransfer.setDragImage(ghost, Math.min(36, rect.width / 2), Math.min(28, rect.height / 2));
-  window.setTimeout(() => ghost.remove(), 0);
+  window.requestAnimationFrame(() => window.requestAnimationFrame(() => ghost.remove()));
 }
 
 function toolCallLabel(name = "任务") {
@@ -233,8 +251,12 @@ function toolCallLabel(name = "任务") {
     generate_image: "生成图片",
     propose_discussion_directions: "建议讨论方向",
     update_discussion_directions: "更新讨论方向",
+    add_discussion_directions: "追加讨论方向",
     complete_discussion_direction: "完成讨论方向",
-    propose_discussion_topic: "确认讨论主题"
+    propose_discussion_topic: "确认讨论主题",
+    confirm_discussion_topic: "确认待定主题",
+    confirm_discussion_directions: "确认待定方向",
+    end_voice_discussion: "结束语音讨论"
   } as Record<string, string>)[name] || name;
 }
 
@@ -443,6 +465,7 @@ export function App() {
   const [webEnabled, setWebEnabled] = useState(true);
   const [meetingRecordEnabled, setMeetingRecordEnabled] = useState(() => localStorage.getItem("discuz-meeting-record-enabled") !== "false");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [clearConfirmOpen, setClearConfirmOpen] = useState(false);
   const [directionProposal, setDirectionProposal] = useState<DirectionProposal | null>(null);
   const [settingsPopoverStyle, setSettingsPopoverStyle] = useState<CSSProperties>({});
   const [micPermissionOpen, setMicPermissionOpen] = useState(false);
@@ -490,7 +513,8 @@ export function App() {
   );
   const [drawing, setDrawing] = useState(false);
   const [voiceState, setVoiceState] = useState<VoiceState>("idle");
-  const [voiceLevel, setVoiceLevel] = useState(0);
+  const [voiceInputLevel, setVoiceInputLevel] = useState(0);
+  const [voiceOutputLevel, setVoiceOutputLevel] = useState(0);
   const [transcript, setTranscript] = useState("");
   const [statusText, setStatusText] = useState("Ready");
   const [error, setError] = useState("");
@@ -522,6 +546,7 @@ export function App() {
   const voiceSessionStartedAtRef = useRef<string | null>(null);
   const voiceReconnectTimerRef = useRef<number | null>(null);
   const voiceMeterRef = useRef<VoiceMeter | null>(null);
+  const pendingVoiceStopAfterResponseRef = useRef<PendingVoiceStop>("none");
   const pendingTaskCountRef = useRef(0);
   const activeTaskLabelRef = useRef("");
   const backgroundParsingActiveRef = useRef(false);
@@ -1412,11 +1437,13 @@ export function App() {
     }
   };
 
-  const confirmDiscussionTopic = async (title: string) => {
+  const confirmDiscussionTopic = async (title: string, options: { notifyRealtime?: boolean } = {}) => {
+    const confirmedTitle = title.trim();
+    if (!confirmedTitle) throw new Error("Missing discussion topic title.");
     const response = await fetch("/api/discussion-topic", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ topic: title })
+      body: JSON.stringify({ topic: confirmedTitle })
     });
     if (!response.ok) throw new Error(await response.text());
     const payload = await response.json();
@@ -1428,8 +1455,9 @@ export function App() {
     }));
     setTopicProposal(null);
     setDirectionProposal(null);
+    setStatusText(`已确认主题：${confirmedTitle}`);
     const channel = dataChannelRef.current;
-    if (channel?.readyState === "open") {
+    if (options.notifyRealtime !== false && channel?.readyState === "open") {
       channel.send(JSON.stringify({
         type: "conversation.item.create",
         item: {
@@ -1437,7 +1465,7 @@ export function App() {
           role: "user",
           content: [{
             type: "input_text",
-            text: `系统事件：用户已确认讨论主题《${title}》。请立即基于当前主题、主题文件和用户输入调用 propose_discussion_directions，提出 3 到 5 个讨论方向供用户确认。语音只简单说“我先列几个方向，你看要不要删改”。如果用户不满意，优先调用 update_discussion_directions 快速替换完整列表；如果用户只是不想要某一条，提醒他可以直接点圆圈右侧删除。`
+            text: `系统事件：用户已确认讨论主题《${confirmedTitle}》。请立即基于当前主题、主题文件和用户输入调用 propose_discussion_directions，提出 1 到 3 个讨论方向供用户确认，一次最多 3 个。语音只简单说“我先列几个方向，你看要不要删改”。如果用户明确要求增加方向，调用 add_discussion_directions 追加 1 到 3 个；如果用户不满意，优先调用 update_discussion_directions 快速替换完整列表；如果用户只是不想要某一条，提醒他可以直接点圆圈右侧删除。`
           }]
         }
       }));
@@ -1461,6 +1489,25 @@ export function App() {
       topics: payload.topics ?? current.topics
     }));
     setDirectionProposal(null);
+    setStatusText("讨论方向已确认");
+  };
+
+  const addDiscussionDirections = async (directions: string[]) => {
+    const response = await fetch("/api/directions/add", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ directions })
+    });
+    if (!response.ok) throw new Error(await response.text());
+    const payload = await response.json();
+    setState((current) => ({
+      ...current,
+      directions: payload.directions ?? current.directions,
+      notes: payload.notes ?? current.notes,
+      activities: payload.activities ?? current.activities,
+      topics: payload.topics ?? current.topics
+    }));
+    setStatusText("已追加讨论方向");
   };
 
   const completeDirection = async (direction: DiscussionDirection, note = "") => {
@@ -2114,7 +2161,7 @@ export function App() {
         const directions = (Array.isArray(args.directions) ? args.directions : [])
           .map((item: unknown) => String(item || "").trim())
           .filter(Boolean)
-          .slice(0, 5);
+          .slice(0, 3);
         if (directions.length) {
           setDirectionProposal({ directions, reason: String(args.reason || "").trim() });
           output = { ok: true, proposed: directions };
@@ -2134,6 +2181,18 @@ export function App() {
           output = { ok: false, error: "Missing discussion directions." };
         }
       }
+      if (message.name === "add_discussion_directions") {
+        const directions = (Array.isArray(args.directions) ? args.directions : [])
+          .map((item: unknown) => String(item || "").trim())
+          .filter(Boolean)
+          .slice(0, 3);
+        if (directions.length) {
+          await addDiscussionDirections(directions);
+          output = { ok: true, added: directions };
+        } else {
+          output = { ok: false, error: "Missing discussion directions to add." };
+        }
+      }
       if (message.name === "complete_discussion_direction") {
         const queryText = String(args.query || "").trim().toLowerCase();
         const candidate = state.directions.find((direction, index) => {
@@ -2145,6 +2204,41 @@ export function App() {
         } else {
           output = { ok: false, error: "No matching discussion direction found." };
         }
+      }
+      if (message.name === "confirm_discussion_topic") {
+        const title = String(args.title || topicProposal?.title || "").trim();
+        if (title) {
+          await confirmDiscussionTopic(title, { notifyRealtime: false });
+          output = {
+            ok: true,
+            confirmed: title,
+            next: "Now briefly acknowledge the confirmed topic, then call propose_discussion_directions with 1 to 3 directions for the user to confirm."
+          };
+        } else {
+          output = { ok: false, error: "No pending discussion topic to confirm." };
+        }
+      }
+      if (message.name === "confirm_discussion_directions") {
+        const directions = directionProposal?.directions ?? [];
+        if (directions.length) {
+          await confirmDirectionProposal(directions);
+          output = {
+            ok: true,
+            confirmed: directions,
+            next: "Briefly acknowledge that the direction todo list is confirmed and ask where to start."
+          };
+        } else {
+          output = { ok: false, error: "No pending discussion directions to confirm." };
+        }
+      }
+      if (message.name === "end_voice_discussion") {
+        pendingVoiceStopAfterResponseRef.current = "awaiting_closing";
+        setStatusText("正在结束讨论");
+        output = {
+          ok: true,
+          ending: true,
+          next: "Give one short Chinese closing response to the user. The app will disconnect voice after this response is done."
+        };
       }
       if (message.name === "propose_discussion_topic") {
         const title = String(args.title || "").trim();
@@ -2219,7 +2313,8 @@ export function App() {
     cancelAnimationFrame(meter.frameId);
     meter.context.close().catch(() => undefined);
     voiceMeterRef.current = null;
-    setVoiceLevel(0);
+    setVoiceInputLevel(0);
+    setVoiceOutputLevel(0);
   }, []);
 
   const startVoiceMeter = useCallback((inputStream: MediaStream) => {
@@ -2245,8 +2340,10 @@ export function App() {
     const tick = () => {
       const current = voiceMeterRef.current;
       if (!current) return;
-      const level = readAnalyserLevel(current.inputAnalyser, current.inputData);
-      setVoiceLevel((previous) => previous * 0.82 + level * 0.18);
+      const inputLevel = readAnalyserLevel(current.inputAnalyser, current.inputData);
+      const outputLevel = readAnalyserLevel(current.outputAnalyser, current.outputData);
+      setVoiceInputLevel((previous) => previous * 0.86 + inputLevel * 0.14);
+      setVoiceOutputLevel((previous) => previous * 0.86 + outputLevel * 0.14);
       current.frameId = requestAnimationFrame(tick);
     };
     meter.frameId = requestAnimationFrame(tick);
@@ -2270,6 +2367,7 @@ export function App() {
     voiceSessionRef.current += 1;
     if (voiceReconnectTimerRef.current) window.clearTimeout(voiceReconnectTimerRef.current);
     voiceReconnectTimerRef.current = null;
+    pendingVoiceStopAfterResponseRef.current = "none";
     responseActiveRef.current = false;
     responsePendingRef.current = false;
     dataChannelRef.current = null;
@@ -2290,6 +2388,7 @@ export function App() {
   useEffect(() => {
     const saveAndDisconnect = () => {
       voiceSessionRef.current += 1;
+      pendingVoiceStopAfterResponseRef.current = "none";
       responseActiveRef.current = false;
       responsePendingRef.current = false;
       dataChannelRef.current = null;
@@ -2315,6 +2414,7 @@ export function App() {
     const sessionId = voiceSessionRef.current + 1;
     voiceSessionRef.current = sessionId;
     voiceSessionStartedAtRef.current = null;
+    pendingVoiceStopAfterResponseRef.current = "none";
     assistantTranscriptRef.current = "";
     userTranscriptRef.current = "";
     setVoiceState("connecting");
@@ -2380,12 +2480,23 @@ export function App() {
           const message = JSON.parse(event.data);
           if (message.type === "response.created") {
             responseActiveRef.current = true;
+            if (pendingVoiceStopAfterResponseRef.current === "awaiting_closing") {
+              pendingVoiceStopAfterResponseRef.current = "closing_started";
+            }
             setVoiceState("thinking");
           }
           if (message.type === "response.done") {
             responseActiveRef.current = false;
             setVoiceState("live");
             if (pendingTaskCountRef.current === 0 && !backgroundParsingActiveRef.current) setStatusText("Live");
+            if (pendingVoiceStopAfterResponseRef.current === "closing_started") {
+              pendingVoiceStopAfterResponseRef.current = "none";
+              setStatusText("讨论已结束");
+              window.setTimeout(() => {
+                if (sessionId === voiceSessionRef.current) stopVoice();
+              }, 800);
+              return;
+            }
             window.setTimeout(() => flushRealtimeResponse(), 0);
           }
           if (message.type === "response.output_audio_transcript.delta") {
@@ -2561,7 +2672,7 @@ export function App() {
   };
 
   const clearDiscussion = async () => {
-    if (!window.confirm("清空当前讨论？主题文件、资源库、当前生成记录和文字输入都会清空，历史记录卡片会保留。")) return;
+    setClearConfirmOpen(false);
     disconnectVoice();
     await finalizeDiscussionRecord();
     const response = await fetch("/api/discussion/reset", { method: "POST" });
@@ -2640,6 +2751,7 @@ export function App() {
         height: `${100 / layoutScale}vh`,
         minHeight: `${100 / layoutScale}vh`,
         transform: `scale(${layoutScale})`,
+        "--topic-pane-width": `${leftWidth}%`,
         "--wallpaper-url": `url("${state.settings?.wallpaperUrl || "/assets/default-wallpaper.png"}")`
       } as CSSProperties}
     >
@@ -2675,7 +2787,7 @@ export function App() {
         <div className="voice-dock">
           <VoiceButton state={voiceState} onStart={requestVoiceStart} onStop={stopVoice} />
         </div>
-        <VoiceLevelBars state={voiceState} level={voiceLevel} />
+        <VoiceLevelBars state={voiceState} inputLevel={voiceInputLevel} outputLevel={voiceOutputLevel} />
       </div>
 
       <section
@@ -2705,7 +2817,7 @@ export function App() {
                 {fullscreenPanel === "topic" ? <Minimize2 size={17} /> : <Maximize2 size={17} />}
               </button>
               <button className="icon-button" title="新建主题" onClick={() => createNewTopic().catch((err) => setError(err.message))}><Plus size={17} /></button>
-              <button className="icon-button danger" title="Clear discussion" onClick={() => clearDiscussion().catch((err) => setError(err.message))}><Trash2 size={17} /></button>
+              <button className="icon-button danger" title="Clear discussion" onClick={() => setClearConfirmOpen(true)}><Trash2 size={17} /></button>
               <button className="icon-button" title="Choose file" onClick={() => primaryInputRef.current?.click()}><FilePlus2 size={18} /></button>
               <button ref={settingsButtonRef} className="icon-button" title="Settings" onClick={toggleSettingsPopover}><Settings2 size={18} /></button>
             </div>
@@ -3063,6 +3175,12 @@ export function App() {
           onClose={() => setMicPermissionOpen(false)}
         />
       )}
+      {clearConfirmOpen && (
+        <ClearDiscussionConfirm
+          onConfirm={() => clearDiscussion().catch((err) => setError(err.message))}
+          onClose={() => setClearConfirmOpen(false)}
+        />
+      )}
       {activeTool && (
         <ToolWindow
           tool={activeTool}
@@ -3203,18 +3321,20 @@ const StatusLogPanel = forwardRef<HTMLDivElement, { entries: StatusLogEntry[]; t
   return (
     <div className="status-log-panel" aria-live="polite">
       <div className="status-log-scroll" ref={ref}>
-        {entries.map((entry) => (
-          <p key={entry.id} className={entry.kind === "error" ? "error" : ""}>
-            <span>{shortTime(entry.createdAt)}</span>
-            {entry.text}
-          </p>
-        ))}
-        {transcript.trim() && (
-          <p>
-            <span>{shortTime(new Date().toISOString())}</span>
-            {transcript}
-          </p>
-        )}
+        <div className="status-log-content">
+          {entries.map((entry) => (
+            <p key={entry.id} className={entry.kind === "error" ? "error" : ""}>
+              <span>{shortTime(entry.createdAt)}</span>
+              {entry.text}
+            </p>
+          ))}
+          {transcript.trim() && (
+            <p>
+              <span>{shortTime(new Date().toISOString())}</span>
+              {transcript}
+            </p>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -3749,19 +3869,25 @@ function VoiceButton({
   );
 }
 
-function VoiceLevelBars({ state, level }: { state: VoiceState; level: number }) {
+function VoiceLevelBars({ state, inputLevel, outputLevel }: { state: VoiceState; inputLevel: number; outputLevel: number }) {
   const live = state === "live" || state === "thinking";
   const connecting = state === "connecting";
-  const multipliers = [0.32, 0.52, 0.82, 0.58, 1, 0.72, 0.44, 0.88, 0.64, 0.38, 0.76, 0.48];
-  return (
-    <div className={`voice-level-bars ${connecting ? "connecting" : ""} ${live ? "live" : ""}`} aria-hidden="true">
+  const multipliers = [0.48, 0.68, 0.92, 0.76, 0.56, 0.82, 1, 0.62];
+  const renderWave = (side: "user" | "ai", level: number) => (
+    <div className={`voice-waveform ${side} ${connecting ? "connecting" : ""} ${live ? "live" : ""}`} aria-hidden="true">
       {multipliers.map((multiplier, index) => {
         const activeLevel = live ? level : 0;
-        const shape = 0.42 + multiplier * 0.72;
-        const height = 4 + Math.min(1, activeLevel * shape) * 30;
-        return <span key={index} style={{ height: `${height}px`, opacity: live ? 0.46 + Math.min(1, activeLevel + 0.15) * 0.54 : 0.3 }} />;
+        const height = 3 + Math.min(1, activeLevel * multiplier) * 26;
+        return <span key={index} style={{ height: `${height}px`, opacity: live ? 0.34 + Math.min(1, activeLevel * 1.05 + 0.12) * 0.66 : 0.24 }} />;
       })}
     </div>
+  );
+
+  return (
+    <>
+      {renderWave("user", inputLevel)}
+      {renderWave("ai", outputLevel)}
+    </>
   );
 }
 
@@ -3799,6 +3925,36 @@ function MicrophonePermissionWindow({
       <div className="permission-actions">
         <button className="secondary-button" onClick={onClose}>稍后</button>
         <button className="primary-button" onClick={onRequest}>{denied ? "重新检测权限" : "请求麦克风权限"}</button>
+      </div>
+    </aside>
+  );
+}
+
+function ClearDiscussionConfirm({
+  onConfirm,
+  onClose
+}: {
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <aside className="permission-window clear-confirm-window" role="dialog" aria-modal="true" aria-labelledby="clear-confirm-title">
+      <header className="permission-head">
+        <div>
+          <Trash2 size={20} />
+          <strong id="clear-confirm-title">清空当前讨论</strong>
+        </div>
+        <button className="icon-button" title="关闭" onClick={onClose}><X size={17} /></button>
+      </header>
+      <p>
+        确认后会删除当前主题里的所有内容，包括主题文件、资源、临时文件、讨论方向、记录、要点和文字输入。
+      </p>
+      <p className="permission-warning">
+        这个操作不可撤销；完成后当前主题会变成一个空白主题。
+      </p>
+      <div className="permission-actions">
+        <button className="secondary-button" onClick={onClose}>取消</button>
+        <button className="primary-button danger-button" onClick={onConfirm}>确认清空</button>
       </div>
     </aside>
   );
