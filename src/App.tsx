@@ -576,6 +576,7 @@ export function App() {
   const currentNotes = useMemo(() => [...state.notes].reverse(), [state.notes]);
   const meetingMessages = useMemo(() => [...(state.meetingMessages ?? [])].reverse(), [state.meetingMessages]);
   const rightResourceHeight = Math.max(22, Math.min(52, topHeight - 30));
+  const rightRecordHeight = Math.max(12, 100 - rightResourceHeight - generatedHeight);
 
   const buildMeetingRecordMarkdown = useCallback(() => [
     `# ${state.discussionTopic ? `${state.discussionTopic} - 会议记录` : "会议记录"}`,
@@ -2805,7 +2806,7 @@ export function App() {
 
       <section
         className="right-stack"
-        style={{ gridTemplateRows: `${rightResourceHeight}% 10px ${generatedHeight}% 10px minmax(220px, 1fr)` }}
+        style={{ gridTemplateRows: `minmax(0, ${rightResourceHeight}fr) 10px minmax(0, ${generatedHeight}fr) 10px minmax(0, ${rightRecordHeight}fr)` }}
       >
         <section
           className={`panel resource-panel ${dragTarget === "context" ? "dragging" : ""} ${fullscreenPanel === "resources" ? "fullscreen-panel" : ""}`}
