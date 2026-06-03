@@ -58,7 +58,7 @@ type TopicProposal = { title: string; reason: string; intent: "confirm" | "drift
 type DirectionProposal = { directions: string[]; reason: string };
 type SettingsState = NonNullable<AppState["settings"]>;
 type VoiceState = "idle" | "connecting" | "live" | "thinking" | "error";
-type WebPreview = { url: string; title: string };
+type WebPreview = { url: string; title: string; embeddable?: boolean | null; embedReason?: string };
 type PanelId = "topic" | "resources" | "generated" | "record";
 type ToolId = "whiteboard" | "draft" | "image" | "video" | "audio";
 type StatusLogEntry = { id: string; kind: "status" | "error"; text: string; createdAt: string };
@@ -554,7 +554,6 @@ export function App() {
   const activeTaskLabelRef = useRef("");
   const backgroundParsingActiveRef = useRef(false);
   const assistantRespondedSinceUserRef = useRef(true);
-  const lastLocalAckAtRef = useRef(0);
   const lastStatusLogRef = useRef("Ready");
   const lastErrorLogRef = useRef("");
   const assistantTranscriptRef = useRef("");
@@ -583,7 +582,7 @@ export function App() {
     [parsingFiles]
   );
   const visibleTasks = useMemo(
-    () => [...backgroundParsingTasks, ...pendingTasks].slice(-6),
+    () => [...backgroundParsingTasks, ...pendingTasks],
     [backgroundParsingTasks, pendingTasks]
   );
   const selectedFile = useMemo(
@@ -677,7 +676,7 @@ export function App() {
     if (parsingFiles.length) {
       backgroundParsingActiveRef.current = true;
       const label = parsingFiles.length === 1 ? fileExtractionLabel(parsingFiles[0]) : `后台解析/识别 ${parsingFiles.length} 个文件`;
-      if (pendingTaskCountRef.current === 0) setStatusText(`AI正在执行：${label}，请稍等`);
+      if (pendingTaskCountRef.current === 0) setStatusText(`${label}进行中`);
       return;
     }
     if (backgroundParsingActiveRef.current) {
@@ -978,8 +977,8 @@ export function App() {
     const startedAt = new Date().toISOString();
     pendingTaskCountRef.current += 1;
     activeTaskLabelRef.current = label;
-    setPendingTasks((current) => [...current, { id, label, startedAt }].slice(-6));
-    setStatusText(`AI正在执行：${label}，请稍等`);
+    setPendingTasks((current) => [...current.filter((task) => task.id !== id), { id, label, startedAt }]);
+    setStatusText(`${label}进行中`);
     let finished = false;
     return () => {
       if (finished) return;
@@ -987,28 +986,12 @@ export function App() {
       pendingTaskCountRef.current = Math.max(0, pendingTaskCountRef.current - 1);
       setPendingTasks((current) => current.filter((task) => task.id !== id));
       if (pendingTaskCountRef.current > 0) {
-        setStatusText(`AI正在执行：${activeTaskLabelRef.current || "任务"}，请稍等`);
+        setStatusText(`${activeTaskLabelRef.current || "任务"}进行中`);
       } else {
         activeTaskLabelRef.current = "";
         setStatusText(`${label}完成`);
       }
     };
-  }, []);
-
-  const acknowledgeImmediately = useCallback((text: string, speak = false) => {
-    const clean = text.trim();
-    if (!clean) return;
-    setStatusText(clean);
-    if (!speak || !("speechSynthesis" in window) || typeof SpeechSynthesisUtterance === "undefined") return;
-    const nowMs = Date.now();
-    if (nowMs - lastLocalAckAtRef.current < 1200) return;
-    lastLocalAckAtRef.current = nowMs;
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(clean);
-    utterance.lang = "zh-CN";
-    utterance.rate = 1.08;
-    utterance.pitch = 1.08;
-    window.speechSynthesis.speak(utterance);
   }, []);
 
   const summarizeToolResult = (value: unknown) => {
@@ -1033,7 +1016,7 @@ export function App() {
       startedAt: new Date().toISOString(),
       detail
     };
-    setToolActivities((items) => [activity, ...items].slice(0, 12));
+    setToolActivities([activity]);
     return id;
   };
 
@@ -1265,7 +1248,7 @@ export function App() {
     if (!channel || channel.readyState !== "open") return false;
     if (responseActiveRef.current) {
       responsePendingRef.current = true;
-      setStatusText("AI仍在处理上一轮，稍等");
+      setStatusText("上一轮还在处理");
       return false;
     }
     responseActiveRef.current = true;
@@ -1333,7 +1316,7 @@ export function App() {
     sendRealtimeSystemEvent(
       [
         `系统事件：用户刚刚在主题区添加了主题文件：${primaryFileChangeNames(files)}。`,
-        "请立即用 1 句中文询问用户接下来想怎么讨论，例如先看哪份、想解决什么问题或是否需要你先粗看一遍。",
+        "请立即用自然短句询问用户接下来想怎么讨论，不要使用固定问法。",
         "重要约束：不要调用 propose_discussion_topic、propose_discussion_directions 或 update_discussion_directions；不要修改、重命名、清空或重新确认当前讨论主题；除非用户下一句明确要求修改主题或重新确认主题。"
       ].join("\n"),
       { blockTopicProposal: true }
@@ -1501,7 +1484,7 @@ export function App() {
           role: "user",
           content: [{
             type: "input_text",
-            text: `系统事件：用户已确认讨论主题《${confirmedTitle}》。请立即基于当前主题、主题文件和用户输入调用 propose_discussion_directions，提出 1 到 3 个讨论方向供用户确认，一次最多 3 个。语音只简单说“我先列几个方向，你看要不要删改”。如果用户明确要求增加方向，调用 add_discussion_directions 追加 1 到 3 个；如果用户不满意，优先调用 update_discussion_directions 快速替换完整列表；如果用户只是不想要某一条，提醒他可以直接点圆圈右侧删除。`
+            text: `系统事件：用户已确认讨论主题《${confirmedTitle}》。请立即基于当前主题、主题文件和用户输入调用 propose_discussion_directions，提出 1 到 3 个讨论方向供用户确认，一次最多 3 个。语音只用自然短句说明你会列出方向并请用户删改，不要使用固定话术。如果用户明确要求增加方向，调用 add_discussion_directions 追加 1 到 3 个；如果用户不满意，优先调用 update_discussion_directions 快速替换完整列表；如果用户只是不想要某一条，提醒他可以直接点圆圈右侧删除。`
           }]
         }
       }));
@@ -1592,7 +1575,6 @@ export function App() {
     const args = JSON.parse(message.arguments || "{}");
     const label = toolCallLabel(message.name);
     if (!assistantRespondedSinceUserRef.current) {
-      acknowledgeImmediately(`我在执行${label}，稍等。`, true);
       assistantRespondedSinceUserRef.current = true;
     }
     const activityId = createToolActivity(label, message.name);
@@ -3383,12 +3365,37 @@ const StatusLogPanel = forwardRef<HTMLDivElement, { entries: StatusLogEntry[]; t
 });
 
 function TaskIndicator({ tasks }: { tasks: TaskItem[] }) {
+  const [expanded, setExpanded] = useState(false);
+
+  useEffect(() => {
+    if (tasks.length <= 1) setExpanded(false);
+  }, [tasks.length]);
+
   if (!tasks.length) return null;
   const active = tasks[tasks.length - 1];
+  const label = tasks.length > 1 ? `正在执行 ${tasks.length} 个任务` : `${active.label}进行中`;
   return (
-    <div className="task-indicator" title={tasks.map((task) => task.label).join(" / ")}>
-      <Sparkles size={14} />
-      <span>{tasks.length > 1 ? `AI正在执行 ${tasks.length} 个任务` : `AI正在执行：${active.label}`}</span>
+    <div className={`task-indicator ${expanded ? "expanded" : ""}`}>
+      <button
+        type="button"
+        title={tasks.length > 1 ? "查看正在执行的任务" : active.label}
+        aria-expanded={expanded}
+        onClick={() => tasks.length > 1 && setExpanded((value) => !value)}
+      >
+        <Sparkles size={14} />
+        <span>{label}</span>
+        {tasks.length > 1 && <ChevronDown size={13} />}
+      </button>
+      {expanded && (
+        <ul>
+          {tasks.map((task) => (
+            <li key={task.id}>
+              <span />
+              {task.label}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
@@ -3414,7 +3421,7 @@ function VoiceStatusBubble({ state, statusText, ambientMode }: { state: VoiceSta
 }
 
 function ToolActivityPanel({ activities, onCancel }: { activities: ToolActivity[]; onCancel: () => void }) {
-  const visible = activities.slice(0, 4);
+  const visible = activities.slice(0, 1);
   if (!visible.length) return null;
   return (
     <div className="tool-activity-panel" aria-label="AI工具活动">
@@ -3615,6 +3622,33 @@ function FilePreviewWindow({
 }
 
 function WebPreviewWindow({ page, onClose }: { page: WebPreview; onClose: () => void }) {
+  const [embedState, setEmbedState] = useState<{ embeddable: boolean | null; reason: string }>({
+    embeddable: page.embeddable ?? null,
+    reason: page.embedReason || ""
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    setEmbedState({ embeddable: page.embeddable ?? null, reason: page.embedReason || "" });
+    fetch(`/api/web/embed-check?url=${encodeURIComponent(page.url)}`)
+      .then((response) => response.json())
+      .then((payload) => {
+        if (cancelled) return;
+        setEmbedState({
+          embeddable: payload.embeddable !== false,
+          reason: payload.reason || ""
+        });
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setEmbedState({ embeddable: false, reason: err instanceof Error ? err.message : "无法检测网页嵌入状态" });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [page.embeddable, page.embedReason, page.url]);
+
+  const blocked = embedState.embeddable === false;
   return (
     <aside className="web-preview-window">
       <header className="tool-head">
@@ -3630,8 +3664,19 @@ function WebPreviewWindow({ page, onClose }: { page: WebPreview; onClose: () => 
         </div>
       </header>
       <div className="web-preview-body">
-        <iframe title={page.title || page.url} src={page.url} />
-        <p>如果网页没有显示，说明该网站禁止嵌入，可点右上角打开。</p>
+        {blocked ? (
+          <div className="web-preview-blocked">
+            <ExternalLink size={28} />
+            <strong>这个网页不能在窗口内显示</strong>
+            <span>{embedState.reason || "网站禁止被嵌入到其他页面。"}</span>
+            <a href={page.url} target="_blank" rel="noreferrer">在浏览器打开</a>
+          </div>
+        ) : (
+          <>
+            <iframe title={page.title || page.url} src={page.url} />
+            <p>{embedState.embeddable === null ? "正在检测网页是否允许嵌入..." : "如果网页没有显示，可点右上角打开。"}</p>
+          </>
+        )}
       </div>
     </aside>
   );

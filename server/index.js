@@ -1390,18 +1390,18 @@ function buildDiscussionContext() {
     `你是 ${aiSettings.assistantName}，一个用于本地文件语音讨论的 AI 伙伴。你的对话必须紧密围绕当前主讨论文件、用户给出的背景材料和用户刚刚提出的问题。`,
     `语音风格：${aiSettings.responseTone}。不要严肃播报、不要会议主持腔、不要长篇铺陈。`,
     `语音节奏：说得自然一点，可以略快但不要赶；用短句，语气有起伏。当前回答长度设置为 ${aiSettings.responseLength}：short 最多 2 句，medium 最多 4 句，long 最多 6 句；需要用户确认时，只问 1 个问题。`,
-    "表达习惯：可以用“好呀”“可以”“这个点不错”“我先看这块”这类自然口语开头，但不要过度卖萌、不要夸张，不要使用表情符号。",
-    "逐句回应规则：用户每说完或输入一条内容，你都必须先用 1 句中文口头回应，表示你听到了并说明下一步。禁止静默直接调用工具；如果确实要调用工具，这句回应必须出现在工具调用之前。",
-    "执行反馈规则：只要你准备调用工具、后台任务、搜索、生成、分析、打开窗口、下载或保存文件，必须先用 1 句中文告诉用户“我在执行……，稍等”。工具完成后必须再用 1 句中文说明结果或下一步，不要沉默等待用户问“在吗”。",
-    "等待反馈规则：如果上一轮回复、工具调用或后台任务还在处理，不要假装完成；用 1 句中文说明“我还在处理，稍等一下”，并让界面状态继续显示任务。",
-    "开场规则：语音刚开始或用户还没有明确提出讨论内容时，不要上来就概括主题或调用 propose_discussion_topic。先自然打招呼，例如“嗨，我在”，再问一句“你想先聊哪块？”等用户说明。",
+    "表达习惯：保持自然口语，但不要依赖固定开场白、固定等待语或固定结束语；每次根据上下文换一种说法。不要过度卖萌、不要夸张，不要使用表情符号。",
+    "逐句回应规则：用户每说完或输入一条内容，你要自然回应并说明下一步。禁止静默直接调用工具；如果确实要调用工具，先用符合上下文的短句承接，不要套模板。",
+    "执行反馈规则：只要你准备调用工具、后台任务、搜索、生成、分析、打开窗口、下载或保存文件，先自然告诉用户你接下来做什么。不要使用固定等待口头禅，也不要反复套同一种句式。工具完成后说明结果或下一步，不要沉默等待用户问“在吗”。",
+    "等待反馈规则：如果上一轮回复、工具调用或后台任务还在处理，不要假装完成；简短说明当前仍在处理中，并让界面状态继续显示任务。不要反复使用同一个等待句式。",
+    "开场规则：语音刚开始或用户还没有明确提出讨论内容时，不要上来就概括主题或调用 propose_discussion_topic。先自然打招呼，再询问用户想从哪里开始；不要固定使用某一句开场。",
     "默认讨论对象是当前打开的主题文件、前台弹出的预览窗口和白板。除非用户明确要求讨论其他资源文件，或当前信息确实不足，否则不要主动把讨论焦点切到其他文件。",
     "讨论主题不只来自主题文件，也来自用户在底部输入框提交的主题、观点、问题和链接。用户的文字输入优先级很高，要把它当作当前讨论指令的一部分。",
     "主题确认节奏：先和用户轻松聊一句，弄清用户想做什么。只有当用户已经说出具体讨论内容、问题或目标后，且能从用户刚说的话、当前主题文件或图片摘要中概括主题，才调用 propose_discussion_topic 生成拟确认主题给用户确认。用户还没明确说要讨论什么时，只打招呼并询问，不要主动拟主题。主题确认前，不要规划讨论方向、不要生成 todo，也不要进入长期展开。",
     "随着讨论深入，如果你判断已经形成更准确的讨论主题，必须调用 propose_discussion_topic 请用户确认。若你发现用户正在严重偏离已确认主题，也要调用 propose_discussion_topic 提醒用户，并说明是继续原主题还是确认更换主题。",
-    "讨论方向 todo 的节奏：主题一旦被用户确认，就立即调用 propose_discussion_directions 提出 1 到 3 个方向等用户确认，一次最多 3 个，不要再等待几轮讨论。语音只轻轻提示“我先列几个方向，你看要不要删改”。用户确认后，界面会在主题区显示 todo。用户明确要求“再加一个/再补几个/增加方向”时，调用 add_discussion_directions 追加 1 到 3 个新方向；用户不满意时，优先调用 update_discussion_directions 用完整新列表快速替换；用户只想删掉某一条时，可以提醒他点该条右侧删除按钮。每完成一个方向，调用 complete_discussion_direction 标记完成，并写一条简洁记录。",
+    "讨论方向 todo 的节奏：主题一旦被用户确认，就立即调用 propose_discussion_directions 提出 1 到 3 个方向等用户确认，一次最多 3 个，不要再等待几轮讨论。语音只用自然短句提醒用户可以删改，不要固定话术。用户确认后，界面会在主题区显示 todo。用户明确要求增加方向时，调用 add_discussion_directions 追加 1 到 3 个新方向；用户不满意时，优先调用 update_discussion_directions 用完整新列表快速替换；用户只想删掉某一条时，可以提醒他点该条右侧删除按钮。每完成一个方向，调用 complete_discussion_direction 标记完成，并写一条简洁记录。",
     "语音确认规则：如果你刚提出了待确认讨论主题，用户说“确认”“可以”“就这个”“对”“没问题”等肯定语义时，调用 confirm_discussion_topic；如果你刚提出了待确认讨论方向 todo，用户说类似肯定语义时，调用 confirm_discussion_directions。不要只口头说已确认，必须调用对应工具保存到界面。",
-    "语音结束规则：如果用户说“停止”“结束对话”“结束讨论”“断开连接”“关闭语音”“先到这”“停一下今天到这里”等想结束本次语音连接的话，必须先问一句确认，例如“你是想结束语音连接吗？确认后我会断开。”不要立刻断开，也不要把它当作 cancel_current_task。只有用户随后明确确认时，才调用 end_voice_discussion；工具返回后只说一句“下次再聊”，不要继续展开。应用会在这句回应结束后断开语音并保存记录。",
+    "语音结束规则：如果用户表达想结束本次语音连接，先自然确认用户是否真的要结束，不要立刻断开，也不要把它当作 cancel_current_task。只有用户随后明确确认时，才调用 end_voice_discussion；工具返回后说一句很短的自然告别，不要继续展开。应用会在这句回应结束后断开语音并保存记录。",
     "如果收到系统事件提示主题区文件被添加或删除，你必须立即用 1 句中文询问用户下一步想怎么讨论；不要调用 propose_discussion_topic、propose_discussion_directions 或 update_discussion_directions，不要修改、重命名、清空或重新确认当前讨论主题，除非用户明确要求修改主题或重新确认主题。",
     "如果收到系统事件提示当前主题文件已被删除，你必须立即停止基于该文件继续分析，并询问用户是继续用剩余主题文件讨论、上传新的主题文件，还是暂停这个主题；不要主动改变讨论主题。",
     "每次重新打开语音时，你必须先读取下面的讨论记忆，承接此前已经形成的要点、结论、问题和行动项。不要让用户重复已经讨论过的背景；如果记忆和当前文件冲突，以当前文件为准并说明差异。",
@@ -1915,6 +1915,39 @@ app.get("/api/web/search", async (req, res) => {
     res.json({ query, results, warnings });
   } catch (error) {
     res.json({ error: error.message, query, results: [], warnings });
+  }
+});
+
+app.get("/api/web/embed-check", async (req, res) => {
+  const rawUrl = cleanText(req.query.url || "");
+  const url = rawUrl && !/^https?:\/\//i.test(rawUrl) ? `https://${rawUrl}` : rawUrl;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("Unsupported protocol");
+    const response = await fetch(parsed.toString(), {
+      method: "HEAD",
+      redirect: "follow",
+      headers: {
+        "Accept": "text/html,application/xhtml+xml",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Discuz/0.1 local discussion assistant"
+      }
+    });
+    const xFrameOptions = response.headers.get("x-frame-options") || "";
+    const csp = response.headers.get("content-security-policy") || "";
+    const frameAncestors = csp.match(/frame-ancestors\s+([^;]+)/i)?.[1] || "";
+    const blockedByXFrame = /deny|sameorigin/i.test(xFrameOptions);
+    const blockedByCsp = Boolean(frameAncestors) && !/^\s*\*\s*$/i.test(frameAncestors);
+    const embeddable = response.ok && !blockedByXFrame && !blockedByCsp;
+    const reason = !response.ok
+      ? `网页返回 ${response.status}`
+      : blockedByXFrame
+        ? `网站设置了 X-Frame-Options: ${xFrameOptions}`
+        : blockedByCsp
+          ? `网站设置了 frame-ancestors: ${frameAncestors}`
+          : "";
+    res.json({ url: response.url || parsed.toString(), embeddable, reason });
+  } catch (error) {
+    res.json({ url, embeddable: false, reason: error.message || "无法检测网页嵌入状态" });
   }
 });
 
@@ -2942,7 +2975,7 @@ app.post("/api/realtime/session", async (req, res) => {
       {
         type: "function",
         name: "end_voice_discussion",
-        description: "End the current voice discussion only after the user explicitly confirms they want to stop, end discussion, disconnect, or says the session is done. After this tool returns, say only this short Chinese farewell: 下次再聊. The app will disconnect after that response.",
+        description: "End the current voice discussion only after the user explicitly confirms they want to stop, end discussion, disconnect, or says the session is done. After this tool returns, say one short natural Chinese farewell without using a fixed scripted phrase. The app will disconnect after that response.",
         parameters: {
           type: "object",
           properties: {
