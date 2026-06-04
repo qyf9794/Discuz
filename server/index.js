@@ -2006,21 +2006,133 @@ function buildBackgroundTaskPrompt(row, files) {
   ].filter(Boolean).join("\n\n");
 }
 
+function webResearchResultLines(results) {
+  return results.map((result, index) => [
+    `${index + 1}. ${cleanText(result.title) || "Untitled"}`,
+    `URL: ${cleanText(result.url)}`,
+    result.snippet ? `摘要: ${compactPromptText(result.snippet, 500)}` : "",
+    result.details?.date ? `日期: ${cleanText(result.details.date)}` : "",
+    result.details?.time ? `时间: ${cleanText(result.details.time)}` : "",
+    result.details?.venue ? `地点: ${cleanText(result.details.venue)}` : "",
+    result.details?.teams ? `对阵/对象: ${cleanText(Array.isArray(result.details.teams) ? result.details.teams.join(" vs ") : result.details.teams)}` : "",
+    result.details?.status ? `状态: ${cleanText(result.details.status)}` : "",
+    result.details?.notes ? `备注: ${cleanText(result.details.notes)}` : ""
+  ].filter(Boolean).join("\n")).join("\n\n");
+}
+
+function webResearchSourceScore(result) {
+  const url = cleanText(result?.url).toLowerCase();
+  const title = cleanText(result?.title).toLowerCase();
+  let score = 0;
+  if (/fifa\.com|inside\.fifa\.com/.test(url)) score += 80;
+  if (/wikipedia\.org/.test(url)) score += 30;
+  if (/fourfourtwo|apnews|reuters|espn|bbc|skysports|sofascore/.test(url)) score += 20;
+  if (/schedule|fixture|fixtures|赛程|日程|match/.test(`${url} ${title}`)) score += 25;
+  if (result?.snippet) score += 8;
+  if (result?.details && Object.keys(result.details).length) score += 15;
+  return score;
+}
+
+function softTimeout(ms, label) {
+  return new Promise((_, reject) => {
+    setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+}
+
+async function readSearchResultPages(results, maxPages = 1) {
+  const seen = new Set();
+  const candidates = [...results]
+    .filter((result) => result?.url && !seen.has(result.url) && seen.add(result.url))
+    .sort((first, second) => webResearchSourceScore(second) - webResearchSourceScore(first))
+    .slice(0, maxPages * 2);
+  const pages = [];
+  for (const result of candidates) {
+    if (pages.length >= maxPages) break;
+    try {
+      const page = await Promise.race([
+        readPublicWebPage(result.url, 6000),
+        softTimeout(9000, `Read ${result.url}`)
+      ]);
+      pages.push({
+        title: page.title || result.title,
+        url: page.url || result.url,
+        source: page.source,
+        text: compactPromptText(page.text || "", 4500)
+      });
+    } catch (error) {
+      pages.push({
+        title: result.title,
+        url: result.url,
+        source: "read-failed",
+        text: `读取失败：${error instanceof Error ? error.message : String(error)}`
+      });
+    }
+  }
+  return pages;
+}
+
+function buildWebResearchPrompt(row, searchOutput, pages) {
+  const query = row.prompt || row.title;
+  const resultLines = webResearchResultLines(searchOutput.results || []);
+  const pageBlocks = pages.map((page, index) => [
+    `来源 ${index + 1}：${page.title}`,
+    `URL: ${page.url}`,
+    `读取状态: ${page.source}`,
+    page.text
+  ].join("\n")).join("\n\n");
+  return [
+    "你是联网研究整理器。请根据搜索结果和已读取网页，生成用户真正需要的 Markdown 成果。",
+    "硬性要求：不要只输出网址列表；必须把可验证的信息整理成表格或清单。每条重要信息都要带来源标题或 URL。",
+    "如果用户要日程/赛程：不要等待继续读取网页；只要搜索卡片已经出现可用网站，就立刻基于卡片里的标题、摘要、日期、时间、地点、对阵等信息整理 Markdown 表格。",
+    "赛程表列至少包含 日期/阶段或场次/对阵或对象/地点或场馆/时间或状态/来源。没有球队或具体时间时，明确写“待官方确认”或“来源未给出”，不要编造。",
+    "如果搜索卡片只提供网址而没有具体赛程信息，输出“可确认信息”和“信息缺口”，并列出建议优先打开的 1 到 3 个来源；不要把 20 个网址原样粘贴成最终结果。",
+    `任务标题：${row.title}`,
+    `用户要求：${query}`,
+    searchOutput.answer ? `搜索摘要：${compactPromptText(searchOutput.answer, 1200)}` : "",
+    resultLines ? `搜索卡片：\n${compactPromptText(resultLines, 6000)}` : "",
+    pageBlocks ? `已读取网页：\n${pageBlocks}` : "已读取网页：无"
+  ].filter(Boolean).join("\n\n");
+}
+
 async function executeBackgroundTask(row) {
   const files = backgroundTaskFiles(row);
   if (row.kind === "web_search") {
     const query = row.prompt || row.title;
     const searchOutput = await runWebSearch(query, 20);
-    const markdown = [
-      `# ${row.title}`,
-      "",
-      searchOutput.answer || `已找到 ${searchOutput.results.length} 条结果。`,
-      "",
-      "## 搜索结果",
-      formatSearchResultText(searchOutput.results),
-      searchOutput.warnings?.length ? `\n## 限制\n${searchOutput.warnings.map((item) => `- ${item}`).join("\n")}` : ""
-    ].filter(Boolean).join("\n\n");
-    return { markdown, summary: searchOutput.answer || `找到 ${searchOutput.results.length} 条结果。` };
+    const shouldReadOnePage = /指定|第一个|这个链接|这条链接|按照.*链接|按.*链接|read\s+page|specific\s+link/i.test(query);
+    const pages = shouldReadOnePage ? await readSearchResultPages(searchOutput.results || [], 1) : [];
+    try {
+      const synthesized = await runBackgroundTaskText(buildWebResearchPrompt(row, searchOutput, pages), 3600);
+      const markdown = [
+        synthesized || `# ${row.title}\n\n没有整理出可用结果。`,
+        searchOutput.warnings?.length ? `\n## 搜索限制\n${searchOutput.warnings.map((item) => `- ${item}`).join("\n")}` : ""
+      ].filter(Boolean).join("\n\n");
+      return { markdown, summary: summarizeText(markdown, row.title) };
+    } catch (error) {
+      const topSources = (searchOutput.results || []).slice(0, 5);
+      const markdown = [
+        `# ${row.title}`,
+        "",
+        "后台模型未能完成二次整理。下面先给出基于搜索卡片可确认的信息与缺口，避免只返回网址列表。",
+        "",
+        "## 可确认信息",
+        searchOutput.answer || `找到 ${searchOutput.results.length} 条候选来源。`,
+        "",
+        "## 优先来源",
+        topSources.length ? topSources.map((result, index) => [
+          `${index + 1}. ${result.title}`,
+          result.snippet ? `- 信息：${compactPromptText(result.snippet, 260)}` : "- 信息：搜索卡片未给出具体日程文本。",
+          `- 来源：${result.url}`
+        ].join("\n")).join("\n\n") : "没有可用来源。",
+        "",
+        "## 信息缺口",
+        "- 如果上面没有日期、阶段、对阵、时间或地点，说明搜索卡片没有提供可直接整理成赛程表的内容。",
+        "- 可以继续指定一个来源打开读取，但默认不会连续读取多个网页，以免拖慢响应。",
+        "",
+        `## 整理失败原因\n- ${error instanceof Error ? error.message : String(error)}`
+      ].join("\n");
+      return { markdown, summary: "已找到候选来源，但后台模型未能完成日程整理。" };
+    }
   }
   try {
     const markdown = await runBackgroundTaskText(buildBackgroundTaskPrompt(row, files));
