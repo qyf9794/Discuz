@@ -4660,7 +4660,7 @@ function buildRealtimeSessionConfig(aiSettings) {
     instructions: buildDiscussionContext(),
     tools: realtimeToolDefinitionsForSession(aiSettings),
     tool_choice: "auto",
-    max_response_output_tokens: 300,
+    max_output_tokens: 300,
     truncation: {
       type: "retention_ratio",
       retention_ratio: 0.7,
@@ -4691,7 +4691,7 @@ function buildRealtimeSessionConfig(aiSettings) {
 
 function compatibleRealtimeSessionConfig(session) {
   const fallback = { ...session };
-  delete fallback.max_response_output_tokens;
+  delete fallback.max_output_tokens;
   delete fallback.truncation;
   return fallback;
 }
@@ -4741,7 +4741,7 @@ app.post("/api/realtime/session", async (req, res) => {
       model: aiSettings.realtimeModel,
       instructions: session.instructions,
       tools: session.tools,
-      max_response_output_tokens: session.max_response_output_tokens,
+      max_output_tokens: session.max_output_tokens,
       truncation: session.truncation,
       realtimeConfigFallback: fallbackReason,
       audio: session.audio,

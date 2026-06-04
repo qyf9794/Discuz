@@ -101,6 +101,8 @@ type RealtimeSessionBootstrap = {
   model: string;
   instructions: string;
   tools: RealtimeToolDefinition[];
+  maxOutputTokens?: number;
+  max_output_tokens?: number | "inf";
   maxResponseOutputTokens?: number;
   max_response_output_tokens?: number | "inf";
   truncation?: Record<string, unknown>;
@@ -3984,9 +3986,12 @@ export function App() {
       const realtimeTurnDetection = normalizeRealtimeTurnDetection(
         bootstrap.audio.input?.turnDetection ?? bootstrap.audio.input?.turn_detection
       );
-      const maxResponseOutputTokens = bootstrap.max_response_output_tokens ?? bootstrap.maxResponseOutputTokens;
+      const maxOutputTokens = bootstrap.max_output_tokens
+        ?? bootstrap.maxOutputTokens
+        ?? bootstrap.max_response_output_tokens
+        ?? bootstrap.maxResponseOutputTokens;
       const realtimeProviderData = {
-        ...(maxResponseOutputTokens ? { max_response_output_tokens: maxResponseOutputTokens } : {}),
+        ...(maxOutputTokens ? { max_output_tokens: maxOutputTokens } : {}),
         ...(bootstrap.truncation ? { truncation: bootstrap.truncation } : {})
       };
       const session = new RealtimeSession(agent, {
