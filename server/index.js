@@ -2165,6 +2165,35 @@ app.get("/api/diagnostics", (_req, res) => {
   res.json({ diagnosticsDir, files });
 });
 
+app.get("/api/diagnostics/:sessionId", (req, res) => {
+  const sessionId = safeDiagnosticSessionId(req.params.sessionId);
+  const filePath = diagnosticFilePath(sessionId);
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: "Diagnostic file not found" });
+  const limit = Math.max(1, Math.min(1000, Number(req.query.limit || 300)));
+  const lines = fs.readFileSync(filePath, "utf8")
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const events = lines.slice(-limit).map((line, index) => {
+    try {
+      return JSON.parse(line);
+    } catch {
+      return {
+        kind: "parse_error",
+        at: new Date(0).toISOString(),
+        detail: { line: lines.length - limit + index + 1, preview: line.slice(0, 500) }
+      };
+    }
+  });
+  res.json({
+    sessionId,
+    file: path.basename(filePath),
+    totalEvents: lines.length,
+    returnedEvents: events.length,
+    events
+  });
+});
+
 app.get("/api/topics", (_req, res) => {
   res.json({ activeTopicId: getActiveTopicId(), topics: getTopics() });
 });

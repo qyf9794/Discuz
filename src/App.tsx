@@ -426,9 +426,6 @@ function isDiagnosticsEnabled() {
 
 function isConversationRecorderEnabled() {
   if (typeof window === "undefined") return false;
-  if (!["localhost", "127.0.0.1", "::1"].includes(window.location.hostname)) {
-    return localStorage.getItem("discuz-conversation-recorder") === "true";
-  }
   return localStorage.getItem("discuz-conversation-recorder") !== "false";
 }
 
@@ -975,11 +972,13 @@ export function App() {
     setStatusText("要点已导出");
   }, [buildNotesMarkdown, state.discussionTopic]);
 
-  const loadState = useCallback(async () => {
+  const loadState = useCallback(async (preferredSelectedId?: string | null) => {
     const response = await fetch("/api/state");
     const nextState = await response.json();
     setState(nextState);
-    if (!selectedId) {
+    if (preferredSelectedId) {
+      setSelectedId(preferredSelectedId);
+    } else if (!selectedId) {
       const primary = nextState.files.find((file: DiscuzFile) => file.role === "primary");
       setSelectedId(primary?.id ?? nextState.files[0]?.id ?? null);
     }
@@ -1642,9 +1641,11 @@ export function App() {
         files: payload.files ?? current.files,
         activities: payload.activities ?? current.activities
       }));
-      setSelectedId(file.id);
+      const nextFile = payload.file as DiscuzFile | undefined;
+      setSelectedId(nextFile?.id ?? file.id);
       setGeneratedEditorId(null);
       notifyPrimaryFilesAdded(payload.file ? [payload.file as DiscuzFile] : [file]);
+      await loadState(nextFile?.id ?? file.id);
       setError("");
       return payload.file as DiscuzFile;
     } finally {
@@ -1668,10 +1669,12 @@ export function App() {
         files: payload.files ?? current.files,
         activities: payload.activities ?? current.activities
       }));
-      setSelectedId(file.id);
+      const nextFile = payload.file as DiscuzFile | undefined;
+      setSelectedId(nextFile?.id ?? file.id);
       if (role !== "generated") setGeneratedEditorId(null);
       if (previewFileId === file.id && role === "generated") setPreviewFileId(null);
       if (role === "primary") notifyPrimaryFilesAdded(payload.file ? [payload.file as DiscuzFile] : [file]);
+      await loadState(nextFile?.id ?? file.id);
       setError("");
       return payload.file as DiscuzFile;
     } finally {
@@ -1693,6 +1696,7 @@ export function App() {
       const copiedFile = payload.file as DiscuzFile | undefined;
       setGeneratedEditorId(copiedFile && (copiedFile.kind === "markdown" || copiedFile.kind === "text") ? copiedFile.id : null);
       setSelectedId(payload.file?.id ?? file.id);
+      await loadState(copiedFile?.id ?? file.id);
       setError("");
       return payload.file as DiscuzFile;
     } finally {
@@ -3275,6 +3279,7 @@ export function App() {
         if (sessionId !== voiceSessionRef.current) return;
         recordConversationDiagnostic("agent_tool_end", { values });
         if (responseActiveRef.current) scheduleResponseTask("AI整理结果");
+        window.setTimeout(() => requestRealtimeResponse(), 0);
       });
       session.on("tool_approval_requested", (...values: unknown[]) => {
         if (sessionId !== voiceSessionRef.current) return;
