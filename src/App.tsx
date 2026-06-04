@@ -197,6 +197,14 @@ function readAnalyserLevel(analyser?: AnalyserNode, data?: Uint8Array<ArrayBuffe
   return Math.min(1, Math.sqrt(normalized) * 1.12);
 }
 
+function realtimeRetryDelayMs(message: string) {
+  const match = message.match(/try again in\s+([\d.]+)s/i);
+  if (!match) return 800;
+  const seconds = Number(match[1]);
+  if (!Number.isFinite(seconds)) return 800;
+  return Math.min(15000, Math.max(800, Math.ceil(seconds * 1000) + 450));
+}
+
 function voiceStartErrorMessage(error: unknown) {
   const message = error instanceof Error ? error.message : String(error || "");
   const name = error instanceof DOMException ? error.name : "";
@@ -763,6 +771,10 @@ export function App() {
   const lastErrorLogRef = useRef("");
   const assistantTranscriptRef = useRef("");
   const userTranscriptRef = useRef("");
+  const awaitingAssistantReplyRef = useRef(false);
+  const assistantResponseHadOutputRef = useRef(false);
+  const emptyResponseRetryCountRef = useRef(0);
+  const emptyResponseRetryTimerRef = useRef<number | null>(null);
   const boardRef = useRef<HTMLDivElement | null>(null);
   const recordStreamRef = useRef<HTMLDivElement | null>(null);
   const [topicPreviewFrame, setTopicPreviewFrame] = useState<{ left: number; width: number } | null>(null);
@@ -1751,6 +1763,31 @@ export function App() {
     scheduleResponseTask("AI处理中");
     return true;
   }, [clearResponseWatchdog, finishResponseTask, scheduleResponseTask]);
+
+  const clearEmptyResponseRetry = useCallback(() => {
+    if (emptyResponseRetryTimerRef.current) window.clearTimeout(emptyResponseRetryTimerRef.current);
+    emptyResponseRetryTimerRef.current = null;
+  }, []);
+
+  const scheduleEmptyResponseRetry = useCallback((activeSessionId: number, errorMessage = "") => {
+    if (!awaitingAssistantReplyRef.current || emptyResponseRetryCountRef.current >= 1) return false;
+    emptyResponseRetryCountRef.current += 1;
+    clearEmptyResponseRetry();
+    const delay = realtimeRetryDelayMs(errorMessage);
+    setStatusText(delay > 1500 ? "上一轮被限流，稍后自动补答" : "上一轮没有出声，正在补答");
+    emptyResponseRetryTimerRef.current = window.setTimeout(() => {
+      emptyResponseRetryTimerRef.current = null;
+      if (activeSessionId !== voiceSessionRef.current || !awaitingAssistantReplyRef.current) return;
+      const session = realtimeSessionRef.current;
+      if (!session) return;
+      session.sendMessage([
+        "系统事件：上一轮用户发言后没有产生可听回复，可能是临时限流或空响应。",
+        "请直接回答用户刚才的问题，不要说你要执行什么任务；后台工具直接执行。",
+        "如果已经形成观点、结论、风险或行动项，直接调用 save_discussion_note 记录，不要请求用户审批。"
+      ].join("\n"));
+    }, delay);
+    return true;
+  }, [clearEmptyResponseRetry]);
 
   const sendRealtimeSystemEvent = (text: string, options: { blockTopicProposal?: boolean } = {}) => {
     const session = realtimeSessionRef.current;
@@ -3133,9 +3170,13 @@ export function App() {
     if (voiceReconnectTimerRef.current) window.clearTimeout(voiceReconnectTimerRef.current);
     voiceReconnectTimerRef.current = null;
     clearResponseWatchdog();
+    clearEmptyResponseRetry();
     pendingVoiceStopAfterResponseRef.current = "none";
     responseActiveRef.current = false;
     responsePendingRef.current = false;
+    awaitingAssistantReplyRef.current = false;
+    assistantResponseHadOutputRef.current = false;
+    emptyResponseRetryCountRef.current = 0;
     finishAllVisibleTasks();
     realtimeSessionRef.current?.close();
     realtimeSessionRef.current = null;
@@ -3144,7 +3185,7 @@ export function App() {
     stopVoiceMeter();
     setVoiceState("idle");
     setStatusText("Ready");
-  }, [clearResponseWatchdog, finishAllVisibleTasks, stopVoiceMeter]);
+  }, [clearEmptyResponseRetry, clearResponseWatchdog, finishAllVisibleTasks, stopVoiceMeter]);
 
   const stopVoice = useCallback(() => {
     disconnectVoice();
@@ -3183,6 +3224,10 @@ export function App() {
     pendingVoiceStopAfterResponseRef.current = "none";
     assistantTranscriptRef.current = "";
     userTranscriptRef.current = "";
+    awaitingAssistantReplyRef.current = false;
+    assistantResponseHadOutputRef.current = false;
+    emptyResponseRetryCountRef.current = 0;
+    clearEmptyResponseRetry();
     setVoiceState("connecting");
     setStatusText("Connecting");
     try {
@@ -3320,6 +3365,12 @@ export function App() {
           if (message.type === "input_audio_buffer.speech_stopped" || message.type === "input_audio_buffer.committed") {
             if (!responseActiveRef.current) setStatusText("AI处理中");
           }
+          if (message.type === "input_audio_buffer.committed") {
+            clearEmptyResponseRetry();
+            awaitingAssistantReplyRef.current = true;
+            assistantResponseHadOutputRef.current = false;
+            emptyResponseRetryCountRef.current = 0;
+          }
           if (message.type === "input_audio_buffer.timeout_triggered") {
             if (!responseActiveRef.current) {
               setStatusText("检测到停顿");
@@ -3327,6 +3378,7 @@ export function App() {
           }
           if (message.type === "response.created") {
             responseActiveRef.current = true;
+            assistantResponseHadOutputRef.current = false;
             startResponseWatchdog();
             scheduleResponseTask("AI处理中");
             if (pendingVoiceStopAfterResponseRef.current === "awaiting_closing") {
@@ -3334,12 +3386,33 @@ export function App() {
             }
             setVoiceState("thinking");
           }
+          if (
+            message.type === "response.output_item.added"
+            || message.type === "response.content_part.added"
+            || message.type === "output_audio_buffer.started"
+          ) {
+            assistantResponseHadOutputRef.current = true;
+          }
           if (message.type === "response.done") {
             responseActiveRef.current = false;
             clearResponseWatchdog();
             finishResponseTask();
             setVoiceState("live");
             if (pendingTaskCountRef.current === 0 && !backgroundParsingActiveRef.current) setStatusText("Live");
+            const responseOutput = Array.isArray(message.response?.output) ? message.response.output : [];
+            const responseStatus = String(message.response?.status || "");
+            const responseError = message.response?.status_details?.error?.message || "";
+            const hadAudibleOutput = assistantResponseHadOutputRef.current || responseOutput.length > 0;
+            if (
+              awaitingAssistantReplyRef.current
+              && !hadAudibleOutput
+              && responseStatus !== "cancelled"
+              && pendingVoiceStopAfterResponseRef.current === "none"
+              && scheduleEmptyResponseRetry(sessionId, responseError)
+            ) {
+              window.setTimeout(() => flushRealtimeResponse(), 0);
+              return;
+            }
             if (pendingVoiceStopAfterResponseRef.current === "closing_started") {
               pendingVoiceStopAfterResponseRef.current = "none";
               setStatusText("讨论已结束");
@@ -3359,12 +3432,19 @@ export function App() {
             window.setTimeout(() => flushRealtimeResponse(), 0);
           }
           if (message.type === "response.output_audio_transcript.delta") {
+            assistantResponseHadOutputRef.current = true;
             assistantTranscriptRef.current += message.delta;
             setTranscript(assistantTranscriptRef.current.slice(-220));
           }
           if (message.type === "response.output_audio_transcript.done") {
             const text = String(message.transcript || assistantTranscriptRef.current || "").trim();
-            if (text) saveMeetingMessage(text, "assistant").catch((err) => setError(err instanceof Error ? err.message : "Unable to save meeting record"));
+            if (text) {
+              assistantResponseHadOutputRef.current = true;
+              awaitingAssistantReplyRef.current = false;
+              emptyResponseRetryCountRef.current = 0;
+              clearEmptyResponseRetry();
+              saveMeetingMessage(text, "assistant").catch((err) => setError(err instanceof Error ? err.message : "Unable to save meeting record"));
+            }
             assistantTranscriptRef.current = "";
           }
           if (message.type === "conversation.item.input_audio_transcription.delta") {
@@ -3403,6 +3483,7 @@ export function App() {
       session.on("audio_start", () => {
         if (sessionId !== voiceSessionRef.current) return;
         responseActiveRef.current = true;
+        assistantResponseHadOutputRef.current = true;
         finishResponseTask();
         setVoiceState("thinking");
         startResponseWatchdog();
@@ -3587,6 +3668,10 @@ export function App() {
     lastErrorLogRef.current = "";
     assistantTranscriptRef.current = "";
     userTranscriptRef.current = "";
+    awaitingAssistantReplyRef.current = false;
+    assistantResponseHadOutputRef.current = false;
+    emptyResponseRetryCountRef.current = 0;
+    clearEmptyResponseRetry();
   };
 
   const createNewTopic = async () => {
@@ -3626,7 +3711,8 @@ export function App() {
     resetLocalDiscussionView(await response.json());
   };
 
-  const hasTopicCards = primaryFiles.length > 0 || state.directions.length > 0 || Boolean(directionProposal);
+  const hasAgendaCard = Boolean(state.discussionTopic || topicProposal || state.directions.length > 0 || directionProposal);
+  const hasTopicCards = primaryFiles.length > 0 || hasAgendaCard;
 
   return (
     <main
@@ -3685,17 +3771,6 @@ export function App() {
         <PanelHeader
           title="主题"
           meta=""
-          center={
-            <TopicConfirmation
-              currentTopic={state.discussionTopic}
-              proposal={topicProposal}
-              onConfirm={(title) => confirmDiscussionTopic(title).catch((err) => setError(err.message))}
-              onDismiss={() => {
-                topicProposalRef.current = null;
-                setTopicProposal(null);
-              }}
-            />
-          }
           action={
             <div className="header-actions">
               <button className="icon-button" title={fullscreenPanel === "topic" ? "Exit fullscreen topic" : "Fullscreen topic"} onClick={() => setFullscreenPanel(fullscreenPanel === "topic" ? null : "topic")}>
@@ -3711,12 +3786,19 @@ export function App() {
         <div className="topic-preview">
           {hasTopicCards ? (
             <div className="topic-file-list">
-              {(state.directions.length > 0 || directionProposal) && (
-                <DiscussionDirectionsCard
+              {hasAgendaCard && (
+                <TopicAgendaCard
+                  currentTopic={state.discussionTopic}
+                  topicProposal={topicProposal}
+                  onConfirmTopic={(title) => confirmDiscussionTopic(title).catch((err) => setError(err.message))}
+                  onDismissTopic={() => {
+                    topicProposalRef.current = null;
+                    setTopicProposal(null);
+                  }}
                   directions={state.directions}
-                  proposal={directionProposal}
-                  onConfirmProposal={() => directionProposal && confirmDirectionProposal(directionProposal.directions).catch((err) => setError(err.message))}
-                  onDismissProposal={() => {
+                  directionProposal={directionProposal}
+                  onConfirmDirections={() => directionProposal && confirmDirectionProposal(directionProposal.directions).catch((err) => setError(err.message))}
+                  onDismissDirections={() => {
                     directionProposalRef.current = null;
                     setDirectionProposal(null);
                   }}
@@ -4149,65 +4231,64 @@ function PanelHeader({ title, meta, center, action }: { title: string; meta?: st
   );
 }
 
-function TopicConfirmation({
+function TopicAgendaCard({
   currentTopic,
-  proposal,
-  onConfirm,
-  onDismiss
-}: {
-  currentTopic: string;
-  proposal: TopicProposal | null;
-  onConfirm: (_title: string) => void;
-  onDismiss: () => void;
-}) {
-  if (!proposal && !currentTopic) return null;
-  return (
-    <aside className={`topic-confirmation ${proposal?.intent === "drift" ? "drift" : ""}`}>
-      <div>
-        <span>{proposal ? proposal.intent === "drift" ? "主题偏离提醒" : "AI 建议讨论主题" : "当前讨论主题"}</span>
-        <strong>{proposal?.title ?? currentTopic}</strong>
-        {proposal?.reason && <p>{proposal.reason}</p>}
-      </div>
-      {proposal && (
-        <div className="topic-confirmation-actions">
-          <button title="Confirm topic" onClick={() => onConfirm(proposal.title)}><Check size={16} /></button>
-          <button title="Dismiss" onClick={onDismiss}><X size={16} /></button>
-        </div>
-      )}
-    </aside>
-  );
-}
-
-function DiscussionDirectionsCard({
+  topicProposal,
+  onConfirmTopic,
+  onDismissTopic,
   directions,
-  proposal,
-  onConfirmProposal,
-  onDismissProposal,
+  directionProposal,
+  onConfirmDirections,
+  onDismissDirections,
   onComplete,
   onDelete
 }: {
+  currentTopic: string;
+  topicProposal: TopicProposal | null;
+  onConfirmTopic: (_title: string) => void;
+  onDismissTopic: () => void;
   directions: DiscussionDirection[];
-  proposal: DirectionProposal | null;
-  onConfirmProposal: () => void;
-  onDismissProposal: () => void;
+  directionProposal: DirectionProposal | null;
+  onConfirmDirections: () => void;
+  onDismissDirections: () => void;
   onComplete: (_direction: DiscussionDirection) => void;
   onDelete: (_direction: DiscussionDirection) => void;
 }) {
-  const proposalItems = proposal?.directions ?? [];
+  const proposalItems = directionProposal?.directions ?? [];
+  const displayedDirections = directionProposal ? proposalItems : directions;
+  const topicTitle = topicProposal?.title ?? currentTopic;
   return (
-    <article className="topic-file-card directions-card">
-      <div className="directions-card-head">
-        <span>{proposal ? "待确认方向" : "讨论方向"}</span>
-        {proposal && (
+    <article className={`topic-file-card directions-card topic-agenda-card ${topicProposal?.intent === "drift" ? "drift" : ""}`}>
+      <div className="topic-agenda-head">
+        <div className="topic-agenda-title">
+          <span>{topicProposal ? topicProposal.intent === "drift" ? "主题偏离提醒" : "AI 建议讨论主题" : "当前讨论主题"}</span>
+          <strong>{topicTitle || "讨论主题待确认"}</strong>
+          {topicProposal?.reason && <p>{topicProposal.reason}</p>}
+        </div>
+        {topicProposal && (
           <div className="directions-card-actions">
-            <button title="确认方向" onClick={onConfirmProposal}><Check size={14} /></button>
-            <button title="关闭" onClick={onDismissProposal}><X size={14} /></button>
+            <button title="确认主题" onClick={() => onConfirmTopic(topicProposal.title)}><Check size={14} /></button>
+            <button title="关闭" onClick={onDismissTopic}><X size={14} /></button>
           </div>
         )}
       </div>
-      {proposal?.reason && <p className="directions-reason">{proposal.reason}</p>}
+      <div className="directions-card-head">
+        <span>{directionProposal ? "待确认方向" : "讨论方向"}</span>
+        {directionProposal && (
+          <div className="directions-card-actions">
+            <button title="确认方向" onClick={onConfirmDirections}><Check size={14} /></button>
+            <button title="关闭" onClick={onDismissDirections}><X size={14} /></button>
+          </div>
+        )}
+      </div>
+      {directionProposal?.reason && <p className="directions-reason">{directionProposal.reason}</p>}
       <ul className="directions-list">
-        {(proposal ? proposalItems : directions).map((item, index) => {
+        {displayedDirections.length === 0 && (
+          <li className="direction-placeholder">
+            <span>确认主题后，这里会显示 1 到 3 条讨论方向。</span>
+          </li>
+        )}
+        {displayedDirections.map((item, index) => {
           const text = typeof item === "string" ? item : item.text;
           const completed = typeof item === "string" ? false : item.completed;
           return (
@@ -4215,7 +4296,7 @@ function DiscussionDirectionsCard({
               <button
                 className="direction-dot"
                 title={completed ? "已完成" : "标记完成"}
-                disabled={Boolean(proposal) || completed}
+                disabled={Boolean(directionProposal) || completed}
                 onClick={() => typeof item !== "string" && onComplete(item)}
               >
                 {completed ? <CheckCircle2 size={16} /> : null}

@@ -264,91 +264,6 @@ a.icon-button {
   color: #b42318;
 }
 
-.topic-confirmation {
-  display: flex;
-  min-width: 0;
-  max-width: min(560px, 46vw);
-  flex: 1;
-  align-items: center;
-  gap: 10px;
-  min-height: 46px;
-  padding: 7px 9px 7px 11px;
-  border: 1px solid rgba(255, 255, 255, 0.42);
-  border-radius: 14px;
-  background:
-    linear-gradient(145deg, rgba(255, 255, 255, 0.42), rgba(255, 255, 255, 0.12)),
-    rgba(255, 255, 255, 0.16);
-  box-shadow: 0 10px 28px rgba(3, 9, 18, 0.08);
-  backdrop-filter: blur(18px) saturate(1.1);
-  -webkit-backdrop-filter: blur(18px) saturate(1.1);
-}
-
-.topic-confirmation.drift {
-  border-color: rgba(198, 119, 28, 0.5);
-}
-
-.topic-confirmation > div:first-child {
-  min-width: 0;
-  flex: 1;
-}
-
-.topic-confirmation span {
-  display: block;
-  color: rgba(8, 125, 140, 0.86);
-  font-size: 10px;
-  font-weight: 800;
-}
-
-.topic-confirmation strong {
-  display: block;
-  overflow-x: auto;
-  overflow-y: hidden;
-  color: rgba(23, 33, 43, 0.94);
-  font-size: 16px;
-  line-height: 1.25;
-  scrollbar-width: none;
-  white-space: nowrap;
-}
-
-.topic-confirmation strong::-webkit-scrollbar {
-  display: none;
-}
-
-.topic-confirmation:has(.topic-confirmation-actions) strong {
-  font-size: 18px;
-  font-weight: 780;
-}
-
-.topic-confirmation p {
-  margin: 2px 0 0;
-  overflow: hidden;
-  color: rgba(61, 76, 90, 0.82);
-  font-size: 12px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.topic-confirmation-actions {
-  display: flex;
-  flex: 0 0 auto;
-  gap: 7px;
-}
-
-.topic-confirmation-actions button {
-  display: grid;
-  width: 28px;
-  height: 28px;
-  place-items: center;
-  border: 0;
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.56);
-  color: rgba(56, 74, 88, 0.9);
-}
-
-.topic-confirmation-actions button:first-child {
-  color: #148c4f;
-}
-
 .bottom-discussion-bar {
   position: fixed;
   left: 22px;
@@ -679,13 +594,54 @@ a.icon-button {
 .directions-card {
   display: flex;
   flex-direction: column;
-  justify-content: center;
+  justify-content: flex-start;
   grid-template-rows: none;
-  min-height: 260px;
+  height: auto;
+  min-height: 300px;
+  max-height: 625px;
+  gap: 12px;
   padding: 16px;
-  background: transparent;
-  box-shadow: none;
+  background: rgba(255, 255, 255, 0.34);
+  box-shadow: 0 14px 36px rgba(8, 22, 34, 0.1);
   cursor: default;
+}
+
+.topic-agenda-card.drift {
+  outline: 1px solid rgba(198, 119, 28, 0.42);
+}
+
+.topic-agenda-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.topic-agenda-title {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.topic-agenda-title span {
+  color: rgba(8, 125, 140, 0.86);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.topic-agenda-title strong {
+  color: rgba(23, 33, 43, 0.94);
+  font-size: 20px;
+  font-weight: 780;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+
+.topic-agenda-title p {
+  margin: 0;
+  color: rgba(61, 76, 90, 0.82);
+  font-size: 13px;
+  line-height: 1.45;
 }
 
 .directions-card-head {
@@ -796,6 +752,15 @@ a.icon-button {
 .direction-delete:hover {
   background: rgba(255, 255, 255, 0.56);
   color: #b42318;
+}
+
+.direction-placeholder {
+  grid-template-columns: minmax(0, 1fr) !important;
+  color: rgba(61, 76, 90, 0.68);
+}
+
+.direction-placeholder span {
+  grid-column: 1 / -1;
 }
 
 .card-actions {
@@ -2663,6 +2628,29 @@ a.icon-button {
     gap: 8px;
     padding: 8px;
     border-radius: 16px;
+  }
+
+  .directions-card {
+    min-height: 220px;
+    max-height: none;
+    aspect-ratio: auto;
+    gap: 10px;
+    padding: 12px;
+  }
+
+  .topic-agenda-title strong {
+    font-size: 17px;
+  }
+
+  .topic-agenda-title p,
+  .directions-reason {
+    font-size: 12px;
+  }
+
+  .directions-list li {
+    grid-template-columns: 22px minmax(0, 1fr) 22px;
+    gap: 7px;
+    font-size: 13px;
   }
 
   .topic-card-preview {
