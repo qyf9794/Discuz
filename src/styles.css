@@ -1628,6 +1628,17 @@ a.icon-button {
   margin-bottom: 14px;
 }
 
+.settings-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.settings-close-button {
+  display: none;
+}
+
 .status-pill {
   padding: 5px 8px;
   border-radius: 999px;
@@ -2538,6 +2549,25 @@ a.icon-button {
       rgba(224, 243, 252, 0.58);
     backdrop-filter: blur(18px) saturate(1.1);
     -webkit-backdrop-filter: blur(18px) saturate(1.1);
+  }
+
+  .settings-head-actions {
+    flex: 0 0 auto;
+  }
+
+  .settings-close-button {
+    display: grid;
+    width: 34px;
+    height: 34px;
+    place-items: center;
+    border: 0;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.58);
+    color: rgba(37, 52, 65, 0.82);
+  }
+
+  .settings-close-button:active {
+    background: rgba(255, 255, 255, 0.76);
   }
 
   .ai-settings-grid {

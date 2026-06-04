@@ -4008,6 +4008,7 @@ export function App() {
           onImportTopic={(topicId) => importTopic(topicId).catch((err) => setError(err.message))}
           onDeleteTopic={(topicId) => deleteTopic(topicId).catch((err) => setError(err.message))}
           onSettingsSaved={(settings) => setState((current) => ({ ...current, settings }))}
+          onClose={() => setSettingsOpen(false)}
           style={settingsPopoverStyle}
         />
       )}
@@ -4951,6 +4952,7 @@ const SettingsPopover = forwardRef<HTMLElement, {
   onImportTopic: (_topicId: string) => void;
   onDeleteTopic: (_topicId: string) => void;
   onSettingsSaved: (_settings: SettingsState) => void;
+  onClose: () => void;
   style?: CSSProperties;
 }>(function SettingsPopover({
   settings,
@@ -4965,6 +4967,7 @@ const SettingsPopover = forwardRef<HTMLElement, {
   onImportTopic,
   onDeleteTopic,
   onSettingsSaved,
+  onClose,
   style
 }, ref) {
   const [apiKey, setApiKey] = useState("");
@@ -5067,9 +5070,14 @@ const SettingsPopover = forwardRef<HTMLElement, {
     <aside ref={ref} className="settings-popover" style={style}>
       <header className="settings-head">
         <strong>设置</strong>
-        <span className={settings.openaiApiKeyConfigured ? "status-pill ready" : "status-pill"}>
-          {settings.openaiApiKeyConfigured ? `Key: ${settings.openaiApiKeySource}` : "未配置 Key"}
-        </span>
+        <div className="settings-head-actions">
+          <span className={settings.openaiApiKeyConfigured ? "status-pill ready" : "status-pill"}>
+            {settings.openaiApiKeyConfigured ? `Key: ${settings.openaiApiKeySource}` : "未配置 Key"}
+          </span>
+          <button type="button" className="settings-close-button" aria-label="关闭设置" onClick={onClose}>
+            <X size={17} />
+          </button>
+        </div>
       </header>
 
       <section className="settings-section">
