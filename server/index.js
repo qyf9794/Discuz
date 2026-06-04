@@ -1823,6 +1823,7 @@ function buildDiscussionContext() {
     "主题规则：需要拟定主题时调用 prepare_discussion_topic；主题确认用 confirm_discussion_topic。需要拟定方向时调用 prepare_discussion_directions；方向确认用 confirm_discussion_directions。用户确认语义包括“确认、可以、就这个、对、没问题”。",
     "材料规则：下面只给压缩摘要。需要精确内容时，调用 get_discussion_state、search_context 或对应 analyze_* 工具；图片问题优先 analyze_image_file，Office 文件优先对应 analyze_* 工具。引用时说来源文件名或网页标题。",
     "压缩规则：工具结果可能被压缩。若用户要原文细节、证据、完整清单、逐项比较或文件深度分析，而返回片段不足，不要硬答；继续调用更具体的读取/分析工具，或说明需要后台深度分析。",
+    "文件分析路由：用户要求完整/详细/深度文件分析、长文件对比、报告、表格、清单、生成文件、加入主题卡片或打开预览时，必须调用 run_background_task，不要直接把大文件内容通过 analyze_* 或 compare_files 带入实时上下文。",
     "联网规则：用户有明确具体的联网需求时，结果必须贴合需求组织。小事实或少量链接用 web_search。用户要求完整/全部赛程、日程、清单、名单、表格、报告，或要求整理成主题卡片/文件并打开时，必须调用 research_request，不要直接 web_search。",
     "文件规则：不要直接改主题区或资源区原件；需要修改先 copy_file_to_generated。用户要求移动/复制/打开/下载文件时用对应工具完成。",
     "媒体规则：氛围模式调用 set_ambient_mode；用户给媒体链接时 open_media_url；不要编造受版权限制的播放源。",
@@ -3669,7 +3670,7 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "analyze_word_file",
-      description: "Load structured discussion context for a Word .doc/.docx file using the Documents skill bridge. Use before answering requests to discuss, review, summarize, or improve a Word document.",
+      description: "Load brief structured context for a Word .doc/.docx file. Use for small, immediate questions. For full review, detailed report, table/list output, topic-card/file/open workflows, use run_background_task.",
       parameters: {
         type: "object",
         properties: {
@@ -3684,7 +3685,7 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "analyze_spreadsheet_file",
-      description: "Load structured discussion context for an Excel .xls/.xlsx/.xlsm, CSV, or TSV spreadsheet using the Spreadsheets skill bridge. Use before answering requests about tables, sheets, fields, trends, anomalies, formulas, or analysis plans.",
+      description: "Load brief structured context for a spreadsheet. Use for small, immediate questions about fields or visible rows. For full analysis, calculations, reports, tables, files, or open workflows, use run_background_task.",
       parameters: {
         type: "object",
         properties: {
@@ -3699,7 +3700,7 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "analyze_presentation_file",
-      description: "Load structured discussion context for a PowerPoint .ppt/.pptx file using the Presentations skill bridge. Use before answering requests to discuss deck story, slide flow, claims, evidence, audience fit, or improvements.",
+      description: "Load brief structured context for a PowerPoint file. Use for small, immediate questions. For full deck review, detailed rewrite plan, report, file, topic-card, or open workflows, use run_background_task.",
       parameters: {
         type: "object",
         properties: {
@@ -3759,7 +3760,7 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "compare_files",
-      description: "Load two files' discussion context so you can compare differences, risks, and suggested changes.",
+      description: "Load brief context for comparing two small files. For long files, full comparisons, reports, tables, or saved comparison files, use run_background_task.",
       parameters: {
         type: "object",
         properties: {

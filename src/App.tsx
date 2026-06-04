@@ -381,6 +381,7 @@ function toolCallLabel(name = "任务") {
 
 const backgroundResearchIntentPattern = /全部|完整|所有|全量|整理|生成|保存|导出|打开|预览|主题卡片|主题区|卡片|文件|表格|报告|清单|列表|名单|赛程|日程|赛果|fixture|fixtures|schedule|calendar|timetable|full|all|complete|list|table|report|file|card|open/i;
 const artifactResearchPattern = /整理|生成|保存|导出|打开|预览|主题卡片|主题区|卡片|文件|表格|报告|markdown|md|table|report|file|card|open/i;
+const deepFileTaskPattern = /全部|完整|全面|详细|深度|逐项|全文|长文|报告|表格|清单|列表|对比|比较|审查|方案|整理|生成|保存|导出|打开|预览|主题卡片|主题区|卡片|文件|full|complete|detailed|deep|report|table|list|compare|review|audit|plan|file|card|open|preview/i;
 
 function shouldUseBackgroundResearch(args: Record<string, any> = {}) {
   const query = String(args.query || args.prompt || "").trim();
@@ -404,6 +405,17 @@ function researchPostActions(args: Record<string, any> = {}) {
   if (args.openWhenDone === true || /打开|预览|open|preview/i.test(combined)) actions.push("open_preview");
   if (actions.includes("open_preview") && !actions.includes("add_to_topic") && /主题|卡片|topic|card/i.test(combined)) actions.unshift("add_to_topic");
   return actions.filter((action, index, list) => list.indexOf(action) === index);
+}
+
+function shouldQueueFileAnalysis(file: DiscuzFile, focus = "", extra = "") {
+  const text = `${focus}\n${extra}`;
+  const sourceLength = (file.extractedText || file.summary || "").length;
+  if (deepFileTaskPattern.test(text)) return true;
+  return sourceLength > 16000;
+}
+
+function fileAnalysisPostActions(focus = "") {
+  return researchPostActions({ query: focus, purpose: focus });
 }
 
 function realtimeEventToolName(...values: unknown[]) {
@@ -2632,6 +2644,32 @@ export function App() {
             ok: false,
             error: `No matching ${analysisKind} file found. Ask the user to upload one or specify the filename.`
           };
+        } else if (shouldQueueFileAnalysis(candidate, focus, analysisKind)) {
+          const postActions = fileAnalysisPostActions(focus);
+          const task = await queueBackgroundTask({
+            kind: "file_analysis",
+            title: compactText(`${candidate.originalName} 分析`, 80),
+            prompt: [
+              `请分析文件：${candidate.originalName}`,
+              focus ? `分析重点：${focus}` : "分析重点：根据文件内容整理结论、依据、风险和下一步。",
+              "如果用户要求报告、表格、清单、完整分析或打开预览，请生成结构化 Markdown 成果。"
+            ].join("\n"),
+            outputMode: "file",
+            targetFileIds: [candidate.id],
+            postActions
+          });
+          output = {
+            ok: true,
+            route: "background",
+            reason: "该文件分析可能产生较长上下文，已转入后台生成结果文件。",
+            queued: task?.title || `${candidate.originalName} 分析`,
+            taskId: task?.id,
+            status: task?.status || "queued",
+            postActions,
+            next: postActions.includes("open_preview")
+              ? "完成后会按要求加入主题区或打开预览。"
+              : "完成后会在 AI 临时文件区生成分析结果。"
+          };
         } else if (analysisKind === "word") {
           output = buildWordAnalysisPayload(candidate, focus);
         } else if (analysisKind === "spreadsheet") {
@@ -2862,6 +2900,27 @@ export function App() {
         const second = selectFileByQuery(state.files, String(args.secondQuery || ""), secondRole, undefined);
         if (!first || !second) {
           output = { ok: false, error: "Need two matching files to compare." };
+        } else if (shouldQueueFileAnalysis(first, "比较文件", second.extractedText || second.summary || "") || shouldQueueFileAnalysis(second, "比较文件", first.extractedText || first.summary || "")) {
+          const task = await queueBackgroundTask({
+            kind: "file_analysis",
+            title: compactText(`文件对比-${first.originalName}-${second.originalName}`, 80),
+            prompt: [
+              `请对比两个文件：${first.originalName} 与 ${second.originalName}`,
+              "输出结构化 Markdown：核心差异、共同点、冲突/风险、可引用依据、建议下一步。",
+              "不要只给摘要；如果材料不足，明确说明缺口。"
+            ].join("\n"),
+            outputMode: "file",
+            targetFileIds: [first.id, second.id]
+          });
+          output = {
+            ok: true,
+            route: "background",
+            reason: "文件对比会产生较长上下文，已转入后台生成对比文件。",
+            queued: task?.title || "文件对比",
+            taskId: task?.id,
+            status: task?.status || "queued",
+            next: "完成后会在 AI 临时文件区生成对比结果。"
+          };
         } else {
           output = {
             ok: true,
