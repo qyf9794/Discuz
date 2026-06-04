@@ -4565,6 +4565,14 @@ function buildRealtimeSessionConfig(aiSettings) {
     instructions: buildDiscussionContext(),
     tools: realtimeToolDefinitionsForSession(),
     tool_choice: "auto",
+    max_response_output_tokens: 300,
+    truncation: {
+      type: "retention_ratio",
+      retention_ratio: 0.7,
+      token_limits: {
+        post_instructions: 5000
+      }
+    },
     audio: {
       input: {
         turn_detection: {
@@ -4608,6 +4616,8 @@ app.post("/api/realtime/session", async (req, res) => {
     model: aiSettings.realtimeModel,
     instructions: session.instructions,
     tools: session.tools,
+    max_response_output_tokens: session.max_response_output_tokens,
+    truncation: session.truncation,
     audio: session.audio,
     settings: aiSettings
   });

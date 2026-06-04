@@ -101,6 +101,9 @@ type RealtimeSessionBootstrap = {
   model: string;
   instructions: string;
   tools: RealtimeToolDefinition[];
+  maxResponseOutputTokens?: number;
+  max_response_output_tokens?: number | "inf";
+  truncation?: Record<string, unknown>;
   audio: {
     input?: {
       transcription?: { model?: string; language?: string };
@@ -156,6 +159,12 @@ type VoiceMeter = {
   frameId: number;
 };
 
+type RealtimeRateLimitState = {
+  limit: number;
+  remaining: number;
+  resetAt: number;
+};
+
 function ambientMusicPreview(): WebPreview {
   return { url: "/ambient.html", title: "轻音乐氛围", embeddable: true };
 }
@@ -204,6 +213,26 @@ function realtimeRetryDelayMs(message: string) {
   const seconds = Number(match[1]);
   if (!Number.isFinite(seconds)) return 800;
   return Math.min(65000, Math.max(800, Math.ceil(seconds * 1000) + 700));
+}
+
+function realtimeRateLimitDelayMs(limit: RealtimeRateLimitState | null, minimumRemaining = 5000) {
+  if (!limit || limit.remaining >= minimumRemaining) return 0;
+  return Math.min(65000, Math.max(800, limit.resetAt - Date.now() + 700));
+}
+
+function extractRealtimeTokenLimit(message: any): RealtimeRateLimitState | null {
+  const limits = Array.isArray(message?.rate_limits) ? message.rate_limits : [];
+  const tokenLimit = limits.find((item: any) => item?.name === "tokens");
+  if (!tokenLimit) return null;
+  const remaining = Number(tokenLimit.remaining);
+  const limit = Number(tokenLimit.limit);
+  const resetSeconds = Number(tokenLimit.reset_seconds);
+  if (!Number.isFinite(remaining) || !Number.isFinite(limit) || !Number.isFinite(resetSeconds)) return null;
+  return {
+    limit,
+    remaining,
+    resetAt: Date.now() + Math.max(0, resetSeconds * 1000)
+  };
 }
 
 function voiceStartErrorMessage(error: unknown) {
@@ -828,6 +857,8 @@ export function App() {
   const assistantResponseHadOutputRef = useRef(false);
   const emptyResponseRetryCountRef = useRef(0);
   const emptyResponseRetryTimerRef = useRef<number | null>(null);
+  const realtimeRateLimitRef = useRef<RealtimeRateLimitState | null>(null);
+  const rateLimitResumeTimerRef = useRef<number | null>(null);
   const boardRef = useRef<HTMLDivElement | null>(null);
   const recordStreamRef = useRef<HTMLDivElement | null>(null);
   const [topicPreviewFrame, setTopicPreviewFrame] = useState<{ left: number; width: number } | null>(null);
@@ -1964,9 +1995,43 @@ export function App() {
     }, 30000);
   }, [clearResponseWatchdog, finishAllVisibleTasks]);
 
+  const clearEmptyResponseRetry = useCallback(() => {
+    if (emptyResponseRetryTimerRef.current) window.clearTimeout(emptyResponseRetryTimerRef.current);
+    emptyResponseRetryTimerRef.current = null;
+  }, []);
+
+  const clearRateLimitResume = useCallback(() => {
+    if (rateLimitResumeTimerRef.current) window.clearTimeout(rateLimitResumeTimerRef.current);
+    rateLimitResumeTimerRef.current = null;
+  }, []);
+
   const requestRealtimeResponse = useCallback(() => {
     const session = realtimeSessionRef.current;
     if (!session || typeof session.transport.requestResponse !== "function") return false;
+    const rateLimitDelay = realtimeRateLimitDelayMs(realtimeRateLimitRef.current, 5000);
+    if (rateLimitDelay > 0) {
+      responsePendingRef.current = true;
+      clearRateLimitResume();
+      setStatusText("限流冷却中，稍后自动补答");
+      const activeSessionId = voiceSessionRef.current;
+      rateLimitResumeTimerRef.current = window.setTimeout(() => {
+        rateLimitResumeTimerRef.current = null;
+        if (activeSessionId !== voiceSessionRef.current || !responsePendingRef.current) return;
+        const delayedSession = realtimeSessionRef.current;
+        if (!delayedSession || typeof delayedSession.transport.requestResponse !== "function") return;
+        responsePendingRef.current = false;
+        try {
+          delayedSession.transport.requestResponse();
+          scheduleResponseTask("AI处理中");
+        } catch (error) {
+          clearResponseWatchdog();
+          finishResponseTask();
+          setVoiceState("error");
+          setError(error instanceof Error ? error.message : "Realtime response request failed");
+        }
+      }, rateLimitDelay);
+      return false;
+    }
     responsePendingRef.current = false;
     try {
       session.transport.requestResponse();
@@ -1980,18 +2045,13 @@ export function App() {
     }
     scheduleResponseTask("AI处理中");
     return true;
-  }, [clearResponseWatchdog, finishResponseTask, scheduleResponseTask]);
-
-  const clearEmptyResponseRetry = useCallback(() => {
-    if (emptyResponseRetryTimerRef.current) window.clearTimeout(emptyResponseRetryTimerRef.current);
-    emptyResponseRetryTimerRef.current = null;
-  }, []);
+  }, [clearRateLimitResume, clearResponseWatchdog, finishResponseTask, scheduleResponseTask]);
 
   const scheduleEmptyResponseRetry = useCallback((activeSessionId: number, errorMessage = "") => {
     if (!awaitingAssistantReplyRef.current || emptyResponseRetryCountRef.current >= 1) return false;
     emptyResponseRetryCountRef.current += 1;
     clearEmptyResponseRetry();
-    const delay = realtimeRetryDelayMs(errorMessage);
+    const delay = Math.max(realtimeRetryDelayMs(errorMessage), realtimeRateLimitDelayMs(realtimeRateLimitRef.current, 5000));
     setStatusText(delay > 1500 ? "上一轮被限流，稍后自动补答" : "上一轮没有出声，正在补答");
     emptyResponseRetryTimerRef.current = window.setTimeout(() => {
       emptyResponseRetryTimerRef.current = null;
@@ -3699,6 +3759,8 @@ export function App() {
     voiceReconnectTimerRef.current = null;
     clearResponseWatchdog();
     clearEmptyResponseRetry();
+    clearRateLimitResume();
+    realtimeRateLimitRef.current = null;
     pendingVoiceStopAfterResponseRef.current = "none";
     responseActiveRef.current = false;
     responsePendingRef.current = false;
@@ -3713,7 +3775,7 @@ export function App() {
     stopVoiceMeter();
     setVoiceState("idle");
     setStatusText("Ready");
-  }, [clearEmptyResponseRetry, clearResponseWatchdog, finishAllVisibleTasks, stopVoiceMeter]);
+  }, [clearEmptyResponseRetry, clearRateLimitResume, clearResponseWatchdog, finishAllVisibleTasks, stopVoiceMeter]);
 
   const stopVoice = useCallback(() => {
     disconnectVoice();
@@ -3756,6 +3818,8 @@ export function App() {
     assistantResponseHadOutputRef.current = false;
     emptyResponseRetryCountRef.current = 0;
     clearEmptyResponseRetry();
+    clearRateLimitResume();
+    realtimeRateLimitRef.current = null;
     setVoiceState("connecting");
     setStatusText("Connecting");
     try {
@@ -3841,6 +3905,7 @@ export function App() {
       const realtimeTurnDetection = normalizeRealtimeTurnDetection(
         bootstrap.audio.input?.turnDetection ?? bootstrap.audio.input?.turn_detection
       );
+      const maxResponseOutputTokens = bootstrap.max_response_output_tokens ?? bootstrap.maxResponseOutputTokens ?? 300;
       const session = new RealtimeSession(agent, {
         model: bootstrap.model,
         transport,
@@ -3848,6 +3913,10 @@ export function App() {
           outputModalities: ["audio"],
           toolChoice: "auto",
           parallelToolCalls: true,
+          providerData: {
+            max_response_output_tokens: maxResponseOutputTokens,
+            ...(bootstrap.truncation ? { truncation: bootstrap.truncation } : {})
+          },
           audio: {
             input: {
               transcription: bootstrap.audio.input?.transcription ?? { model: bootstrap.settings.transcriptionModel, language: "zh" },
@@ -3883,6 +3952,15 @@ export function App() {
         try {
           if (!String(message.type || "").endsWith(".delta")) {
             recordConversationDiagnostic("realtime_event", message);
+          }
+          if (message.type === "rate_limits.updated") {
+            const tokenLimit = extractRealtimeTokenLimit(message);
+            if (tokenLimit) {
+              realtimeRateLimitRef.current = tokenLimit;
+              if (tokenLimit.remaining < 5000 && !responseActiveRef.current) {
+                setStatusText("限流冷却中，稍后自动补答");
+              }
+            }
           }
           if (message.type === "input_audio_buffer.speech_started") {
             if (!responseActiveRef.current) {
