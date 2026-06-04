@@ -3338,8 +3338,7 @@ export function App() {
           }
           if (message.type === "input_audio_buffer.timeout_triggered") {
             if (!responseActiveRef.current) {
-              setStatusText("检测到停顿，正在回应");
-              window.setTimeout(() => requestRealtimeResponseRef.current(), 0);
+              setStatusText("检测到停顿");
             }
           }
           if (message.type === "response.created") {
