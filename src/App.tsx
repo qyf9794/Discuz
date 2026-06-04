@@ -5289,10 +5289,18 @@ function WebPreviewWindow({ page, onClose }: { page: WebPreview; onClose: () => 
     embeddable: page.embeddable ?? null,
     reason: page.embedReason || ""
   });
+  const [readerState, setReaderState] = useState<{
+    status: "idle" | "loading" | "ready" | "error";
+    title: string;
+    source: string;
+    text: string;
+    error: string;
+  }>({ status: "idle", title: "", source: "", text: "", error: "" });
 
   useEffect(() => {
     let cancelled = false;
     setEmbedState({ embeddable: page.embeddable ?? null, reason: page.embedReason || "" });
+    setReaderState({ status: "idle", title: "", source: "", text: "", error: "" });
     if (isLocalPreviewUrl(page.url)) {
       setEmbedState({ embeddable: true, reason: "" });
       return () => {
@@ -5318,6 +5326,47 @@ function WebPreviewWindow({ page, onClose }: { page: WebPreview; onClose: () => 
   }, [page.embeddable, page.embedReason, page.url]);
 
   const blocked = embedState.embeddable === false;
+  useEffect(() => {
+    if (!blocked || isLocalPreviewUrl(page.url)) return;
+    let cancelled = false;
+    setReaderState({ status: "loading", title: "", source: "", text: "", error: "" });
+    fetch(`/api/web/read?url=${encodeURIComponent(page.url)}&maxChars=8000`)
+      .then((response) => response.json().then((payload) => ({ response, payload })))
+      .then(({ response, payload }) => {
+        if (cancelled) return;
+        if (!response.ok || payload.ok === false) {
+          setReaderState({
+            status: "error",
+            title: "",
+            source: "",
+            text: "",
+            error: payload.error || "无法读取网页正文。"
+          });
+          return;
+        }
+        setReaderState({
+          status: "ready",
+          title: payload.title || page.title || "网页正文",
+          source: payload.source || "",
+          text: payload.text || "",
+          error: ""
+        });
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setReaderState({
+          status: "error",
+          title: "",
+          source: "",
+          text: "",
+          error: err instanceof Error ? err.message : "无法读取网页正文。"
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [blocked, page.title, page.url]);
+
   return (
     <aside className="web-preview-window">
       <header className="tool-head">
@@ -5334,12 +5383,26 @@ function WebPreviewWindow({ page, onClose }: { page: WebPreview; onClose: () => 
       </header>
       <div className="web-preview-body">
         {blocked ? (
-          <div className="web-preview-blocked">
-            <ExternalLink size={28} />
-            <strong>这个网页不能在窗口内显示</strong>
-            <span>{embedState.reason || "网站禁止被嵌入到其他页面。"}</span>
-            <a href={page.url} target="_blank" rel="noreferrer">在浏览器打开</a>
-          </div>
+          readerState.status === "ready" && readerState.text ? (
+            <article className="web-reader">
+              <div className="web-reader-meta">
+                <strong>{readerState.title}</strong>
+                <span>{embedState.reason || "原网页禁止嵌入，已切换为应用内阅读视图。"}{readerState.source ? ` 来源：${readerState.source}` : ""}</span>
+              </div>
+              <pre>{readerState.text}</pre>
+            </article>
+          ) : (
+            <div className="web-preview-blocked">
+              <ExternalLink size={28} />
+              <strong>{readerState.status === "loading" ? "正在生成应用内阅读视图" : "这个网页不能直接嵌入"}</strong>
+              <span>
+                {readerState.status === "error"
+                  ? `${embedState.reason || "网站禁止被嵌入到其他页面。"} ${readerState.error}`
+                  : embedState.reason || "网站禁止被嵌入到其他页面。"}
+              </span>
+              {readerState.status === "error" && <a href={page.url} target="_blank" rel="noreferrer">在浏览器打开</a>}
+            </div>
+          )
         ) : (
           <>
             <iframe title={page.title || page.url} src={page.url} />

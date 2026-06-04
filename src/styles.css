@@ -2113,6 +2113,48 @@ a.icon-button {
   text-decoration: none;
 }
 
+.web-reader {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.86);
+}
+
+.web-reader-meta {
+  display: grid;
+  gap: 5px;
+  padding: 16px 18px 12px;
+  border-bottom: 1px solid rgba(43, 57, 70, 0.08);
+}
+
+.web-reader-meta strong {
+  color: rgba(31, 45, 58, 0.94);
+  font-size: 15px;
+  line-height: 1.35;
+}
+
+.web-reader-meta span {
+  color: rgba(73, 88, 101, 0.68);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.web-reader pre {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 18px;
+  overflow: auto;
+  color: rgba(31, 45, 58, 0.92);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.75;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .web-preview-body p {
   position: absolute;
   right: 12px;
