@@ -13,6 +13,7 @@ import multer from "multer";
 import mammoth from "mammoth";
 import JSZip from "jszip";
 import { XMLParser } from "fast-xml-parser";
+import OpenAI from "openai";
 
 const execFileAsync = promisify(execFile);
 const officeConverterCandidates = [
@@ -220,7 +221,6 @@ const upload = multer({
 
 const app = express();
 app.use(cors());
-app.use(express.text({ type: ["application/sdp", "text/plain"], limit: "2mb" }));
 app.use(express.json({ limit: "2mb" }));
 app.get("/api/raw/:topicId/:storedName", (req, res) => {
   const topicId = cleanText(req.params.topicId);
@@ -1391,30 +1391,6 @@ function addActivity(label, detail = "", createdAt = now(), topicId = getActiveT
 
 function getOpenAiApiKey() {
   return cleanText(getSetting("openai_api_key")) || cleanText(process.env.OPENAI_API_KEY || "");
-}
-
-function getOpenAiErrorStatus(error) {
-  const status = Number(error?.status || error?.response?.status || 0);
-  return status >= 400 && status < 600 ? status : 502;
-}
-
-function getOpenAiErrorMessage(error, fallback = "OpenAI API request failed") {
-  const status = getOpenAiErrorStatus(error);
-  const code = cleanText(error?.code || error?.error?.code || "");
-  const message = cleanText(error?.message || error?.error?.message || "");
-  if (status === 401 || code === "invalid_api_key") {
-    return "OpenAI API 鉴权失败。请检查 Render 环境变量 OPENAI_API_KEY 是否正确、没有多余空格，并重新部署。";
-  }
-  if (status === 429 && /insufficient_quota|quota|credits|billing/i.test(`${code} ${message}`)) {
-    return "OpenAI API 额度或余额不足。请检查 API 账单、项目限额或充值状态。";
-  }
-  if (status === 429) {
-    return "OpenAI API 触发速率限制。请稍后重试，或降低并发/请求频率。";
-  }
-  if (status === 403 || /model_not_found|permission|access/i.test(`${code} ${message}`)) {
-    return "OpenAI API 权限不足。请检查当前 API key 所属项目是否有权限使用所选模型。";
-  }
-  return message || fallback;
 }
 
 function getEnvValue(names = []) {
@@ -3656,73 +3632,25 @@ app.post("/api/realtime/session", async (req, res) => {
   }
   const aiSettings = getAiSettingsState();
   const session = buildRealtimeSessionConfig(aiSettings);
-  addActivity("Realtime", "Voice session bootstrap created", now());
+  const client = new OpenAI({ apiKey: openAiApiKey });
+  const clientSecret = await client.realtime.clientSecrets.create({
+    session,
+    expires_after: {
+      anchor: "created_at",
+      seconds: 600
+    }
+  });
+  addActivity("Realtime", "Voice session token created", now());
   writeTopicSnapshot();
   return res.json({
-    clientSecret: "server-proxy",
-    expiresAt: Math.floor(Date.now() / 1000) + 600,
+    clientSecret: clientSecret.value,
+    expiresAt: clientSecret.expires_at,
     model: aiSettings.realtimeModel,
-    realtimeCallUrl: "/api/realtime/calls",
-    useServerProxy: true,
     instructions: session.instructions,
     tools: session.tools,
     audio: session.audio,
     settings: aiSettings
   });
-});
-
-app.post("/api/realtime/calls", async (req, res) => {
-  const openAiApiKey = getOpenAiApiKey();
-  if (!openAiApiKey) {
-    return res.status(500).type("text/plain").send("OPENAI_API_KEY is not configured");
-  }
-  const sdp = String(req.body || "").trim();
-  if (!sdp) {
-    return res.status(400).type("text/plain").send("Missing WebRTC SDP offer");
-  }
-  const aiSettings = getAiSettingsState();
-  const form = new FormData();
-  form.set("sdp", sdp);
-  form.set("session", JSON.stringify(buildRealtimeSessionConfig(aiSettings)));
-  try {
-    const response = await fetch("https://api.openai.com/v1/realtime/calls", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${openAiApiKey}`
-      },
-      body: form
-    });
-    const answer = await response.text();
-    if (!response.ok) {
-      let payload = {};
-      try {
-        payload = JSON.parse(answer);
-      } catch {
-        payload = { message: answer };
-      }
-      const error = payload?.error || payload;
-      const status = response.status || getOpenAiErrorStatus(error);
-      console.error("Failed to create OpenAI realtime call", {
-        status,
-        code: error?.code,
-        type: error?.type,
-        message: error?.message || answer
-      });
-      return res.status(status).type("text/plain").send(getOpenAiErrorMessage({ ...error, status }, answer || "Unable to create OpenAI realtime call"));
-    }
-    const location = response.headers.get("Location");
-    if (location) res.setHeader("Location", location);
-    return res.status(200).type("application/sdp").send(answer);
-  } catch (error) {
-    const status = getOpenAiErrorStatus(error);
-    console.error("Failed to proxy OpenAI realtime call", {
-      status,
-      code: error?.code || error?.error?.code,
-      type: error?.type || error?.error?.type,
-      message: error?.message || error?.error?.message
-    });
-    return res.status(status).type("text/plain").send(getOpenAiErrorMessage(error, "Unable to reach OpenAI realtime API from Render"));
-  }
 });
 
 if (process.env.NODE_ENV === "production" && fs.existsSync(clientDistDir)) {

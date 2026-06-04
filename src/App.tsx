@@ -84,8 +84,6 @@ type RealtimeSessionBootstrap = {
   clientSecret: string;
   expiresAt: number;
   model: string;
-  realtimeCallUrl?: string;
-  useServerProxy?: boolean;
   instructions: string;
   tools: RealtimeToolDefinition[];
     audio: {
@@ -194,12 +192,6 @@ function isVoicePermissionError(error: unknown) {
   const message = error instanceof Error ? error.message : String(error || "");
   const name = error instanceof DOMException ? error.name : "";
   return name === "NotAllowedError" || name === "SecurityError" || /permission denied|notallowed|denied/i.test(message);
-}
-
-function absoluteRealtimeCallUrl(value?: string) {
-  const cleaned = value?.trim();
-  if (!cleaned) return undefined;
-  return new URL(cleaned, window.location.origin).toString();
 }
 
 function loadStoredJson<T>(key: string, fallback: T): T {
@@ -3207,8 +3199,6 @@ export function App() {
         tools: realtimeTools
       });
       const transport = new OpenAIRealtimeWebRTC({
-        baseUrl: absoluteRealtimeCallUrl(bootstrap.realtimeCallUrl),
-        useInsecureApiKey: Boolean(bootstrap.useServerProxy),
         mediaStream: stream,
         audioElement: audioRef.current ?? undefined,
         changePeerConnection: (peer) => {
