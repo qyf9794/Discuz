@@ -196,6 +196,12 @@ function isVoicePermissionError(error: unknown) {
   return name === "NotAllowedError" || name === "SecurityError" || /permission denied|notallowed|denied/i.test(message);
 }
 
+function absoluteRealtimeCallUrl(value?: string) {
+  const cleaned = value?.trim();
+  if (!cleaned) return undefined;
+  return new URL(cleaned, window.location.origin).toString();
+}
+
 function loadStoredJson<T>(key: string, fallback: T): T {
   try {
     const raw = localStorage.getItem(key);
@@ -3201,7 +3207,7 @@ export function App() {
         tools: realtimeTools
       });
       const transport = new OpenAIRealtimeWebRTC({
-        baseUrl: bootstrap.realtimeCallUrl || undefined,
+        baseUrl: absoluteRealtimeCallUrl(bootstrap.realtimeCallUrl),
         useInsecureApiKey: Boolean(bootstrap.useServerProxy),
         mediaStream: stream,
         audioElement: audioRef.current ?? undefined,
