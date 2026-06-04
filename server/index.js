@@ -36,7 +36,7 @@ const port = Number(process.env.PORT || 8787);
 const defaultImageGenerationModel = process.env.OPENAI_IMAGE_MODEL || "gpt-image-1.5";
 const aiSettingsDefaults = {
   assistantName: "Discuz",
-  realtimeModel: "gpt-realtime-2",
+  realtimeModel: "gpt-realtime",
   realtimeVoice: "shimmer",
   transcriptionModel: "gpt-4o-transcribe",
   imageModel: defaultImageGenerationModel,
@@ -1393,6 +1393,30 @@ function getOpenAiApiKey() {
   return cleanText(getSetting("openai_api_key")) || cleanText(process.env.OPENAI_API_KEY || "");
 }
 
+function getOpenAiErrorStatus(error) {
+  const status = Number(error?.status || error?.response?.status || 0);
+  return status >= 400 && status < 600 ? status : 502;
+}
+
+function getOpenAiErrorMessage(error, fallback = "OpenAI API request failed") {
+  const status = getOpenAiErrorStatus(error);
+  const code = cleanText(error?.code || error?.error?.code || "");
+  const message = cleanText(error?.message || error?.error?.message || "");
+  if (status === 401 || code === "invalid_api_key") {
+    return "OpenAI API 鉴权失败。请检查 Render 环境变量 OPENAI_API_KEY 是否正确、没有多余空格，并重新部署。";
+  }
+  if (status === 429 && /insufficient_quota|quota|credits|billing/i.test(`${code} ${message}`)) {
+    return "OpenAI API 额度或余额不足。请检查 API 账单、项目限额或充值状态。";
+  }
+  if (status === 429) {
+    return "OpenAI API 触发速率限制。请稍后重试，或降低并发/请求频率。";
+  }
+  if (status === 403 || /model_not_found|permission|access/i.test(`${code} ${message}`)) {
+    return "OpenAI API 权限不足。请检查当前 API key 所属项目是否有权限使用所选模型。";
+  }
+  return message || fallback;
+}
+
 function getEnvValue(names = []) {
   return names.map((name) => cleanText(process.env[name] || "")).find(Boolean) || "";
 }
@@ -1436,7 +1460,7 @@ function getAiSettingsState() {
   const tavilyState = getWebSearchSecretState("tavily");
   return {
     assistantName: cleanText(getSetting("ai_assistant_name")) || aiSettingsDefaults.assistantName,
-    realtimeModel: oneOf(getSetting("ai_realtime_model"), ["gpt-realtime-2", "gpt-realtime"], aiSettingsDefaults.realtimeModel),
+    realtimeModel: oneOf(getSetting("ai_realtime_model"), ["gpt-realtime"], aiSettingsDefaults.realtimeModel),
     realtimeVoice: oneOf(getSetting("ai_realtime_voice"), ["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"], aiSettingsDefaults.realtimeVoice),
     transcriptionModel: oneOf(getSetting("ai_transcription_model"), ["gpt-4o-transcribe", "gpt-4o-mini-transcribe"], aiSettingsDefaults.transcriptionModel),
     imageModel: oneOf(getSetting("ai_image_model"), ["gpt-image-1.5", "gpt-image-1"], aiSettingsDefaults.imageModel),
@@ -1461,7 +1485,7 @@ function saveAiSettings(payload = {}) {
   const current = getAiSettingsState();
   const next = {
     assistantName: cleanText(payload.assistantName ?? current.assistantName).slice(0, 40) || aiSettingsDefaults.assistantName,
-    realtimeModel: oneOf(payload.realtimeModel ?? current.realtimeModel, ["gpt-realtime-2", "gpt-realtime"], current.realtimeModel),
+    realtimeModel: oneOf(payload.realtimeModel ?? current.realtimeModel, ["gpt-realtime"], current.realtimeModel),
     realtimeVoice: oneOf(payload.realtimeVoice ?? current.realtimeVoice, ["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"], current.realtimeVoice),
     transcriptionModel: oneOf(payload.transcriptionModel ?? current.transcriptionModel, ["gpt-4o-transcribe", "gpt-4o-mini-transcribe"], current.transcriptionModel),
     imageModel: oneOf(payload.imageModel ?? current.imageModel, ["gpt-image-1.5", "gpt-image-1"], current.imageModel),
@@ -3630,27 +3654,42 @@ app.post("/api/realtime/session", async (req, res) => {
   if (!openAiApiKey) {
     return res.status(500).json({ error: "OPENAI_API_KEY is not configured" });
   }
-  const aiSettings = getAiSettingsState();
-  const session = buildRealtimeSessionConfig(aiSettings);
-  const client = new OpenAI({ apiKey: openAiApiKey });
-  const clientSecret = await client.realtime.clientSecrets.create({
-    session,
-    expires_after: {
-      anchor: "created_at",
-      seconds: 600
-    }
-  });
-  addActivity("Realtime", "Voice session token created", now());
-  writeTopicSnapshot();
-  return res.json({
-    clientSecret: clientSecret.value,
-    expiresAt: clientSecret.expires_at,
-    model: aiSettings.realtimeModel,
-    instructions: session.instructions,
-    tools: session.tools,
-    audio: session.audio,
-    settings: aiSettings
-  });
+  try {
+    const aiSettings = getAiSettingsState();
+    const session = buildRealtimeSessionConfig(aiSettings);
+    const client = new OpenAI({ apiKey: openAiApiKey });
+    const clientSecret = await client.realtime.clientSecrets.create({
+      session,
+      expires_after: {
+        anchor: "created_at",
+        seconds: 600
+      }
+    });
+    addActivity("Realtime", "Voice session token created", now());
+    writeTopicSnapshot();
+    return res.json({
+      clientSecret: clientSecret.value,
+      expiresAt: clientSecret.expires_at,
+      model: aiSettings.realtimeModel,
+      instructions: session.instructions,
+      tools: session.tools,
+      audio: session.audio,
+      settings: aiSettings
+    });
+  } catch (error) {
+    const status = getOpenAiErrorStatus(error);
+    console.error("Failed to create OpenAI realtime client secret", {
+      status,
+      code: error?.code || error?.error?.code,
+      type: error?.type || error?.error?.type,
+      message: error?.message || error?.error?.message
+    });
+    return res.status(status).json({
+      error: getOpenAiErrorMessage(error, "Unable to create OpenAI realtime session"),
+      openaiStatus: status,
+      openaiCode: cleanText(error?.code || error?.error?.code || "")
+    });
+  }
 });
 
 if (process.env.NODE_ENV === "production" && fs.existsSync(clientDistDir)) {

@@ -44,7 +44,7 @@ const emptyState: AppState = {
     wallpaperUrl: "",
     ai: {
       assistantName: "Discuz",
-      realtimeModel: "gpt-realtime-2",
+      realtimeModel: "gpt-realtime",
       realtimeVoice: "shimmer",
       transcriptionModel: "gpt-4o-transcribe",
       imageModel: "gpt-image-1.5",
@@ -176,7 +176,8 @@ function voiceStartErrorMessage(error: unknown) {
   const message = error instanceof Error ? error.message : String(error || "");
   const name = error instanceof DOMException ? error.name : "";
   if (isVoicePermissionError(error)) {
-    return "麦克风权限被拒绝。请在浏览器地址栏或站点设置中允许 localhost 使用麦克风，并确认系统设置允许当前浏览器使用麦克风，然后刷新页面再试。";
+    const site = typeof window !== "undefined" ? window.location.host || "当前站点" : "当前站点";
+    return `麦克风权限被拒绝。请在浏览器地址栏或站点设置中允许 ${site} 使用麦克风，并确认系统设置允许当前浏览器使用麦克风，然后刷新页面再试。`;
   }
   if (name === "NotFoundError" || /requested device not found|no.*microphone|not found/i.test(message)) {
     return "没有找到可用麦克风。请连接或启用麦克风后再试。";
@@ -5116,7 +5117,6 @@ const SettingsPopover = forwardRef<HTMLElement, {
             <GlassSelect
               value={aiDraft.realtimeModel}
               options={[
-                { value: "gpt-realtime-2", label: "gpt-realtime-2" },
                 { value: "gpt-realtime", label: "gpt-realtime" }
               ]}
               onChange={(value) => setAiDraft((draft) => ({ ...draft, realtimeModel: value }))}
