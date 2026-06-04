@@ -155,6 +155,14 @@ type VoiceMeter = {
   frameId: number;
 };
 
+function ambientMusicPreview(): WebPreview {
+  return { url: "/ambient.html", title: "轻音乐氛围", embeddable: true };
+}
+
+function isAmbientPreview(page: WebPreview | null) {
+  return page?.url === "/ambient.html";
+}
+
 function moveItemByDrop<T extends { id: string }>(items: T[], draggedId: string, targetId: string, after: boolean) {
   const fromIndex = items.findIndex((item) => item.id === draggedId);
   const toIndex = items.findIndex((item) => item.id === targetId);
@@ -417,6 +425,10 @@ function parseHttpUrl(value: string) {
   } catch {
     return null;
   }
+}
+
+function isLocalPreviewUrl(value: string) {
+  return value.startsWith("/");
 }
 
 function isDiagnosticsEnabled() {
@@ -2370,13 +2382,16 @@ export function App() {
         untilDate.setTime(untilDate.getTime() + minutes * 60000);
         const until = untilDate.toISOString();
         setBreakUntil(until);
-        setAmbientMode(args.ambientMode === true ? true : ambientMode);
+        const nextAmbient = args.ambientMode === true ? true : ambientMode;
+        setAmbientMode(nextAmbient);
+        if (nextAmbient) setWebPreview((current) => current ?? ambientMusicPreview());
         setStatusText(`休息中 ${minutes}:00`);
         output = { ok: true, breakUntil: until, minutes };
       }
       if (name === "resume_discussion") {
         setBreakUntil(null);
         setAmbientMode(false);
+        setWebPreview((current) => isAmbientPreview(current) ? null : current);
         setStatusText("已回到讨论");
         output = { ok: true, resumed: true };
       }
@@ -2399,8 +2414,10 @@ export function App() {
           const parsed = parseHttpUrl(musicUrl);
           if (parsed) setWebPreview({ url: parsed.toString(), title: String(args.title || "氛围音乐").trim() });
         }
-        setStatusText(enabled ? "氛围模式已开启" : "氛围模式已关闭");
-        output = { ok: true, ambientMode: enabled, musicUrl: musicUrl || "" };
+        if (enabled && !musicUrl) setWebPreview(ambientMusicPreview());
+        if (!enabled) setWebPreview((current) => isAmbientPreview(current) ? null : current);
+        setStatusText(enabled ? "氛围模式已开启，轻音乐已打开" : "氛围模式已关闭");
+        output = { ok: true, ambientMode: enabled, musicUrl: musicUrl || "/ambient.html" };
       }
       if (name === "show_tool_activity") {
         output = { ok: true, activities: toolActivities.slice(0, 8) };
@@ -4461,6 +4478,12 @@ function WebPreviewWindow({ page, onClose }: { page: WebPreview; onClose: () => 
   useEffect(() => {
     let cancelled = false;
     setEmbedState({ embeddable: page.embeddable ?? null, reason: page.embedReason || "" });
+    if (isLocalPreviewUrl(page.url)) {
+      setEmbedState({ embeddable: true, reason: "" });
+      return () => {
+        cancelled = true;
+      };
+    }
     fetch(`/api/web/embed-check?url=${encodeURIComponent(page.url)}`)
       .then((response) => response.json())
       .then((payload) => {
