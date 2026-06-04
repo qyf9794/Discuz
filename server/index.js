@@ -29,6 +29,7 @@ const rootDir = path.resolve(__dirname, "..");
 const dataDir = path.join(rootDir, "data");
 const legacyUploadDir = path.join(dataDir, "uploads");
 const topicsDir = path.join(dataDir, "topics");
+const diagnosticsDir = path.join(dataDir, "diagnostics");
 const dbPath = path.join(dataDir, "discuz.sqlite");
 const port = Number(process.env.PORT || 8787);
 const defaultImageGenerationModel = process.env.OPENAI_IMAGE_MODEL || "gpt-image-1.5";
@@ -53,6 +54,7 @@ const webSearchSecretSettings = {
 
 fs.mkdirSync(legacyUploadDir, { recursive: true });
 fs.mkdirSync(topicsDir, { recursive: true });
+fs.mkdirSync(diagnosticsDir, { recursive: true });
 
 const db = new DatabaseSync(dbPath);
 db.exec(`
@@ -234,6 +236,28 @@ function now() {
   return new Date().toISOString();
 }
 
+function safeDiagnosticSessionId(value) {
+  const cleaned = String(value || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 80);
+  return cleaned || "default";
+}
+
+function diagnosticEventLimit(event) {
+  const json = JSON.stringify(event ?? {});
+  if (json.length <= 8000) return event;
+  return {
+    at: event?.at || now(),
+    kind: event?.kind || "oversized",
+    detail: {
+      truncated: true,
+      preview: json.slice(0, 8000)
+    }
+  };
+}
+
+function diagnosticFilePath(sessionId) {
+  return path.join(diagnosticsDir, `${safeDiagnosticSessionId(sessionId)}.jsonl`);
+}
+
 function nextFileSortOrder(role, topicId = getActiveTopicId()) {
   const row = db.prepare("SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order FROM files WHERE role = ? AND topic_id = ?").get(role, topicId);
   return Number(row?.next_order ?? 0);
@@ -266,6 +290,33 @@ function decodeMojibakeFilename(value) {
 function normalizeUploadedFilename(value) {
   const leaf = String(value || "unknown").split(/[\\/]/).filter(Boolean).pop() || "unknown";
   return decodeMojibakeFilename(leaf).normalize("NFC");
+}
+
+function filenameFromContentDisposition(value) {
+  const text = String(value || "");
+  const encoded = text.match(/filename\*\s*=\s*UTF-8''([^;]+)/i)?.[1];
+  if (encoded) {
+    try {
+      return decodeURIComponent(encoded.replace(/["']/g, ""));
+    } catch {
+      return encoded.replace(/["']/g, "");
+    }
+  }
+  return text.match(/filename\s*=\s*"?([^";]+)"?/i)?.[1] || "";
+}
+
+function filenameFromUrl(url, contentType = "", contentDisposition = "") {
+  const dispositionName = filenameFromContentDisposition(contentDisposition);
+  if (dispositionName) return normalizeUploadedFilename(dispositionName);
+  try {
+    const parsed = new URL(url);
+    const leaf = decodeURIComponent(path.basename(parsed.pathname));
+    if (leaf && leaf !== "/" && path.extname(leaf)) return normalizeUploadedFilename(leaf);
+  } catch {
+    // Fall through to a content-type based filename.
+  }
+  if (String(contentType).includes("pdf")) return "网页导入文件.pdf";
+  return "网页导入文件";
 }
 
 function rowToFile(row) {
@@ -884,6 +935,36 @@ async function persistUploadedFile(file, role) {
   return rowToFile(db.prepare("SELECT * FROM files WHERE id = ?").get(id));
 }
 
+async function persistUrlFile(rawUrl, role = "primary", title = "") {
+  const url = normalizeWebUrl(rawUrl);
+  const response = await fetchWithTimeout(url, {
+    redirect: "follow",
+    headers: { "Accept": "application/pdf,application/octet-stream,*/*" }
+  }, 45_000);
+  if (!response.ok) throw new Error(`文件下载失败：HTTP ${response.status}`);
+  const contentType = response.headers.get("content-type") || "application/octet-stream";
+  const contentDisposition = response.headers.get("content-disposition") || "";
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (!buffer.length) throw new Error("下载到的文件为空。");
+  const maxSize = 80 * 1024 * 1024;
+  if (buffer.length > maxSize) throw new Error("文件超过 80MB，无法导入。");
+  const originalName = normalizeUploadedFilename(title || filenameFromUrl(response.url || url, contentType, contentDisposition));
+  const kind = detectKindFromMetadata(originalName, contentType);
+  const ext = path.extname(originalName).toLowerCase() || (kind === "pdf" ? ".pdf" : "");
+  const storedName = `${crypto.randomUUID()}${ext}`;
+  const filePath = path.join(currentTopicUploadDir(), storedName);
+  fs.writeFileSync(filePath, buffer);
+  const file = await persistUploadedFile({
+    originalname: originalName,
+    filename: storedName,
+    mimetype: contentType,
+    size: buffer.length,
+    path: filePath
+  }, role);
+  addActivity("URL file", originalName, now());
+  return file;
+}
+
 function persistGeneratedFile(title, text) {
   const id = crypto.randomUUID();
   const originalName = normalizeUploadedFilename(title || `AI临时文案-${shortLocalTime(now()).replace(/[/: ]/g, "-")}.md`);
@@ -1466,6 +1547,10 @@ function buildDiscussionContext() {
   return [
     `你是 ${aiSettings.assistantName}，一个用于本地文件语音讨论的 AI 伙伴。你的对话必须紧密围绕当前主讨论文件、用户给出的背景材料和用户刚刚提出的问题。`,
     "表达习惯：保持自然口语，但不要依赖固定开场白、固定等待语或固定结束语；每次根据上下文换一种说法。不要过度卖萌、不要夸张，不要使用表情符号。",
+    "讨论主持人定位：你不是被动执行命令的工具助手，而是一个克制主动的讨论主持人。每轮都要观察当前主题、文件、前台窗口、讨论方向 todo、刚生成的文件、未完成任务和用户刚说的话，判断最能推进讨论的一小步。",
+    "主动推进规则：当用户表达模糊、停顿、跑题、问“接下来呢”、或刚完成一个步骤时，主动给出 1 个推荐下一步，并用一句话询问用户是否这样推进。必要时给 2 个可选方向，但不要一次抛出很多选项。",
+    "主动工具规则：读状态类工具可以主动使用，例如 read_current_focus、get_discussion_state、search_context，用来确认当前材料或界面焦点；会改变界面或产生结果的工具，例如生成文件、联网搜索、打开网页、下载、移动文件、生成图片，除非用户已经明确要求，否则先征求用户同意。",
+    "主动节奏规则：不要为了显得主动而多说话。默认每次只推进一个点，最多 2 句；如果用户明显在消化信息，先小结再问一个轻问题。每 2 到 3 轮讨论可以主动做一个小结或提醒未完成方向，但不要打断用户正在表达的内容。",
     "逐句回应规则：用户每说完或输入一条内容，你要自然回应并说明下一步。禁止静默直接调用工具；如果确实要调用工具，先用符合上下文的短句承接，不要套模板。",
     "执行反馈规则：只要你准备调用工具、后台任务、搜索、生成、分析、打开窗口、下载或保存文件，先自然告诉用户你接下来做什么。不要使用固定等待口头禅，也不要反复套同一种句式。工具完成后说明结果或下一步，不要沉默等待用户问“在吗”。",
     "等待反馈规则：如果上一轮回复、工具调用或后台任务还在处理，不要假装完成；简短说明当前仍在处理中，并让界面状态继续显示任务。不要反复使用同一个等待句式。",
@@ -1475,8 +1560,8 @@ function buildDiscussionContext() {
     "讨论主题不只来自主题文件，也来自用户在底部输入框提交的主题、观点、问题和链接。用户的文字输入优先级很高，要把它当作当前讨论指令的一部分。",
     "主题确认节奏：先和用户轻松聊一句，弄清用户想做什么。只有当用户已经说出具体讨论内容、问题或目标后，且能从用户刚说的话、当前主题文件或图片摘要中概括主题，才调用 propose_discussion_topic 生成拟确认主题给用户确认。用户还没明确说要讨论什么时，只打招呼并询问，不要主动拟主题。主题确认前，不要规划讨论方向、不要生成 todo，也不要进入长期展开。",
     "随着讨论深入，如果你判断已经形成更准确的讨论主题，必须调用 propose_discussion_topic 请用户确认。若你发现用户正在严重偏离已确认主题，也要调用 propose_discussion_topic 提醒用户，并说明是继续原主题还是确认更换主题。",
-    "讨论方向 todo 的节奏：主题一旦被用户确认，就立即调用 propose_discussion_directions 提出 1 到 3 个方向等用户确认，一次最多 3 个，不要再等待几轮讨论。语音只用自然短句提醒用户可以删改，不要固定话术。用户确认后，界面会在主题区显示 todo。用户明确要求增加方向时，调用 add_discussion_directions 追加 1 到 3 个新方向；用户不满意时，优先调用 update_discussion_directions 用完整新列表快速替换；用户只想删掉某一条时，可以提醒他点该条右侧删除按钮。每完成一个方向，调用 complete_discussion_direction 标记完成，并写一条简洁记录。",
-    "语音确认规则：如果你刚提出了待确认讨论主题，用户说“确认”“可以”“就这个”“对”“没问题”等肯定语义时，调用 confirm_discussion_topic；如果你刚提出了待确认讨论方向 todo，用户说类似肯定语义时，调用 confirm_discussion_directions。不要只口头说已确认，必须调用对应工具保存到界面。",
+    "讨论方向 todo 的节奏：主题被用户确认后，不要立刻生成方向。先用一句自然短句询问用户是否需要你整理 1 到 3 个讨论方向；只有用户明确同意后，才调用 propose_discussion_directions 提出方向供用户确认，一次最多 3 个。语音只用自然短句提醒用户可以删改，不要固定话术。用户确认方向后，界面会在主题区显示 todo。用户明确要求增加方向时，调用 add_discussion_directions 追加 1 到 3 个新方向；用户不满意时，优先调用 update_discussion_directions 用完整新列表快速替换；用户只想删掉某一条时，可以提醒他点该条右侧删除按钮。每完成一个方向，调用 complete_discussion_direction 标记完成，并写一条简洁记录。",
+    "语音确认规则：如果你刚提出了待确认讨论主题，用户说“确认”“可以”“就这个”“对”“没问题”等肯定语义时，调用 confirm_discussion_topic；工具成功后只询问用户是否需要整理讨论方向，不要立刻调用 propose_discussion_directions。如果你刚询问用户是否需要整理讨论方向，用户表示同意时，调用 propose_discussion_directions。如果你刚提出了待确认讨论方向 todo，用户说类似肯定语义时，调用 confirm_discussion_directions。不要只口头说已确认，必须调用对应工具保存到界面。",
     "语音结束规则：如果用户表达想结束本次语音连接，先自然确认用户是否真的要结束，不要立刻断开，也不要把它当作 cancel_current_task。只有用户随后明确确认时，才调用 end_voice_discussion；工具返回后说一句很短的自然告别，不要继续展开。应用会在这句回应结束后断开语音并保存记录。",
     "如果收到系统事件提示主题区文件被添加或删除，你必须立即用 1 句中文询问用户下一步想怎么讨论；不要调用 propose_discussion_topic、propose_discussion_directions 或 update_discussion_directions，不要修改、重命名、清空或重新确认当前讨论主题，除非用户明确要求修改主题或重新确认主题。",
     "如果收到系统事件提示当前主题文件已被删除，你必须立即停止基于该文件继续分析，并询问用户是继续用剩余主题文件讨论、上传新的主题文件，还是暂停这个主题；不要主动改变讨论主题。",
@@ -1495,6 +1580,7 @@ function buildDiscussionContext() {
     "AI 临时生成文案区的文件可以编辑、修改、迭代。所有文件都可以通过打开前台预览窗口临时成为当前讨论对象，但这不会改变它们所属区域或最终成果状态。",
     "用户可以用语音要求你操控界面：打开/关闭前台文件窗口、打开无限白板或临时文档、保存或清空白板/临时文档、复制文件到临时区、把文件移动到主题区/资源区/临时区。遇到这些请求时应调用对应工具完成，不只用语言说明。",
     "联网资料规则：web_search 只用于发现候选网页；如果用户要求基于网页事实回答，或搜索结果摘要不足，继续调用 read_web_page 读取最相关、最权威的网页正文后再回答。回答中说明网页标题或来源网站。遇到登录、付费墙、验证码、反爬或动态页面读取失败时，如实说明限制并换用其他公开来源。",
+    "PDF 链接规则：如果用户提供的 URL 是 PDF、公告、招股书、研报或其他文件链接，优先调用 import_url_as_topic_file 把它导入主题区并等待后台解析；不要先用 read_web_page 把 PDF 当普通网页读取。导入后先告诉用户正在后台解析，解析完成前不要下确定结论。",
     "当用户要求打开网页、查看链接，或你需要把某个搜索结果展示给用户时，调用 open_web_page 在前台网页窗口打开；不要只口头描述链接。如果网站禁止内嵌，用户可以从窗口右上角跳到浏览器打开。",
     "当你需要生成文案、副本、修改稿或阶段性成果草稿时，先调用 create_generated_file，把它放入资源窗口下半区的 AI 临时生成文案。用户可以先打开编辑并“保存编辑”，这只表示编辑确认；只有用户进一步“确认为成果”后，它才会进入讨论主题窗口，作为最终成果继续讨论。",
     "当用户要求生成、绘制、设计图片、地图、海报、示意图或视觉素材时，调用 generate_image。prompt 必须补全主体、构图、风格、材质、颜色、文字标签、比例和清晰度要求，不要只传用户的一句短话。图片会保存到 AI 临时生成区；生成完成后用一句话提示用户可以预览或确认为成果。",
@@ -1874,6 +1960,9 @@ async function readWebPageDirect(url, maxChars) {
     headers: { "Accept": "text/html,text/plain,application/xhtml+xml" }
   }, 15000);
   const contentType = response.headers.get("content-type") || "";
+  if (/application\/pdf/i.test(contentType) || /\.pdf(?:$|[?#])/i.test(response.url || url)) {
+    throw new Error("这是 PDF 文件链接，请使用 import_url_as_topic_file 导入主题区后由后台解析。");
+  }
   const html = await response.text();
   if (!response.ok) throw new Error(`Page returned ${response.status}`);
   const isHtml = /html|xml/i.test(contentType) || /<html|<article|<body/i.test(html);
@@ -1913,6 +2002,7 @@ async function readPublicWebPage(rawUrl, maxChars = 10000) {
     const direct = await readWebPageDirect(url, maxChars);
     if (direct.text.length >= 500 || !useJina) return direct;
   } catch (error) {
+    if (String(error?.message || "").includes("PDF 文件链接")) throw error;
     if (!useJina) throw error;
   }
   return readWebPageWithJina(url, maxChars);
@@ -1934,6 +2024,37 @@ function statePayload(extra = {}) {
     ...extra
   };
 }
+
+app.post("/api/diagnostics/events", (req, res) => {
+  const sessionId = safeDiagnosticSessionId(req.body?.sessionId);
+  const events = Array.isArray(req.body?.events) ? req.body.events : [];
+  if (!events.length) return res.json({ ok: true, written: 0, sessionId });
+  const rows = events.slice(0, 200).map((event) => JSON.stringify(diagnosticEventLimit({
+    ...event,
+    topicId: event?.topicId || getActiveTopicId(),
+    receivedAt: now()
+  }))).join("\n");
+  fs.appendFileSync(diagnosticFilePath(sessionId), `${rows}\n`);
+  res.json({ ok: true, written: events.length, sessionId });
+});
+
+app.get("/api/diagnostics", (_req, res) => {
+  const files = fs.readdirSync(diagnosticsDir)
+    .filter((file) => file.endsWith(".jsonl"))
+    .map((file) => {
+      const filePath = path.join(diagnosticsDir, file);
+      const stat = fs.statSync(filePath);
+      return {
+        sessionId: file.replace(/\.jsonl$/, ""),
+        file,
+        path: filePath,
+        size: stat.size,
+        updatedAt: stat.mtime.toISOString()
+      };
+    })
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  res.json({ diagnosticsDir, files });
+});
 
 app.get("/api/topics", (_req, res) => {
   res.json({ activeTopicId: getActiveTopicId(), topics: getTopics() });
@@ -2140,6 +2261,19 @@ app.post("/api/files/primary", upload.array("files", 20), async (req, res) => {
   for (const file of uploaded) files.push(await persistUploadedFile(file, "primary"));
   writeTopicSnapshot();
   res.json({ uploaded: files, file: files[0], files: getFiles(), activities: getActivities(), topics: getTopics() });
+});
+
+app.post("/api/files/primary/url", async (req, res) => {
+  try {
+    const url = cleanText(req.body?.url || "");
+    const title = cleanText(req.body?.title || "");
+    if (!url) return res.status(400).json({ error: "Missing file URL" });
+    const file = await persistUrlFile(url, "primary", title);
+    writeTopicSnapshot();
+    res.json({ ok: true, file, files: getFiles(), activities: getActivities(), topics: getTopics() });
+  } catch (error) {
+    res.status(400).json({ ok: false, error: error.message || "Unable to import URL file." });
+  }
 });
 
 app.post("/api/files/context", upload.array("files", 20), async (req, res) => {
@@ -2519,6 +2653,20 @@ function buildRealtimeToolDefinitions() {
     },
     {
       type: "function",
+      name: "import_url_as_topic_file",
+      description: "Download a public http/https file URL, especially a PDF, announcement, prospectus, report, or document link, into the topic area so it can be parsed locally in the background.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "The full http or https file URL to import into the topic area." },
+          title: { type: "string", description: "Optional filename to use for the imported file." }
+        },
+        required: ["url"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
       name: "set_layout",
       description: "Adjust the Discuz discussion workspace layout by voice, including focusing or fullscreening one panel.",
       parameters: {
@@ -2601,7 +2749,7 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "read_current_focus",
-      description: "Read the user's current foreground window, selected file, active tool, web popup, and confirmed topic before answering focus-sensitive questions.",
+      description: "Read the user's current foreground window, selected file, active tool, web popup, and confirmed topic. The assistant may proactively use this before proposing a next discussion step.",
       parameters: {
         type: "object",
         properties: {},
@@ -2612,7 +2760,7 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "get_discussion_state",
-      description: "Get the current topic, files, directions, recent meeting messages, notes, records, foreground state, pending tasks, and status text.",
+      description: "Get the current topic, files, directions, recent meeting messages, notes, records, foreground state, pending tasks, and status text. Use proactively when acting as a discussion host, especially after a pause, topic drift, or completed step.",
       parameters: {
         type: "object",
         properties: {},
@@ -2623,7 +2771,7 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "ask_user_confirmation",
-      description: "Ask the user to confirm a topic, direction, edit plan, export, or action before proceeding. Use when consent or a choice is needed.",
+      description: "Ask the user to confirm a topic, direction, edit plan, export, or action before proceeding. Use when the assistant wants to proactively suggest a next step that changes files, opens windows, searches the web, or creates output.",
       parameters: {
         type: "object",
         properties: {
@@ -3308,7 +3456,7 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "propose_discussion_directions",
-      description: "Propose 1 to 3 discussion directions immediately after the user confirms the topic. This only asks the user to confirm; it does not save the todo list yet. Never propose more than 3 at once.",
+      description: "Propose 1 to 3 discussion directions only after the user has explicitly agreed that the assistant should prepare directions. This only asks the user to confirm; it does not save the todo list yet. Never propose more than 3 at once.",
       parameters: {
         type: "object",
         properties: {
@@ -3389,7 +3537,7 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "confirm_discussion_topic",
-      description: "Confirm the currently pending discussion topic after the user says yes, confirm, okay, right, or similar by voice. After this succeeds, propose discussion directions.",
+      description: "Confirm the currently pending discussion topic after the user says yes, confirm, okay, right, or similar by voice. After this succeeds, ask whether the user wants discussion directions; do not propose directions until they agree.",
       parameters: {
         type: "object",
         properties: {

@@ -64,6 +64,7 @@ type StatusLogEntry = { id: string; kind: "status" | "error"; text: string; crea
 type TaskItem = { id: string; label: string; startedAt: string };
 type ToolActivity = { id: string; label: string; status: "running" | "done" | "failed" | "cancelled"; startedAt: string; endedAt?: string; detail?: string; result?: string };
 type DiagnosticEvent = { type: "task:start" | "task:finish" | "task:cancel"; id: string; label: string; at: string; elapsedMs?: number };
+type ConversationDiagnosticEvent = { id: string; at: string; kind: string; topicId?: string; detail?: unknown };
 type DiagnosticSnapshot = {
   statusText: string;
   pendingTasks: TaskItem[];
@@ -105,6 +106,8 @@ const fileDragType = "application/x-discuz-file-id";
 type AudioContextConstructor = typeof AudioContext;
 type DiscuzDiagnostics = {
   snapshot: () => DiagnosticSnapshot;
+  recorder: () => { enabled: boolean; sessionId: string; events: ConversationDiagnosticEvent[] };
+  flushRecorder: () => Promise<void>;
   clearEvents: () => void;
   runTool: (_name: string, _args?: Record<string, unknown>) => Promise<ToolDiagnosticResult>;
   runTools: (_items: Array<{ name: string; args?: Record<string, unknown> }>) => Promise<ToolDiagnosticResult[]>;
@@ -251,6 +254,7 @@ function toolCallLabel(name = "任务") {
     web_search: "联网搜索",
     read_web_page: "读取网页",
     open_web_page: "打开网页",
+    import_url_as_topic_file: "导入链接文件",
     analyze_word_file: "分析Word文件",
     analyze_spreadsheet_file: "分析Excel表格",
     analyze_presentation_file: "分析PPT文件",
@@ -377,6 +381,31 @@ function parseHttpUrl(value: string) {
 function isDiagnosticsEnabled() {
   if (typeof window === "undefined") return false;
   return import.meta.env.DEV && ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname);
+}
+
+function isConversationRecorderEnabled() {
+  if (typeof window === "undefined") return false;
+  if (!["localhost", "127.0.0.1", "::1"].includes(window.location.hostname)) {
+    return localStorage.getItem("discuz-conversation-recorder") === "true";
+  }
+  return localStorage.getItem("discuz-conversation-recorder") !== "false";
+}
+
+function shrinkDiagnosticDetail(value: unknown, depth = 0): unknown {
+  if (value == null) return value;
+  if (typeof value === "string") return compactText(value, depth > 1 ? 800 : 1800);
+  if (typeof value === "number" || typeof value === "boolean") return value;
+  if (Array.isArray(value)) {
+    return value.slice(0, 16).map((item) => shrinkDiagnosticDetail(item, depth + 1));
+  }
+  if (typeof value === "object") {
+    const output: Record<string, unknown> = {};
+    Object.entries(value as Record<string, unknown>).slice(0, 30).forEach(([key, item]) => {
+      output[key] = shrinkDiagnosticDetail(item, depth + 1);
+    });
+    return output;
+  }
+  return String(value);
 }
 
 function isAffirmativeConfirmation(text: string) {
@@ -670,6 +699,7 @@ export function App() {
   const responseWatchdogTimerRef = useRef<number | null>(null);
   const responseTaskTimerRef = useRef<number | null>(null);
   const continuationNudgeTimerRef = useRef<number | null>(null);
+  const pendingDirectionsAfterTopicRef = useRef<{ title: string; attempts: number; awaitingPermission: boolean } | null>(null);
   const activeTaskFinishersRef = useRef<Record<string, (_failed?: boolean) => void>>({});
   const activeTaskLabelsRef = useRef<Record<string, string>>({});
   const activeTaskOrderRef = useRef<string[]>([]);
@@ -679,6 +709,7 @@ export function App() {
   const pendingTaskCountRef = useRef(0);
   const activeTaskLabelRef = useRef("");
   const backgroundParsingActiveRef = useRef(false);
+  const backgroundParsingLabelRef = useRef("");
   const lastStatusLogRef = useRef("Ready");
   const lastErrorLogRef = useRef("");
   const assistantTranscriptRef = useRef("");
@@ -686,6 +717,53 @@ export function App() {
   const boardRef = useRef<HTMLDivElement | null>(null);
   const recordStreamRef = useRef<HTMLDivElement | null>(null);
   const [topicPreviewFrame, setTopicPreviewFrame] = useState<{ left: number; width: number } | null>(null);
+  const [conversationRecorderSessionId] = useState(() => {
+    if (typeof window === "undefined") return "diag-server";
+    const next = `diag-${new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14)}-${crypto.randomUUID().slice(0, 8)}`;
+    localStorage.setItem("discuz-conversation-recorder-session", next);
+    return next;
+  });
+  const conversationDiagnosticEventsRef = useRef<ConversationDiagnosticEvent[]>([]);
+  const conversationDiagnosticPendingRef = useRef<ConversationDiagnosticEvent[]>([]);
+  const conversationDiagnosticFlushTimerRef = useRef<number | null>(null);
+  const lastRecordedMeetingMessageIdRef = useRef<string | null>(null);
+
+  const flushConversationDiagnostics = useCallback(async () => {
+    if (!isConversationRecorderEnabled()) return;
+    const events = conversationDiagnosticPendingRef.current.splice(0);
+    if (!events.length) return;
+    try {
+      await fetch("/api/diagnostics/events", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: conversationRecorderSessionId,
+          events
+        }),
+        keepalive: true
+      });
+    } catch {
+      conversationDiagnosticPendingRef.current = [...events.slice(-100), ...conversationDiagnosticPendingRef.current].slice(-200);
+    }
+  }, [conversationRecorderSessionId]);
+
+  const recordConversationDiagnostic = useCallback((kind: string, detail: unknown = {}) => {
+    if (!isConversationRecorderEnabled()) return;
+    const event: ConversationDiagnosticEvent = {
+      id: crypto.randomUUID(),
+      at: new Date().toISOString(),
+      kind,
+      topicId: state.activeTopicId || undefined,
+      detail: shrinkDiagnosticDetail(detail)
+    };
+    conversationDiagnosticEventsRef.current = [...conversationDiagnosticEventsRef.current.slice(-399), event];
+    conversationDiagnosticPendingRef.current = [...conversationDiagnosticPendingRef.current, event].slice(-200);
+    if (conversationDiagnosticFlushTimerRef.current) return;
+    conversationDiagnosticFlushTimerRef.current = window.setTimeout(() => {
+      conversationDiagnosticFlushTimerRef.current = null;
+      flushConversationDiagnostics().catch(() => undefined);
+    }, 1200);
+  }, [flushConversationDiagnostics, state.activeTopicId]);
 
   const primaryFiles = useMemo(() => state.files.filter((file) => file.role === "primary"), [state.files]);
   const contextFiles = useMemo(() => state.files.filter((file) => file.role === "context"), [state.files]);
@@ -716,6 +794,72 @@ export function App() {
     visibleTasksRef.current = visibleTasks;
     toolActivitiesRef.current = toolActivities;
   }, [pendingTasks, statusText, toolActivities, visibleTasks]);
+  useEffect(() => {
+    recordConversationDiagnostic("status", { statusText, voiceState, visibleTasks: visibleTasks.map((task) => task.label) });
+  }, [recordConversationDiagnostic, statusText, voiceState, visibleTasks]);
+  useEffect(() => {
+    recordConversationDiagnostic("tool_activities", { toolActivities: toolActivities.slice(0, 8) });
+  }, [recordConversationDiagnostic, toolActivities]);
+  useEffect(() => {
+    recordConversationDiagnostic("discussion_topic", { discussionTopic: state.discussionTopic });
+  }, [recordConversationDiagnostic, state.discussionTopic]);
+  useEffect(() => {
+    recordConversationDiagnostic("directions", { directions: state.directions });
+  }, [recordConversationDiagnostic, state.directions]);
+  useEffect(() => {
+    if (topicProposal) recordConversationDiagnostic("topic_proposal", topicProposal);
+  }, [recordConversationDiagnostic, topicProposal]);
+  useEffect(() => {
+    if (directionProposal) recordConversationDiagnostic("direction_proposal", directionProposal);
+  }, [directionProposal, recordConversationDiagnostic]);
+  useEffect(() => {
+    const latest = state.meetingMessages[state.meetingMessages.length - 1];
+    if (!latest) return;
+    if (lastRecordedMeetingMessageIdRef.current === null) {
+      lastRecordedMeetingMessageIdRef.current = latest.id;
+      recordConversationDiagnostic("meeting_message_snapshot", latest);
+      return;
+    }
+    if (lastRecordedMeetingMessageIdRef.current === latest.id) return;
+    lastRecordedMeetingMessageIdRef.current = latest.id;
+    recordConversationDiagnostic("meeting_message", latest);
+  }, [recordConversationDiagnostic, state.meetingMessages]);
+  useEffect(() => {
+    const heartbeat = window.setInterval(() => {
+      recordConversationDiagnostic("heartbeat", {
+        statusText: statusTextRef.current,
+        voiceState,
+        responseActive: responseActiveRef.current,
+        responsePending: responsePendingRef.current,
+        pendingTaskCount: pendingTaskCountRef.current,
+        visibleTasks: visibleTasksRef.current.map((task) => task.label),
+        toolActivities: toolActivitiesRef.current.slice(0, 6),
+        meetingMessageCount: state.meetingMessages.length,
+        directionCount: directionsRef.current.length,
+        topic: discussionTopicRef.current
+      });
+      flushConversationDiagnostics().catch(() => undefined);
+    }, 5000);
+    return () => window.clearInterval(heartbeat);
+  }, [flushConversationDiagnostics, recordConversationDiagnostic, state.meetingMessages.length, voiceState]);
+  useEffect(() => {
+    recordConversationDiagnostic("recorder_ready", {
+      sessionId: conversationRecorderSessionId,
+      enabled: isConversationRecorderEnabled()
+    });
+    const flushOnPageHide = () => {
+      const events = conversationDiagnosticPendingRef.current.splice(0);
+      if (!events.length) return;
+      const body = JSON.stringify({ sessionId: conversationRecorderSessionId, events });
+      navigator.sendBeacon?.("/api/diagnostics/events", new Blob([body], { type: "application/json" }));
+    };
+    window.addEventListener("pagehide", flushOnPageHide);
+    return () => {
+      window.removeEventListener("pagehide", flushOnPageHide);
+      if (conversationDiagnosticFlushTimerRef.current) window.clearTimeout(conversationDiagnosticFlushTimerRef.current);
+      flushConversationDiagnostics().catch(() => undefined);
+    };
+  }, [conversationRecorderSessionId, flushConversationDiagnostics, recordConversationDiagnostic]);
   const selectedFile = useMemo(
     () => state.files.find((file) => file.id === selectedId) ?? primaryFiles[0] ?? null,
     [state.files, selectedId, primaryFiles]
@@ -809,7 +953,7 @@ export function App() {
     if (!hasParsingFiles) return;
     const timer = window.setInterval(() => {
       loadState().catch((err) => setError(err.message));
-    }, 2500);
+    }, 1000);
     return () => window.clearInterval(timer);
   }, [hasParsingFiles, loadState]);
 
@@ -817,11 +961,13 @@ export function App() {
     if (parsingFiles.length) {
       backgroundParsingActiveRef.current = true;
       const label = parsingFiles.length === 1 ? fileExtractionLabel(parsingFiles[0]) : `后台解析/识别 ${parsingFiles.length} 个文件`;
+      backgroundParsingLabelRef.current = label;
       if (pendingTaskCountRef.current === 0) setStatusText(`${label}进行中`);
       return;
     }
     if (backgroundParsingActiveRef.current) {
       backgroundParsingActiveRef.current = false;
+      backgroundParsingLabelRef.current = "";
       if (pendingTaskCountRef.current === 0) setStatusText("后台解析/识别完成");
     }
   }, [parsingFiles]);
@@ -1130,6 +1276,7 @@ export function App() {
     }
     setPendingTasks((current) => [...current.filter((task) => task.id !== id), { id, label, startedAt }]);
     setStatusText(`${label}进行中`);
+    recordConversationDiagnostic("task:start", { id, label, startedAt });
     let finishing = false;
     let completed = false;
     return (failed = false) => {
@@ -1159,14 +1306,19 @@ export function App() {
           setStatusText(pendingTaskCountRef.current > 1 ? `正在执行 ${pendingTaskCountRef.current} 个任务` : `${activeLabel}进行中`);
         } else {
           activeTaskLabelRef.current = "";
-          setStatusText(`${label}${failed ? "失败" : "完成"}`);
+          if (backgroundParsingActiveRef.current && backgroundParsingLabelRef.current) {
+            setStatusText(`${backgroundParsingLabelRef.current}进行中`);
+          } else {
+            setStatusText(`${label}${failed ? "失败" : "完成"}`);
+          }
         }
+        recordConversationDiagnostic("task:finish", { id, label, failed, elapsedMs: Date.now() - startedAtMs });
       };
       const remainingMs = Math.max(0, 900 - (Date.now() - startedAtMs));
       if (remainingMs > 0) window.setTimeout(complete, remainingMs);
       else complete();
     };
-  }, []);
+  }, [recordConversationDiagnostic]);
 
   const beginUniqueTask = useCallback((key: string, label: string) => {
     const existing = activeTaskFinishersRef.current[key];
@@ -1200,6 +1352,7 @@ export function App() {
       ].slice(-200);
     }
     taskEpochRef.current += 1;
+    recordConversationDiagnostic("task:cancel_all", { ids: activeTaskOrderRef.current, labels: activeTaskLabelsRef.current });
     activeTaskFinishersRef.current = {};
     activeTaskLabelsRef.current = {};
     activeTaskOrderRef.current = [];
@@ -1210,7 +1363,7 @@ export function App() {
     pendingTaskCountRef.current = 0;
     activeTaskLabelRef.current = "";
     setPendingTasks([]);
-  }, []);
+  }, [recordConversationDiagnostic]);
 
   const scheduleResponseTask = useCallback((label = "AI整理结果") => {
     if (responseTaskTimerRef.current || activeTaskFinishersRef.current.response) return;
@@ -1262,6 +1415,7 @@ export function App() {
       detail
     };
     setToolActivities((items) => [activity, ...items].slice(0, 12));
+    recordConversationDiagnostic("tool:start", activity);
     return id;
   };
 
@@ -1273,6 +1427,16 @@ export function App() {
       }
       return { ...item, ...patch, endedAt: patch.endedAt ?? item.endedAt };
     }));
+    recordConversationDiagnostic("tool:update", { id, patch });
+  };
+
+  const showPendingExtractionStatus = (files: DiscuzFile[]) => {
+    const pending = files.filter((file) => file.extractionStatus === "pending" || file.extractionStatus === "processing");
+    if (!pending.length) return;
+    const label = pending.length === 1 ? fileExtractionLabel(pending[0]) : `后台解析/识别 ${pending.length} 个文件`;
+    backgroundParsingActiveRef.current = true;
+    backgroundParsingLabelRef.current = label;
+    setStatusText(`${label}进行中`);
   };
 
   const setPrimary = async (files: FileList | File[]) => {
@@ -1283,7 +1447,9 @@ export function App() {
       const payload = await uploadFiles("/api/files/primary", "files", list);
       setState((current) => ({ ...current, files: payload.files, activities: payload.activities }));
       setSelectedId(payload.uploaded?.[0]?.id ?? payload.file?.id ?? selectedId);
-      notifyPrimaryFilesAdded((payload.uploaded ?? (payload.file ? [payload.file] : [])) as DiscuzFile[]);
+      const uploaded = (payload.uploaded ?? (payload.file ? [payload.file] : [])) as DiscuzFile[];
+      showPendingExtractionStatus(uploaded);
+      notifyPrimaryFilesAdded(uploaded);
       setError("");
     } finally {
       finishTask();
@@ -1297,6 +1463,7 @@ export function App() {
     try {
       const payload = await uploadFiles("/api/files/context", "files", list);
       setState((current) => ({ ...current, files: payload.files, activities: payload.activities }));
+      showPendingExtractionStatus((payload.uploaded ?? (payload.file ? [payload.file] : [])) as DiscuzFile[]);
       setError("");
     } finally {
       finishTask();
@@ -1310,6 +1477,7 @@ export function App() {
     try {
       const payload = await uploadFiles("/api/files/generated/upload", "files", list);
       setState((current) => ({ ...current, files: payload.files, activities: payload.activities }));
+      showPendingExtractionStatus((payload.uploaded ?? (payload.file ? [payload.file] : [])) as DiscuzFile[]);
       setGeneratedEditorId(null);
       setWebPreview(null);
       setError("");
@@ -1564,6 +1732,37 @@ export function App() {
     }, 850);
   }, [beginUniqueTask, requestRealtimeResponse]);
 
+  const finishPendingDirectionsAfterTopic = useCallback(() => {
+    if (!pendingDirectionsAfterTopicRef.current) return;
+    pendingDirectionsAfterTopicRef.current = null;
+    finishUniqueTask("directions-after-topic");
+  }, [finishUniqueTask]);
+
+  const requestDirectionsAfterConfirmedTopic = useCallback(() => {
+    const pending = pendingDirectionsAfterTopicRef.current;
+    if (!pending) return false;
+    if (pending.awaitingPermission) return false;
+    if (directionProposalRef.current?.directions?.length || directionsRef.current.length) {
+      finishPendingDirectionsAfterTopic();
+      return false;
+    }
+    const session = realtimeSessionRef.current;
+    if (!session || typeof session.transport.requestResponse !== "function") return false;
+    if (pending.attempts >= 2) {
+      finishPendingDirectionsAfterTopic();
+      return false;
+    }
+    pending.attempts += 1;
+    beginUniqueTask("directions-after-topic", "生成讨论方向");
+    session.sendMessage([
+      `系统事件：讨论主题《${pending.title}》已经确认，但界面还没有待确认的讨论方向。`,
+      "请现在调用 propose_discussion_directions，基于当前主题、主题文件和用户输入提出 1 到 3 个方向供用户确认。",
+      "只用自然短句提醒用户可以删改方向，不要再次确认主题，不要等待用户再次追问。"
+    ].join("\n\n"));
+    window.setTimeout(() => requestRealtimeResponseRef.current(), 0);
+    return true;
+  }, [beginUniqueTask, finishPendingDirectionsAfterTopic]);
+
   const notifyForegroundDiscussion = (title: string, text: string) => {
     sendRealtimeSystemEvent(`系统事件：用户打开了前台讨论窗口《${title}》。这个窗口现在是当前临时讨论对象，请先阅读以下内容，再围绕它继续讨论。\n\n${text.slice(0, 6000)}`);
   };
@@ -1704,6 +1903,7 @@ export function App() {
         activities: payload.activities ?? current.activities
       }));
       saveMeetingMessage(text, "user").catch((err) => setError(err instanceof Error ? err.message : "Unable to save meeting record"));
+      if (await handleSpokenConfirmation(text)) return;
 
       const session = realtimeSessionRef.current;
       if (session) {
@@ -1745,15 +1945,21 @@ export function App() {
       topicProposalRef.current = null;
       setDirectionProposal(null);
       directionProposalRef.current = null;
-      setStatusText(`已确认主题：${confirmedTitle}`);
+      pendingDirectionsAfterTopicRef.current = { title: confirmedTitle, attempts: 0, awaitingPermission: true };
+      setStatusText("等待确认是否生成讨论方向");
       const session = realtimeSessionRef.current;
+      recordConversationDiagnostic("directions_after_topic:awaiting_permission", { title: confirmedTitle });
       if (options.notifyRealtime !== false && session) {
         if (responseActiveRef.current) {
           session.interrupt();
           responseActiveRef.current = false;
           clearResponseWatchdog();
         }
-        session.sendMessage(`系统事件：用户已确认讨论主题《${confirmedTitle}》。请立即基于当前主题、主题文件和用户输入调用 propose_discussion_directions，提出 1 到 3 个讨论方向供用户确认，一次最多 3 个。语音只用自然短句说明你会列出方向并请用户删改，不要使用固定话术。如果用户明确要求增加方向，调用 add_discussion_directions 追加 1 到 3 个；如果用户不满意，优先调用 update_discussion_directions 快速替换完整列表；如果用户只是不想要某一条，提醒他可以直接点圆圈右侧删除。`);
+        session.sendMessage([
+          `系统事件：用户已确认讨论主题《${confirmedTitle}》。`,
+          "请先用一句自然短句询问用户：是否需要你整理 1 到 3 个讨论方向供他确认。",
+          "在用户明确同意之前，不要调用 propose_discussion_directions，不要生成 todo。"
+        ].join("\n\n"));
         window.setTimeout(() => requestRealtimeResponseRef.current(), 0);
       }
     } catch (err) {
@@ -1816,6 +2022,13 @@ export function App() {
     const pendingTopic = topicProposalRef.current;
     if (pendingTopic?.title) {
       await confirmDiscussionTopic(pendingTopic.title);
+      return true;
+    }
+    const pendingDirectionGeneration = pendingDirectionsAfterTopicRef.current;
+    if (pendingDirectionGeneration?.awaitingPermission) {
+      pendingDirectionsAfterTopicRef.current = { ...pendingDirectionGeneration, awaitingPermission: false };
+      recordConversationDiagnostic("directions_after_topic:permission_confirmed", { title: pendingDirectionGeneration.title });
+      requestDirectionsAfterConfirmedTopic();
       return true;
     }
     const pendingDirections = directionProposalRef.current?.directions ?? [];
@@ -1943,6 +2156,35 @@ export function App() {
           setPreviewRecordId(null);
           setGeneratedEditorId(null);
           output = { ok: true, opened: parsed.toString() };
+        } else {
+          output = { ok: false, error: "Invalid web URL. Use an http or https URL." };
+        }
+      }
+      if (name === "import_url_as_topic_file") {
+        const parsed = parseHttpUrl(String(args.url || ""));
+        if (parsed) {
+          const response = await fetch("/api/files/primary/url", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ url: parsed.toString(), title: String(args.title || "") })
+          });
+          output = await response.json();
+          if (!response.ok) {
+            output = { ok: false, error: (output as { error?: string }).error || "Unable to import URL file." };
+          } else {
+            const payload = output as { file?: DiscuzFile; files?: DiscuzFile[]; activities?: AppState["activities"]; topics?: DiscussionTopic[] };
+            setState((current) => ({
+              ...current,
+              files: payload.files ?? current.files,
+              activities: payload.activities ?? current.activities,
+              topics: payload.topics ?? current.topics
+            }));
+            if (payload.file?.id) {
+              setSelectedId(payload.file.id);
+              showPendingExtractionStatus([payload.file]);
+              notifyPrimaryFilesAdded([payload.file]);
+            }
+          }
         } else {
           output = { ok: false, error: "Invalid web URL. Use an http or https URL." };
         }
@@ -2515,6 +2757,7 @@ export function App() {
           const proposal = { directions, reason: String(args.reason || "").trim() };
           directionProposalRef.current = proposal;
           setDirectionProposal(proposal);
+          finishPendingDirectionsAfterTopic();
           output = { ok: true, proposed: directions };
         } else {
           output = { ok: false, error: "Missing discussion directions." };
@@ -2563,7 +2806,7 @@ export function App() {
           output = {
             ok: true,
             confirmed: title,
-            next: "Now briefly acknowledge the confirmed topic, then call propose_discussion_directions with 1 to 3 directions for the user to confirm."
+            next: "Briefly acknowledge the confirmed topic, then ask whether the user wants you to prepare 1 to 3 discussion directions. Do not call propose_discussion_directions until the user explicitly agrees."
           };
         } else {
           output = { ok: false, error: "No pending discussion topic to confirm." };
@@ -2709,6 +2952,12 @@ export function App() {
     const diagnosticWindow = window as DiscuzDiagnosticWindow;
     diagnosticWindow.__discuzDiagnostics = {
       snapshot: diagnosticSnapshot,
+      recorder: () => ({
+        enabled: isConversationRecorderEnabled(),
+        sessionId: conversationRecorderSessionId,
+        events: conversationDiagnosticEventsRef.current
+      }),
+      flushRecorder: flushConversationDiagnostics,
       clearEvents: () => {
         diagnosticEventsRef.current = [];
       },
@@ -2726,7 +2975,7 @@ export function App() {
       document.removeEventListener("discuz:run-tool", handleRunTool);
       if (diagnosticWindow.__discuzDiagnostics?.runTool === runDiagnosticTool) delete diagnosticWindow.__discuzDiagnostics;
     };
-  }, [diagnosticSnapshot, runDiagnosticScenario, runDiagnosticTool]);
+  }, [conversationRecorderSessionId, diagnosticSnapshot, flushConversationDiagnostics, runDiagnosticScenario, runDiagnosticTool]);
 
   useEffect(() => {
     if (!isDiagnosticsEnabled()) return;
@@ -2998,22 +3247,28 @@ export function App() {
       session.on("agent_tool_start", (...values: unknown[]) => {
         if (sessionId !== voiceSessionRef.current) return;
         const name = realtimeEventToolName(...values);
+        recordConversationDiagnostic("agent_tool_start", { name, values });
         finishUniqueTask(`approval-${name || "tool"}`);
         finishResponseTask();
       });
-      session.on("agent_tool_end", () => {
+      session.on("agent_tool_end", (...values: unknown[]) => {
         if (sessionId !== voiceSessionRef.current) return;
+        recordConversationDiagnostic("agent_tool_end", { values });
         if (responseActiveRef.current) scheduleResponseTask("AI整理结果");
         scheduleContinuationResponse("AI继续回答");
       });
       session.on("tool_approval_requested", (...values: unknown[]) => {
         if (sessionId !== voiceSessionRef.current) return;
         const name = realtimeEventToolName(...values);
+        recordConversationDiagnostic("tool_approval_requested", { name, values });
         beginUniqueTask(`approval-${name || "tool"}`, `${toolCallLabel(name || "工具")}等待确认`);
       });
       session.on("transport_event", (message) => {
         if (sessionId !== voiceSessionRef.current) return;
         try {
+          if (!String(message.type || "").endsWith(".delta")) {
+            recordConversationDiagnostic("realtime_event", message);
+          }
           if (message.type === "response.created") {
             if (continuationNudgeTimerRef.current) window.clearTimeout(continuationNudgeTimerRef.current);
             continuationNudgeTimerRef.current = null;
@@ -3041,6 +3296,7 @@ export function App() {
               }, 1600);
               return;
             }
+            if (requestDirectionsAfterConfirmedTopic()) return;
             window.setTimeout(() => flushRealtimeResponse(), 0);
           }
           if (message.type === "response.cancelled" || message.type === "response.incomplete") {

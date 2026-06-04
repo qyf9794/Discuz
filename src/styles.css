@@ -952,6 +952,9 @@ a.icon-button {
 .empty-topic {
   position: relative;
   display: grid;
+  flex: 1;
+  width: 100%;
+  min-width: 0;
   height: 100%;
   place-items: center;
   overflow: hidden;
