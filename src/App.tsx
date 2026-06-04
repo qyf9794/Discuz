@@ -209,15 +209,17 @@ function readAnalyserLevel(analyser?: AnalyserNode, data?: Uint8Array<ArrayBuffe
 
 function realtimeRetryDelayMs(message: string) {
   const match = message.match(/try again in\s+([\d.]+)s/i);
-  if (!match) return 800;
+  const jitter = Math.floor(Math.random() * 500);
+  if (!match) return 800 + jitter;
   const seconds = Number(match[1]);
-  if (!Number.isFinite(seconds)) return 800;
-  return Math.min(65000, Math.max(800, Math.ceil(seconds * 1000) + 700));
+  if (!Number.isFinite(seconds)) return 800 + jitter;
+  return Math.min(65000, Math.max(800, Math.ceil(seconds * 1000) + 700 + jitter));
 }
 
 function realtimeRateLimitDelayMs(limit: RealtimeRateLimitState | null, minimumRemaining = 5000) {
   if (!limit || limit.remaining >= minimumRemaining) return 0;
-  return Math.min(65000, Math.max(800, limit.resetAt - Date.now() + 700));
+  const jitter = Math.floor(Math.random() * 500);
+  return Math.min(65000, Math.max(800, limit.resetAt - Date.now() + 700 + jitter));
 }
 
 function extractRealtimeTokenLimit(message: any): RealtimeRateLimitState | null {
@@ -233,6 +235,35 @@ function extractRealtimeTokenLimit(message: any): RealtimeRateLimitState | null 
     remaining,
     resetAt: Date.now() + Math.max(0, resetSeconds * 1000)
   };
+}
+
+function realtimeUsageSnapshot(response: any) {
+  const usage = response?.usage || {};
+  const inputTokens = Number(usage.input_tokens || 0);
+  const outputTokens = Number(usage.output_tokens || 0);
+  const cachedTokens = Number(usage.input_token_details?.cached_tokens || 0);
+  return {
+    inputTokens: Number.isFinite(inputTokens) ? inputTokens : 0,
+    outputTokens: Number.isFinite(outputTokens) ? outputTokens : 0,
+    cachedTokens: Number.isFinite(cachedTokens) ? cachedTokens : 0
+  };
+}
+
+function buildRealtimeMemorySummary(topic: string, messages: MeetingMessage[], notes: Note[]) {
+  const orderedMessages = [...messages].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  const olderMessages = orderedMessages.slice(0, Math.max(0, orderedMessages.length - 8)).slice(-18);
+  const recentNotes = [...notes].sort((a, b) => a.createdAt.localeCompare(b.createdAt)).slice(-8);
+  return [
+    "系统摘要：以下内容替代已删除的较早语音上下文，用于降低 Realtime token 和限流风险。",
+    topic ? `当前主题：${compactText(topic, 120)}` : "当前主题：未确认。",
+    olderMessages.length
+      ? `较早对话要点：\n${olderMessages.map((message) => `- ${message.role === "user" ? "用户" : "AI"}：${compactText(message.text, 120)}`).join("\n")}`
+      : "较早对话要点：无。",
+    recentNotes.length
+      ? `已记录要点：\n${recentNotes.map((note) => `- ${noteLabel(note.kind)}：${compactText(note.text, 140)}`).join("\n")}`
+      : "已记录要点：无。",
+    "继续规则：直接回答用户最新问题；需要旧细节时调用 get_discussion_state 或 search_context，不要臆测。"
+  ].join("\n");
 }
 
 function voiceStartErrorMessage(error: unknown) {
@@ -825,6 +856,8 @@ export function App() {
   const directionProposalRef = useRef<DirectionProposal | null>(null);
   const discussionTopicRef = useRef("");
   const directionsRef = useRef<DiscussionDirection[]>([]);
+  const meetingMessagesRef = useRef<MeetingMessage[]>([]);
+  const notesRef = useRef<Note[]>([]);
   const statusTextRef = useRef(statusText);
   const pendingTasksRef = useRef<TaskItem[]>([]);
   const visibleTasksRef = useRef<TaskItem[]>([]);
@@ -859,6 +892,7 @@ export function App() {
   const emptyResponseRetryTimerRef = useRef<number | null>(null);
   const realtimeRateLimitRef = useRef<RealtimeRateLimitState | null>(null);
   const rateLimitResumeTimerRef = useRef<number | null>(null);
+  const lastRealtimeCompactionAtRef = useRef(0);
   const boardRef = useRef<HTMLDivElement | null>(null);
   const recordStreamRef = useRef<HTMLDivElement | null>(null);
   const [topicPreviewFrame, setTopicPreviewFrame] = useState<{ left: number; width: number } | null>(null);
@@ -1040,7 +1074,9 @@ export function App() {
   useEffect(() => {
     discussionTopicRef.current = state.discussionTopic;
     directionsRef.current = state.directions;
-  }, [state.discussionTopic, state.directions]);
+    meetingMessagesRef.current = state.meetingMessages ?? [];
+    notesRef.current = state.notes ?? [];
+  }, [state.discussionTopic, state.directions, state.meetingMessages, state.notes]);
   const generatedEditorFile = useMemo(
     () => state.files.find((file) => file.id === generatedEditorId) ?? null,
     [state.files, generatedEditorId]
@@ -2066,6 +2102,47 @@ export function App() {
     }, delay);
     return true;
   }, [clearEmptyResponseRetry]);
+
+  const maybeCompactRealtimeHistory = useCallback((response: any) => {
+    const session = realtimeSessionRef.current as any;
+    if (!session || typeof session.updateHistory !== "function" || responseActiveRef.current) return;
+    const usage = realtimeUsageSnapshot(response);
+    const inputTokens = usage.inputTokens;
+    const cachedRatio = inputTokens ? usage.cachedTokens / inputTokens : 1;
+    const history = Array.isArray(session.history) ? session.history : [];
+    const messageCount = history.filter((item: any) => item?.type === "message" && (item.role === "user" || item.role === "assistant")).length;
+    const shouldCompact =
+      inputTokens > 8000 ||
+      (inputTokens > 5000 && cachedRatio < 0.35) ||
+      history.length > 28 ||
+      messageCount > 18;
+    if (!shouldCompact || Date.now() - lastRealtimeCompactionAtRef.current < 30000) return;
+    const summary = buildRealtimeMemorySummary(discussionTopicRef.current, meetingMessagesRef.current, notesRef.current);
+    const recentHistory = history.slice(-12);
+    const preservedSystem = history.filter((item: any) => item?.type === "message" && item.role === "system").slice(-1);
+    const summaryItem = {
+      itemId: `summary-${crypto.randomUUID()}`,
+      type: "message",
+      role: "system",
+      content: [{ type: "input_text", text: compactText(summary, 1600) }]
+    };
+    const nextHistory = [...preservedSystem, summaryItem, ...recentHistory].filter((item, index, list) => {
+      const itemId = (item as any)?.itemId;
+      return itemId && list.findIndex((candidate: any) => candidate?.itemId === itemId) === index;
+    });
+    try {
+      session.updateHistory(nextHistory);
+      lastRealtimeCompactionAtRef.current = Date.now();
+      recordConversationDiagnostic("realtime_history_compacted", {
+        reason: { inputTokens, cachedTokens: usage.cachedTokens, cachedRatio, historyItems: history.length, messageCount },
+        retainedItems: nextHistory.length
+      });
+    } catch (error) {
+      recordConversationDiagnostic("realtime_history_compaction_failed", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }, [recordConversationDiagnostic]);
 
   const sendRealtimeSystemEvent = (text: string, options: { blockTopicProposal?: boolean } = {}) => {
     const session = realtimeSessionRef.current;
@@ -3761,6 +3838,7 @@ export function App() {
     clearEmptyResponseRetry();
     clearRateLimitResume();
     realtimeRateLimitRef.current = null;
+    lastRealtimeCompactionAtRef.current = 0;
     pendingVoiceStopAfterResponseRef.current = "none";
     responseActiveRef.current = false;
     responsePendingRef.current = false;
@@ -3820,6 +3898,7 @@ export function App() {
     clearEmptyResponseRetry();
     clearRateLimitResume();
     realtimeRateLimitRef.current = null;
+    lastRealtimeCompactionAtRef.current = 0;
     setVoiceState("connecting");
     setStatusText("Connecting");
     try {
@@ -4004,6 +4083,7 @@ export function App() {
             clearResponseWatchdog();
             finishResponseTask();
             setVoiceState("live");
+            maybeCompactRealtimeHistory(message.response);
             if (pendingTaskCountRef.current === 0 && !backgroundParsingActiveRef.current) setStatusText("Live");
             const responseOutput = Array.isArray(message.response?.output) ? message.response.output : [];
             const responseStatus = String(message.response?.status || "");
@@ -5873,7 +5953,8 @@ const SettingsPopover = forwardRef<HTMLElement, {
               value={aiDraft.realtimeModel}
               options={[
                 { value: "gpt-realtime-2", label: "gpt-realtime-2" },
-                { value: "gpt-realtime", label: "gpt-realtime" }
+                { value: "gpt-realtime", label: "gpt-realtime" },
+                { value: "gpt-realtime-mini", label: "gpt-realtime-mini" }
               ]}
               onChange={(value) => setAiDraft((draft) => ({ ...draft, realtimeModel: value }))}
             />

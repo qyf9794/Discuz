@@ -43,6 +43,7 @@ const aiSettingsDefaults = {
   imageQuality: "high",
   webSearchProviders: "openai,brave,bing,google,serpapi,tavily,duckduckgo,wikipedia"
 };
+const realtimeModelOptions = ["gpt-realtime-2", "gpt-realtime", "gpt-realtime-mini"];
 const webSearchProviders = ["openai", "brave", "bing", "google", "serpapi", "tavily", "duckduckgo", "wikipedia"];
 const webSearchSecretSettings = {
   brave: { setting: "web_search_brave_api_key", env: ["BRAVE_SEARCH_API_KEY"] },
@@ -58,6 +59,68 @@ fs.mkdirSync(topicsDir, { recursive: true });
 fs.mkdirSync(diagnosticsDir, { recursive: true });
 
 const db = new DatabaseSync(dbPath);
+const openAiRateLimitState = {
+  remainingTokens: Infinity,
+  resetAt: 0
+};
+
+function parseDurationMs(value) {
+  const text = cleanText(value);
+  if (!text) return 0;
+  const match = text.match(/^([\d.]+)\s*(ms|s|m)?$/i);
+  if (!match) return 0;
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount)) return 0;
+  const unit = (match[2] || "s").toLowerCase();
+  if (unit === "ms") return amount;
+  if (unit === "m") return amount * 60000;
+  return amount * 1000;
+}
+
+function openAiBackoffDelayMs(attempt, resetAt = 0) {
+  const exponential = Math.min(60000, 1000 * (2 ** Math.max(0, attempt - 1)));
+  const jitter = Math.floor(Math.random() * 350);
+  const resetDelay = Math.max(0, resetAt - Date.now());
+  return Math.max(exponential + jitter, resetDelay + jitter);
+}
+
+async function waitForOpenAiCapacity(minRemainingTokens = 5000) {
+  if (openAiRateLimitState.remainingTokens >= minRemainingTokens) return;
+  const delay = Math.min(65000, Math.max(0, openAiRateLimitState.resetAt - Date.now() + 700));
+  if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+}
+
+function updateOpenAiRateLimitFromHeaders(headers) {
+  const remaining = Number(headers.get("x-ratelimit-remaining-tokens"));
+  const reset = parseDurationMs(headers.get("x-ratelimit-reset-tokens"));
+  if (Number.isFinite(remaining)) openAiRateLimitState.remainingTokens = remaining;
+  if (reset) openAiRateLimitState.resetAt = Date.now() + reset;
+}
+
+async function openAiFetch(url, options = {}, settings = {}) {
+  const maxAttempts = Math.max(1, settings.maxAttempts || 4);
+  const minRemainingTokens = Math.max(0, settings.minRemainingTokens ?? 5000);
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    await waitForOpenAiCapacity(minRemainingTokens);
+    const controller = settings.timeoutMs ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), settings.timeoutMs) : null;
+    const response = await fetch(url, {
+      ...options,
+      signal: controller?.signal ?? options.signal
+    }).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
+    updateOpenAiRateLimitFromHeaders(response.headers);
+    if (response.status !== 429) return response;
+    lastError = new Error(`OpenAI rate limit returned 429 for ${url}`);
+    const retryAfter = parseDurationMs(response.headers.get("retry-after"));
+    const delay = retryAfter || openAiBackoffDelayMs(attempt, openAiRateLimitState.resetAt);
+    if (attempt < maxAttempts) await new Promise((resolve) => setTimeout(resolve, delay));
+    else return response;
+  }
+  throw lastError || new Error(`OpenAI request failed for ${url}`);
+}
 db.exec(`
   CREATE TABLE IF NOT EXISTS files (
     id TEXT PRIMARY KEY,
@@ -952,7 +1015,7 @@ async function analyzeImageAtPath(filePath, mimeType, originalName) {
     return "图片已上传，但尺寸较大，未自动生成视觉摘要。";
   }
   const imageBase64 = fs.readFileSync(filePath).toString("base64");
-  const response = await fetch("https://api.openai.com/v1/responses", {
+  const response = await openAiFetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${openAiApiKey}`,
@@ -1006,11 +1069,8 @@ function discussionSuggestionTimeoutMs() {
 async function runBackgroundTextJson(prompt, maxOutputTokens = 500) {
   const openAiApiKey = getOpenAiApiKey();
   if (!openAiApiKey) throw new Error("OPENAI_API_KEY is not configured");
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), discussionSuggestionTimeoutMs());
-  const response = await fetch("https://api.openai.com/v1/responses", {
+  const response = await openAiFetch("https://api.openai.com/v1/responses", {
     method: "POST",
-    signal: controller.signal,
     headers: {
       Authorization: `Bearer ${openAiApiKey}`,
       "Content-Type": "application/json"
@@ -1023,7 +1083,7 @@ async function runBackgroundTextJson(prompt, maxOutputTokens = 500) {
         content: [{ type: "input_text", text: prompt }]
       }]
     })
-  }).finally(() => clearTimeout(timer));
+  }, { timeoutMs: discussionSuggestionTimeoutMs(), minRemainingTokens: 2500 });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(payload?.error?.message || `OpenAI background request failed: ${response.status}`);
   const text = responseOutputText(payload);
@@ -1245,7 +1305,7 @@ async function persistGeneratedImage({ title, prompt, size = "1024x1024", qualit
   const aiSettings = getAiSettingsState();
   const safeQuality = ["low", "medium", "high", "auto"].includes(quality) ? quality : aiSettings.imageQuality;
 
-  const response = await fetch("https://api.openai.com/v1/images/generations", {
+  const response = await openAiFetch("https://api.openai.com/v1/images/generations", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${openAiApiKey}`,
@@ -1702,7 +1762,7 @@ function getAiSettingsState() {
   const tavilyState = getWebSearchSecretState("tavily");
   return {
     assistantName: cleanText(getSetting("ai_assistant_name")) || aiSettingsDefaults.assistantName,
-    realtimeModel: oneOf(getSetting("ai_realtime_model"), ["gpt-realtime-2", "gpt-realtime"], aiSettingsDefaults.realtimeModel),
+    realtimeModel: oneOf(getSetting("ai_realtime_model"), realtimeModelOptions, aiSettingsDefaults.realtimeModel),
     realtimeVoice: oneOf(getSetting("ai_realtime_voice"), ["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"], aiSettingsDefaults.realtimeVoice),
     transcriptionModel: oneOf(getSetting("ai_transcription_model"), ["gpt-4o-transcribe", "gpt-4o-mini-transcribe"], aiSettingsDefaults.transcriptionModel),
     imageModel: oneOf(getSetting("ai_image_model"), ["gpt-image-1.5", "gpt-image-1"], aiSettingsDefaults.imageModel),
@@ -1727,7 +1787,7 @@ function saveAiSettings(payload = {}) {
   const current = getAiSettingsState();
   const next = {
     assistantName: cleanText(payload.assistantName ?? current.assistantName).slice(0, 40) || aiSettingsDefaults.assistantName,
-    realtimeModel: oneOf(payload.realtimeModel ?? current.realtimeModel, ["gpt-realtime-2", "gpt-realtime"], current.realtimeModel),
+    realtimeModel: oneOf(payload.realtimeModel ?? current.realtimeModel, realtimeModelOptions, current.realtimeModel),
     realtimeVoice: oneOf(payload.realtimeVoice ?? current.realtimeVoice, ["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"], current.realtimeVoice),
     transcriptionModel: oneOf(payload.transcriptionModel ?? current.transcriptionModel, ["gpt-4o-transcribe", "gpt-4o-mini-transcribe"], current.transcriptionModel),
     imageModel: oneOf(payload.imageModel ?? current.imageModel, ["gpt-image-1.5", "gpt-image-1"], current.imageModel),
@@ -1921,11 +1981,8 @@ function backgroundTaskTimeoutMs() {
 async function runBackgroundTaskText(prompt, maxOutputTokens = 1800) {
   const openAiApiKey = getOpenAiApiKey();
   if (!openAiApiKey) throw new Error("OPENAI_API_KEY is not configured");
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), backgroundTaskTimeoutMs());
-  const response = await fetch("https://api.openai.com/v1/responses", {
+  const response = await openAiFetch("https://api.openai.com/v1/responses", {
     method: "POST",
-    signal: controller.signal,
     headers: {
       Authorization: `Bearer ${openAiApiKey}`,
       "Content-Type": "application/json"
@@ -1938,7 +1995,7 @@ async function runBackgroundTaskText(prompt, maxOutputTokens = 1800) {
         content: [{ type: "input_text", text: prompt }]
       }]
     })
-  }).finally(() => clearTimeout(timer));
+  }, { timeoutMs: backgroundTaskTimeoutMs(), minRemainingTokens: 5000 });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(payload?.error?.message || `OpenAI background task failed: ${response.status}`);
   return responseOutputText(payload);
@@ -2615,7 +2672,7 @@ async function openAiWebSearch(query, limit) {
   const openAiApiKey = getOpenAiApiKey();
   if (!openAiApiKey) return { skipped: "OPENAI_API_KEY is not configured" };
   const cardLimit = isStructuredWebQuery(query) ? Math.max(limit, 20) : limit;
-  const response = await fetchWithTimeout("https://api.openai.com/v1/responses", {
+  const response = await openAiFetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${openAiApiKey}`,
@@ -2640,7 +2697,7 @@ async function openAiWebSearch(query, limit) {
         `用户问题：${query}`
       ].join("\n")
     })
-  }, openAiWebSearchTimeoutMs());
+  }, { timeoutMs: openAiWebSearchTimeoutMs(), minRemainingTokens: 5000 });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(payload?.error?.message || `OpenAI web search returned ${response.status}`);
   const text = responseOutputText(payload);
@@ -4552,9 +4609,47 @@ const omittedRealtimeTools = new Set([
   "propose_discussion_directions"
 ]);
 
-function realtimeToolDefinitionsForSession() {
+const compactRealtimeTools = new Set([
+  "search_context",
+  "research_request",
+  "open_web_page",
+  "set_layout",
+  "open_discussion_tool",
+  "close_foreground_window",
+  "open_file_preview",
+  "read_current_focus",
+  "get_discussion_state",
+  "run_background_task",
+  "start_break",
+  "resume_discussion",
+  "open_media_url",
+  "set_ambient_mode",
+  "show_tool_activity",
+  "cancel_current_task",
+  "analyze_image_file",
+  "save_discussion_note",
+  "create_generated_file",
+  "prepare_discussion_workbench",
+  "copy_file_to_generated",
+  "add_file_to_topic",
+  "move_file_to_area",
+  "prepare_discussion_directions",
+  "confirm_discussion_topic",
+  "confirm_discussion_directions",
+  "end_voice_discussion",
+  "prepare_discussion_topic"
+]);
+
+function shouldUseCompactRealtimeTools(aiSettings) {
+  return /mini/i.test(aiSettings?.realtimeModel || "")
+    || /^(1|true|yes)$/i.test(cleanText(process.env.OPENAI_REALTIME_COMPACT_TOOLS || getSetting("openai_realtime_compact_tools")));
+}
+
+function realtimeToolDefinitionsForSession(aiSettings) {
+  const compactTools = shouldUseCompactRealtimeTools(aiSettings);
   return buildRealtimeToolDefinitions()
     .filter((definition) => !omittedRealtimeTools.has(definition.name))
+    .filter((definition) => !compactTools || compactRealtimeTools.has(definition.name))
     .map(compactRealtimeToolDefinition);
 }
 
@@ -4563,7 +4658,7 @@ function buildRealtimeSessionConfig(aiSettings) {
     type: "realtime",
     model: aiSettings.realtimeModel,
     instructions: buildDiscussionContext(),
-    tools: realtimeToolDefinitionsForSession(),
+    tools: realtimeToolDefinitionsForSession(aiSettings),
     tool_choice: "auto",
     max_response_output_tokens: 300,
     truncation: {
