@@ -430,7 +430,7 @@ a.icon-button {
   justify-self: center;
   bottom: calc(var(--discussion-input-lift) + 52px);
   display: flex;
-  height: 29px;
+  height: 46px;
   align-items: center;
   gap: 3px;
   pointer-events: none;
@@ -447,8 +447,8 @@ a.icon-button {
 .voice-waveform span {
   display: block;
   width: 3px;
-  min-height: 5px;
-  max-height: 29px;
+  min-height: 6px;
+  max-height: 46px;
   border-radius: 999px;
   background: rgba(63, 68, 74, 0.42);
   transition: height 80ms linear, background 180ms ease, box-shadow 180ms ease, opacity 180ms ease;
@@ -2687,7 +2687,7 @@ a.icon-button {
 
   .voice-waveform {
     bottom: calc(var(--discussion-input-lift) + 46px);
-    height: 21px;
+    height: 34px;
     gap: 3px;
   }
 
@@ -2701,7 +2701,8 @@ a.icon-button {
 
   .voice-waveform span {
     width: 2.5px;
-    max-height: 21px;
+    min-height: 5px;
+    max-height: 34px;
   }
 
   .voice-button svg {

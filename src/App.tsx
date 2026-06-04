@@ -167,9 +167,10 @@ function readAnalyserLevel(analyser?: AnalyserNode, data?: Uint8Array<ArrayBuffe
     sum += centered * centered;
   }
   const rms = Math.sqrt(sum / data.length);
-  const noiseFloor = 0.012;
+  const noiseFloor = 0.008;
   if (rms <= noiseFloor) return 0;
-  return Math.min(1, (rms - noiseFloor) / 0.28);
+  const normalized = Math.min(1, (rms - noiseFloor) / 0.13);
+  return Math.min(1, Math.sqrt(normalized) * 1.12);
 }
 
 function voiceStartErrorMessage(error: unknown) {
@@ -3070,8 +3071,8 @@ export function App() {
       if (!current) return;
       const inputLevel = readAnalyserLevel(current.inputAnalyser, current.inputData);
       const outputLevel = readAnalyserLevel(current.outputAnalyser, current.outputData);
-      setVoiceInputLevel((previous) => previous * 0.86 + inputLevel * 0.14);
-      setVoiceOutputLevel((previous) => previous * 0.86 + outputLevel * 0.14);
+      setVoiceInputLevel((previous) => previous * 0.72 + inputLevel * 0.28);
+      setVoiceOutputLevel((previous) => previous * 0.72 + outputLevel * 0.28);
       current.frameId = requestAnimationFrame(tick);
     };
     meter.frameId = requestAnimationFrame(tick);
@@ -4777,8 +4778,8 @@ function VoiceLevelBars({ state, inputLevel, outputLevel }: { state: VoiceState;
     <div className={`voice-waveform ${side} ${connecting ? "connecting" : ""} ${live ? "live" : ""}`} aria-hidden="true">
       {multipliers.map((multiplier, index) => {
         const activeLevel = live ? level : 0;
-        const height = 3 + Math.min(1, activeLevel * multiplier) * 26;
-        return <span key={index} style={{ height: `${height}px`, opacity: live ? 0.34 + Math.min(1, activeLevel * 1.05 + 0.12) * 0.66 : 0.24 }} />;
+        const height = 6 + Math.min(1, activeLevel * multiplier) * 40;
+        return <span key={index} style={{ height: `${height}px`, opacity: live ? 0.36 + Math.min(1, activeLevel * 1.35 + 0.14) * 0.64 : 0.24 }} />;
       })}
     </div>
   );
