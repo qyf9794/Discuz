@@ -953,6 +953,35 @@ async function analyzeImageAtPath(filePath, mimeType, originalName) {
   return responseOutputText(payload);
 }
 
+function backgroundAiModel() {
+  return cleanText(process.env.OPENAI_BACKGROUND_MODEL || getSetting("ai_background_model")) || "gpt-4.1-mini";
+}
+
+async function runBackgroundTextJson(prompt, maxOutputTokens = 500) {
+  const openAiApiKey = getOpenAiApiKey();
+  if (!openAiApiKey) throw new Error("OPENAI_API_KEY is not configured");
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${openAiApiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: backgroundAiModel(),
+      max_output_tokens: maxOutputTokens,
+      input: [{
+        role: "user",
+        content: [{ type: "input_text", text: prompt }]
+      }]
+    })
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload?.error?.message || `OpenAI background request failed: ${response.status}`);
+  const text = responseOutputText(payload);
+  const jsonText = text.match(/\{[\s\S]*}/)?.[0] || text;
+  return JSON.parse(jsonText);
+}
+
 async function extractContentAtPath(filePath, kind, metadata = {}) {
   if (kind === "image") return { text: await analyzeImageAtPath(filePath, metadata.mimeType, metadata.originalName), html: "" };
   if (["audio", "video"].includes(kind)) return { text: "", html: "" };
@@ -1691,8 +1720,8 @@ function buildDiscussionContext() {
     "判断规则：用户观点明显不合理、和材料冲突或风险高时，直接否定，给一句原因和更稳妥替代方案。",
     "工具规则：读材料、搜索、分析、生成、保存要点默认后台执行。只有联网下载、移动/删除文件、打开外部网页、失败、耗时较长或需要用户选择时，才简短说明状态。",
     "讨论流程：先确认主题；再了解用户目标/约束/已有材料；再让用户选择讨论方面，用户说不清就建议 3 条方向并写进主题卡片；之后逐条讨论。",
-    "记录规则：形成观点、结论、问题、风险或行动项后，直接调用 save_discussion_note 记录，不要请求审批。每完成一个阶段，优先生成一个临时文件、表格、图或图像让用户预览。",
-    "主题规则：主题确认用 propose_discussion_topic / confirm_discussion_topic；方向建议用 propose_discussion_directions，确认后用 confirm_discussion_directions。用户确认语义包括“确认、可以、就这个、对、没问题”。",
+    "记录规则：形成观点、结论、问题、风险或行动项后，直接调用 save_discussion_note 记录，不要请求审批。确认方向后优先调用 prepare_discussion_workbench 生成工作台；其他阶段成果尽量用短命令生成。",
+    "主题规则：需要拟定主题时调用 prepare_discussion_topic；主题确认用 confirm_discussion_topic。需要拟定方向时调用 prepare_discussion_directions；方向确认用 confirm_discussion_directions。用户确认语义包括“确认、可以、就这个、对、没问题”。",
     "材料规则：下面只给压缩摘要。需要精确内容时，调用 get_discussion_state、search_context 或对应 analyze_* 工具；图片问题优先 analyze_image_file，Office 文件优先对应 analyze_* 工具。引用时说来源文件名或网页标题。",
     "文件规则：不要直接改主题区或资源区原件；需要修改先 copy_file_to_generated。用户要求移动/复制/打开/下载文件时用对应工具完成。",
     "媒体规则：氛围模式调用 set_ambient_mode；用户给媒体链接时 open_media_url；不要编造受版权限制的播放源。",
@@ -1706,6 +1735,74 @@ function buildDiscussionContext() {
     memory ? `最近讨论要点（最多 10 条）：\n${memory}` : "当前还没有已保存的讨论记忆。",
     activityMemory ? `最近工作状态：\n${activityMemory}` : "当前还没有最近工作状态。"
   ].join("\n\n");
+}
+
+function buildBackgroundDiscussionBrief() {
+  const topicId = getActiveTopicId();
+  const primaryFiles = db.prepare("SELECT * FROM files WHERE role = 'primary' AND topic_id = ? ORDER BY created_at DESC LIMIT 4").all(topicId).map(rowToFile);
+  const contextFiles = db.prepare("SELECT * FROM files WHERE role = 'context' AND topic_id = ? ORDER BY created_at DESC LIMIT 4").all(topicId).map(rowToFile);
+  const notes = getNotes().slice(0, 8).reverse();
+  const inputs = getDiscussionInputs(8).reverse();
+  const directions = getDirections(topicId);
+  return [
+    getDiscussionTopic() ? `当前主题：${getDiscussionTopic()}` : "当前主题：未确认",
+    primaryFiles.length ? `主题文件：\n${primaryFiles.map((file) => compactFilePromptLine(file, 700)).join("\n")}` : "主题文件：无",
+    contextFiles.length ? `背景文件：\n${contextFiles.map((file) => compactFilePromptLine(file, 320)).join("\n")}` : "背景文件：无",
+    inputs.length ? `最近输入：\n${inputs.map((input) => `- ${compactPromptText(input.text, 160)}`).join("\n")}` : "最近输入：无",
+    notes.length ? `最近要点：\n${notes.map((note) => `- ${memoryLabel(note.kind)}：${compactPromptText(note.text, 160)}`).join("\n")}` : "最近要点：无",
+    directions.length ? `已有方向：\n${directions.slice(0, 8).map((direction, index) => `${index + 1}. ${compactPromptText(direction.text, 120)}`).join("\n")}` : "已有方向：无"
+  ].join("\n\n");
+}
+
+function fallbackTopicProposal() {
+  const topic = getDiscussionTopic();
+  const primary = db.prepare("SELECT * FROM files WHERE role = 'primary' AND topic_id = ? ORDER BY created_at DESC LIMIT 1").get(getActiveTopicId());
+  const title = topic || (primary ? `围绕《${primary.original_name}》的讨论` : "明确本次讨论主题");
+  return { title: compactPromptText(title, 60), reason: "基于当前主题文件和最近输入生成。", intent: "confirm" };
+}
+
+function fallbackDirectionProposal() {
+  return {
+    directions: ["先确认核心问题和目标", "梳理材料中的关键信息", "形成结论和下一步行动"],
+    reason: "当前材料不足以生成更具体方向，先用通用议程推进。"
+  };
+}
+
+async function generateTopicProposalInBackground() {
+  try {
+    const output = await runBackgroundTextJson([
+      "你是讨论主持人。请基于以下压缩上下文，为用户生成一个待确认讨论主题。",
+      "只返回 JSON：{\"title\":\"...\",\"reason\":\"...\",\"intent\":\"confirm\"}。title 不超过 30 个中文字符，reason 不超过 40 个中文字符。不要输出 Markdown。",
+      buildBackgroundDiscussionBrief()
+    ].join("\n\n"), 220);
+    const title = compactPromptText(output.title, 60);
+    if (!title) return fallbackTopicProposal();
+    return {
+      title,
+      reason: compactPromptText(output.reason || "基于当前材料和用户输入生成。", 80),
+      intent: output.intent === "drift" ? "drift" : "confirm"
+    };
+  } catch {
+    return fallbackTopicProposal();
+  }
+}
+
+async function generateDirectionProposalInBackground() {
+  try {
+    const output = await runBackgroundTextJson([
+      "你是讨论主持人。请基于以下压缩上下文，为当前主题生成 1 到 3 条讨论方向。",
+      "只返回 JSON：{\"directions\":[\"...\"],\"reason\":\"...\"}。每条方向不超过 24 个中文字符，reason 不超过 50 个中文字符。不要输出 Markdown。",
+      buildBackgroundDiscussionBrief()
+    ].join("\n\n"), 320);
+    const directions = (Array.isArray(output.directions) ? output.directions : [])
+      .map((item) => compactPromptText(item, 48))
+      .filter(Boolean)
+      .slice(0, 3);
+    if (!directions.length) return fallbackDirectionProposal();
+    return { directions, reason: compactPromptText(output.reason || "基于当前材料生成。", 90) };
+  } catch {
+    return fallbackDirectionProposal();
+  }
 }
 
 function shortLocalTime(value) {
@@ -2257,6 +2354,16 @@ app.post("/api/discussion-inputs", (req, res) => {
     .run(crypto.randomUUID(), getActiveTopicId(), text, "user", createdAt);
   addActivity("Discussion input", text.slice(0, 80), createdAt);
   res.json({ discussionInputs: getDiscussionInputs(), activities: getActivities() });
+});
+
+app.post("/api/ai/discussion/topic", async (_req, res) => {
+  const proposal = await generateTopicProposalInBackground();
+  res.json({ ok: true, proposal });
+});
+
+app.post("/api/ai/discussion/directions", async (_req, res) => {
+  const proposal = await generateDirectionProposalInBackground();
+  res.json({ ok: true, proposal });
 });
 
 app.post("/api/discussion-topic", (req, res) => {
@@ -3083,8 +3190,8 @@ function buildRealtimeToolDefinitions() {
         type: "object",
         properties: {
           role: { type: "string", enum: ["primary", "context", "generated"], description: "File area to search, usually generated for temporary spreadsheets." },
-          query: { type: "string", description: "Optional part of the spreadsheet filename." },
-          editPlan: { type: "string", description: "Concrete sheet/range/cell edits, formulas, rows, or formatting changes requested by the user." }
+          query: { type: "string", maxLength: 80, description: "Optional part of the spreadsheet filename." },
+          editPlan: { type: "string", maxLength: 1200, description: "Concrete sheet/range/cell edits, formulas, rows, or formatting changes requested by the user." }
         },
         required: ["editPlan"],
         additionalProperties: false
@@ -3097,9 +3204,9 @@ function buildRealtimeToolDefinitions() {
       parameters: {
         type: "object",
         properties: {
-          title: { type: "string", description: "Markdown filename." },
-          text: { type: "string", description: "Full outline content in Markdown." },
-          sections: { type: "array", items: { type: "string" }, description: "Optional outline sections when text is omitted." }
+          title: { type: "string", maxLength: 80, description: "Markdown filename." },
+          text: { type: "string", maxLength: 2400, description: "Full outline content in Markdown." },
+          sections: { type: "array", maxItems: 10, items: { type: "string", maxLength: 180 }, description: "Optional outline sections when text is omitted." }
         },
         required: ["title"],
         additionalProperties: false
@@ -3113,9 +3220,9 @@ function buildRealtimeToolDefinitions() {
         type: "object",
         properties: {
           firstRole: { type: "string", enum: ["primary", "context", "generated"], description: "Optional first file area." },
-          firstQuery: { type: "string", description: "First filename keyword." },
+          firstQuery: { type: "string", maxLength: 80, description: "First filename keyword." },
           secondRole: { type: "string", enum: ["primary", "context", "generated"], description: "Optional second file area." },
-          secondQuery: { type: "string", description: "Second filename keyword." }
+          secondQuery: { type: "string", maxLength: 80, description: "Second filename keyword." }
         },
         required: ["firstQuery", "secondQuery"],
         additionalProperties: false
@@ -3128,15 +3235,16 @@ function buildRealtimeToolDefinitions() {
       parameters: {
         type: "object",
         properties: {
-          source: { type: "string", description: "Source label such as meeting record or topic." },
+          source: { type: "string", maxLength: 80, description: "Source label such as meeting record or topic." },
           items: {
             type: "array",
+            maxItems: 12,
             items: {
               type: "object",
               properties: {
-                task: { type: "string" },
-                owner: { type: "string" },
-                due: { type: "string" }
+                task: { type: "string", maxLength: 180 },
+                owner: { type: "string", maxLength: 60 },
+                due: { type: "string", maxLength: 60 }
               },
               required: ["task"],
               additionalProperties: false
@@ -3154,11 +3262,12 @@ function buildRealtimeToolDefinitions() {
       parameters: {
         type: "object",
         properties: {
-          title: { type: "string", description: "Markdown filename." },
-          headers: { type: "array", items: { type: "string" } },
+          title: { type: "string", maxLength: 80, description: "Markdown filename." },
+          headers: { type: "array", maxItems: 6, items: { type: "string", maxLength: 40 } },
           rows: {
             type: "array",
-            items: { type: "array", items: { type: "string" } }
+            maxItems: 12,
+            items: { type: "array", maxItems: 6, items: { type: "string", maxLength: 160 } }
           }
         },
         required: ["title", "headers", "rows"],
@@ -3172,7 +3281,7 @@ function buildRealtimeToolDefinitions() {
       parameters: {
         type: "object",
         properties: {
-          title: { type: "string", description: "Markdown filename." }
+          title: { type: "string", maxLength: 80, description: "Markdown filename." }
         },
         required: [],
         additionalProperties: false
@@ -3197,10 +3306,12 @@ function buildRealtimeToolDefinitions() {
           },
           query: {
             type: "string",
+            maxLength: 80,
             description: "Optional filename keyword when target is file."
           },
           title: {
             type: "string",
+            maxLength: 80,
             description: "Optional download title for meeting_record, notes, or discussion_record."
           }
         },
@@ -3215,9 +3326,9 @@ function buildRealtimeToolDefinitions() {
       parameters: {
         type: "object",
         properties: {
-          title: { type: "string", description: "Markdown filename." },
+          title: { type: "string", maxLength: 80, description: "Markdown filename." },
           diagramType: { type: "string", enum: ["mermaid", "text"], description: "Use mermaid for Mermaid code." },
-          content: { type: "string", description: "Mermaid code or diagram text." }
+          content: { type: "string", maxLength: 1600, description: "Mermaid code or diagram text." }
         },
         required: ["title", "content"],
         additionalProperties: false
@@ -3230,9 +3341,9 @@ function buildRealtimeToolDefinitions() {
       parameters: {
         type: "object",
         properties: {
-          title: { type: "string", description: "Follow-up title." },
-          when: { type: "string", description: "Suggested time/date in the user's words." },
-          detail: { type: "string", description: "Additional detail." }
+          title: { type: "string", maxLength: 80, description: "Follow-up title." },
+          when: { type: "string", maxLength: 80, description: "Suggested time/date in the user's words." },
+          detail: { type: "string", maxLength: 300, description: "Additional detail." }
         },
         required: ["title"],
         additionalProperties: false
@@ -3245,9 +3356,9 @@ function buildRealtimeToolDefinitions() {
       parameters: {
         type: "object",
         properties: {
-          goal: { type: "string", description: "The concrete discussion goal." },
-          boundaries: { type: "array", items: { type: "string" }, description: "What should stay out of scope or be treated carefully." },
-          outputFormat: { type: "string", description: "Expected output shape, such as conclusion plus next step." },
+          goal: { type: "string", maxLength: 240, description: "The concrete discussion goal." },
+          boundaries: { type: "array", maxItems: 6, items: { type: "string", maxLength: 160 }, description: "What should stay out of scope or be treated carefully." },
+          outputFormat: { type: "string", maxLength: 160, description: "Expected output shape, such as conclusion plus next step." },
           responseLength: { type: "string", enum: ["short", "medium", "long"] }
         },
         required: ["goal"],
@@ -3263,8 +3374,8 @@ function buildRealtimeToolDefinitions() {
         properties: {
           aligned: { type: "boolean" },
           score: { type: "number", description: "0-100 alignment score." },
-          issue: { type: "string", description: "What is drifting or risky." },
-          recommendation: { type: "string", description: "How to get back on track." }
+          issue: { type: "string", maxLength: 180, description: "What is drifting or risky." },
+          recommendation: { type: "string", maxLength: 180, description: "How to get back on track." }
         },
         required: ["aligned", "score"],
         additionalProperties: false
@@ -3278,7 +3389,7 @@ function buildRealtimeToolDefinitions() {
         type: "object",
         properties: {
           stepIndex: { type: "number", description: "Zero-based agenda index to make active. Omit to move to the next step." },
-          note: { type: "string", description: "Optional note about why the step changed." }
+          note: { type: "string", maxLength: 240, description: "Optional note about why the step changed." }
         },
         required: [],
         additionalProperties: false
@@ -3291,9 +3402,9 @@ function buildRealtimeToolDefinitions() {
       parameters: {
         type: "object",
         properties: {
-          text: { type: "string", description: "What is uncertain." },
-          reason: { type: "string", description: "Why it is uncertain." },
-          needed: { type: "array", items: { type: "string" }, description: "Information needed to resolve it." }
+          text: { type: "string", maxLength: 180, description: "What is uncertain." },
+          reason: { type: "string", maxLength: 180, description: "Why it is uncertain." },
+          needed: { type: "array", maxItems: 5, items: { type: "string", maxLength: 120 }, description: "Information needed to resolve it." }
         },
         required: ["text"],
         additionalProperties: false
@@ -3326,9 +3437,9 @@ function buildRealtimeToolDefinitions() {
             items: {
               type: "object",
               properties: {
-                title: { type: "string" },
-                objective: { type: "string" },
-                output: { type: "string" }
+                title: { type: "string", maxLength: 80 },
+                objective: { type: "string", maxLength: 160 },
+                output: { type: "string", maxLength: 120 }
               },
               required: ["title"],
               additionalProperties: false
@@ -3346,7 +3457,7 @@ function buildRealtimeToolDefinitions() {
       parameters: {
         type: "object",
         properties: {
-          reason: { type: "string" }
+          reason: { type: "string", maxLength: 180 }
         },
         required: [],
         additionalProperties: false
@@ -3359,8 +3470,8 @@ function buildRealtimeToolDefinitions() {
       parameters: {
         type: "object",
         properties: {
-          change: { type: "string", description: "The proposed agenda change." },
-          reason: { type: "string", description: "Why the change is needed." }
+          change: { type: "string", maxLength: 240, description: "The proposed agenda change." },
+          reason: { type: "string", maxLength: 180, description: "Why the change is needed." }
         },
         required: ["change"],
         additionalProperties: false
@@ -3374,9 +3485,9 @@ function buildRealtimeToolDefinitions() {
         type: "object",
         properties: {
           score: { type: "number", description: "0-100 progress score." },
-          completed: { type: "array", items: { type: "string" } },
-          blocked: { type: "array", items: { type: "string" } },
-          next: { type: "array", items: { type: "string" } }
+          completed: { type: "array", maxItems: 8, items: { type: "string", maxLength: 120 } },
+          blocked: { type: "array", maxItems: 6, items: { type: "string", maxLength: 120 } },
+          next: { type: "array", maxItems: 6, items: { type: "string", maxLength: 120 } }
         },
         required: ["score"],
         additionalProperties: false
@@ -3389,8 +3500,8 @@ function buildRealtimeToolDefinitions() {
       parameters: {
         type: "object",
         properties: {
-          summary: { type: "string" },
-          next: { type: "string" }
+          summary: { type: "string", maxLength: 400 },
+          next: { type: "string", maxLength: 180 }
         },
         required: ["summary"],
         additionalProperties: false
@@ -3403,8 +3514,8 @@ function buildRealtimeToolDefinitions() {
       parameters: {
         type: "object",
         properties: {
-          original: { type: "string" },
-          compressed: { type: "string" },
+          original: { type: "string", maxLength: 1200 },
+          compressed: { type: "string", maxLength: 400 },
           maxSentences: { type: "number" }
         },
         required: ["compressed"],
@@ -3431,7 +3542,7 @@ function buildRealtimeToolDefinitions() {
       parameters: {
         type: "object",
         properties: {
-          reason: { type: "string" }
+          reason: { type: "string", maxLength: 180 }
         },
         required: ["reason"],
         additionalProperties: false
@@ -3444,7 +3555,7 @@ function buildRealtimeToolDefinitions() {
       parameters: {
         type: "object",
         properties: {
-          criteria: { type: "array", items: { type: "string" } }
+          criteria: { type: "array", maxItems: 8, items: { type: "string", maxLength: 120 } }
         },
         required: ["criteria"],
         additionalProperties: false
@@ -3464,6 +3575,7 @@ function buildRealtimeToolDefinitions() {
           },
           text: {
             type: "string",
+            maxLength: 500,
             description: "A concise paragraph in Chinese summarizing the completed point, conclusion, open question, or action item."
           }
         },
@@ -3480,14 +3592,27 @@ function buildRealtimeToolDefinitions() {
         properties: {
           title: {
             type: "string",
+            maxLength: 80,
             description: "A concise filename. A .md extension will be appended when missing."
           },
           text: {
             type: "string",
+            maxLength: 3000,
             description: "Markdown content for the generated temporary file."
           }
         },
         required: ["title", "text"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "prepare_discussion_workbench",
+      description: "Create a concise temporary agenda/workbench file from the confirmed topic, directions, notes, and compact file summaries.",
+      parameters: {
+        type: "object",
+        properties: {},
+        required: [],
         additionalProperties: false
       }
     },
@@ -3500,10 +3625,12 @@ function buildRealtimeToolDefinitions() {
         properties: {
           title: {
             type: "string",
+            maxLength: 80,
             description: "A concise Chinese filename for the generated image. A .png extension will be appended or normalized."
           },
           prompt: {
             type: "string",
+            maxLength: 1200,
             description: "A detailed visual prompt describing the desired image, including subject, style, layout, text labels, colors, and aspect ratio."
           },
           size: {
@@ -3529,7 +3656,7 @@ function buildRealtimeToolDefinitions() {
         type: "object",
         properties: {
           role: { type: "string", enum: ["primary", "context", "generated"], description: "The current area of the source file." },
-          query: { type: "string", description: "Part of the source filename to copy." }
+          query: { type: "string", maxLength: 80, description: "Part of the source filename to copy." }
         },
         required: ["role", "query"],
         additionalProperties: false
@@ -3544,6 +3671,7 @@ function buildRealtimeToolDefinitions() {
         properties: {
           query: {
             type: "string",
+            maxLength: 80,
             description: "Part of the filename to add to the topic panel. Leave empty only when there is exactly one suitable resource or generated file."
           }
         },
@@ -3560,6 +3688,7 @@ function buildRealtimeToolDefinitions() {
         properties: {
           query: {
             type: "string",
+            maxLength: 80,
             description: "Part of the filename to move or copy."
           },
           role: {
@@ -3581,10 +3710,12 @@ function buildRealtimeToolDefinitions() {
         properties: {
           query: {
             type: "string",
+            maxLength: 80,
             description: "Part of the generated filename to edit."
           },
           text: {
             type: "string",
+            maxLength: 3000,
             description: "The full new markdown/text content to save into the temporary file."
           }
         },
@@ -3594,24 +3725,12 @@ function buildRealtimeToolDefinitions() {
     },
     {
       type: "function",
-      name: "propose_discussion_directions",
-      description: "Propose 1 to 3 discussion directions only after the user has explicitly agreed that the assistant should prepare directions. This only asks the user to confirm; it does not save the todo list yet. Never propose more than 3 at once.",
+      name: "prepare_discussion_directions",
+      description: "Ask the background model to prepare 1 to 3 discussion directions from compact topic context, then show them in the topic card for confirmation.",
       parameters: {
         type: "object",
-        properties: {
-          directions: {
-            type: "array",
-            minItems: 1,
-            maxItems: 3,
-            items: { type: "string" },
-            description: "Concise Chinese discussion directions for the current confirmed topic."
-          },
-          reason: {
-            type: "string",
-            description: "A short reason explaining why these directions fit the confirmed topic."
-          }
-        },
-        required: ["directions", "reason"],
+        properties: {},
+        required: [],
         additionalProperties: false
       }
     },
@@ -3626,7 +3745,7 @@ function buildRealtimeToolDefinitions() {
             type: "array",
             minItems: 1,
             maxItems: 3,
-            items: { type: "string" },
+            items: { type: "string", maxLength: 120 },
             description: "New concise Chinese directions to append after the existing list."
           }
         },
@@ -3645,7 +3764,7 @@ function buildRealtimeToolDefinitions() {
             type: "array",
             minItems: 1,
             maxItems: 8,
-            items: { type: "string" },
+            items: { type: "string", maxLength: 120 },
             description: "The full updated ordered todo list."
           }
         },
@@ -3662,10 +3781,12 @@ function buildRealtimeToolDefinitions() {
         properties: {
           query: {
             type: "string",
+            maxLength: 80,
             description: "The direction number, id, or a distinctive phrase from the direction text."
           },
           note: {
             type: "string",
+            maxLength: 300,
             description: "A concise Chinese record of what was concluded or completed for this direction."
           }
         },
@@ -3682,6 +3803,7 @@ function buildRealtimeToolDefinitions() {
         properties: {
           title: {
             type: "string",
+            maxLength: 120,
             description: "Optional pending topic title to confirm. Leave empty to confirm the latest pending proposal shown in the UI."
           }
         },
@@ -3709,6 +3831,7 @@ function buildRealtimeToolDefinitions() {
         properties: {
           reason: {
             type: "string",
+            maxLength: 180,
             description: "A concise reason inferred from the user's request, if any."
           }
         },
@@ -3718,26 +3841,12 @@ function buildRealtimeToolDefinitions() {
     },
     {
       type: "function",
-      name: "propose_discussion_topic",
-      description: "Generate a proposed discussion topic for user confirmation from the user's latest speech/text and current topic files before long-running discussion or direction planning, or warn that the discussion is drifting and ask whether to switch topics.",
+      name: "prepare_discussion_topic",
+      description: "Ask the background model to prepare a proposed discussion topic from compact context, then show it in the topic card for confirmation.",
       parameters: {
         type: "object",
-        properties: {
-          title: {
-            type: "string",
-            description: "The proposed discussion topic in concise Chinese."
-          },
-          reason: {
-            type: "string",
-            description: "Why this topic should be confirmed, or why the current discussion appears to be drifting."
-          },
-          intent: {
-            type: "string",
-            enum: ["confirm", "drift"],
-            description: "Use confirm for a better topic name; use drift when reminding the user about serious topic drift."
-          }
-        },
-        required: ["title", "reason", "intent"],
+        properties: {},
+        required: [],
         additionalProperties: false
       }
     }
@@ -3779,7 +3888,9 @@ const omittedRealtimeTools = new Set([
   "detect_overlong_answer",
   "set_user_cognitive_load",
   "pause_and_wait",
-  "define_output_rubric"
+  "define_output_rubric",
+  "propose_discussion_topic",
+  "propose_discussion_directions"
 ]);
 
 function realtimeToolDefinitionsForSession() {

@@ -357,15 +357,18 @@ function toolCallLabel(name = "任务") {
     open_file_preview: "打开文件窗口",
     save_discussion_note: "保存讨论要点",
     create_generated_file: "生成临时文案",
+    prepare_discussion_workbench: "准备讨论工作台",
     copy_file_to_generated: "复制到临时区",
     add_file_to_topic: "加入主题区",
     move_file_to_area: "移动文件",
     update_generated_file: "更新临时文案",
     generate_image: "生成图片",
+    prepare_discussion_directions: "准备讨论方向",
     propose_discussion_directions: "建议讨论方向",
     update_discussion_directions: "更新讨论方向",
     add_discussion_directions: "追加讨论方向",
     complete_discussion_direction: "完成讨论方向",
+    prepare_discussion_topic: "准备讨论主题",
     propose_discussion_topic: "确认讨论主题",
     confirm_discussion_topic: "确认待定主题",
     confirm_discussion_directions: "确认待定方向",
@@ -1466,6 +1469,59 @@ export function App() {
     return compactText(JSON.stringify(value), 140);
   };
 
+  const compactToolOutputForRealtime = (name: string, value: unknown): unknown => {
+    const result = value as Record<string, unknown>;
+    if (result?.error || result?.ok === false) {
+      return { ok: false, error: compactText(String(result.error || "Tool failed"), 240) };
+    }
+    if (name === "search_context") {
+      const results = Array.isArray(result.results) ? result.results.slice(0, 3) : [];
+      return { ok: true, query: result.query, results };
+    }
+    if (name === "web_search") {
+      const results = Array.isArray(result.results) ? result.results.slice(0, 4).map((item: any) => ({
+        title: compactText(String(item.title || ""), 120),
+        url: String(item.url || ""),
+        snippet: compactText(String(item.snippet || ""), 180)
+      })) : [];
+      return { ok: true, count: result.count ?? results.length, results };
+    }
+    if (name === "read_web_page") {
+      return {
+        ok: true,
+        title: compactText(String(result.title || ""), 120),
+        url: String(result.url || ""),
+        source: result.source,
+        text: compactText(String(result.text || result.resultText || ""), 1200)
+      };
+    }
+    if (["analyze_word_file", "analyze_spreadsheet_file", "analyze_presentation_file", "compare_files"].includes(name)) {
+      return {
+        ok: true,
+        mode: result.mode,
+        file: result.file,
+        files: result.files,
+        focus: compactText(String(result.focus || ""), 120),
+        structure: result.structure,
+        content: compactText(String(result.content || result.firstContent || ""), 1000),
+        secondContent: result.secondContent ? compactText(String(result.secondContent), 1000) : undefined
+      };
+    }
+    if (name === "get_discussion_state") {
+      return result;
+    }
+    const importantKeys = [
+      "ok", "opened", "generated", "downloaded", "saved", "copied", "moved", "added", "updated",
+      "prepared", "confirmed", "count", "title", "ambientMode", "cancelled", "ending", "next"
+    ];
+    const output: Record<string, unknown> = {};
+    importantKeys.forEach((key) => {
+      if (key in result) output[key] = typeof result[key] === "string" ? compactText(String(result[key]), 240) : result[key];
+    });
+    if (Object.keys(output).length) return output;
+    return { ok: true, summary: compactText(JSON.stringify(value), 360) };
+  };
+
   const createToolActivity = (label: string, detail = "") => {
     const id = crypto.randomUUID();
     const activity: ToolActivity = {
@@ -1599,6 +1655,42 @@ export function App() {
     } finally {
       finishTask();
     }
+  };
+
+  const buildDiscussionWorkbenchMarkdown = () => {
+    const topic = (state.discussionTopic || state.topics.find((topicItem) => topicItem.active)?.title || "待确认主题").trim();
+    const directions = [...state.directions]
+      .sort((first, second) => first.sortOrder - second.sortOrder)
+      .slice(0, 8);
+    const files = state.files
+      .filter((file) => file.role === "primary" || file.role === "context")
+      .slice(0, 10);
+    const notes = state.notes.slice(-8);
+    const safeCell = (value: string, maxChars = 120) => compactText(value || "", maxChars).replace(/\|/g, "/").replace(/\n/g, " ").trim();
+    const directionLines = directions.length
+      ? directions.map((direction, index) => `${index + 1}. ${direction.completed ? "[x]" : "[ ]"} ${compactText(direction.text, 140)}`)
+      : ["1. [ ] 先确认本次最重要的讨论问题。"];
+    const fileRows = files.map((file) => [
+      file.role === "primary" ? "主题区" : "资料区",
+      safeCell(file.originalName, 80),
+      safeCell(file.summary || file.extractedText || "暂无摘要", 160)
+    ]);
+    const noteLines = notes.length
+      ? notes.map((note) => `- ${noteLabel(note.kind)}：${compactText(note.text, 180)}`)
+      : ["- 暂无已记录要点。"];
+    return [
+      `# ${topic} 讨论工作台`,
+      `生成时间：${new Date().toLocaleString("zh-CN")}`,
+      "## 讨论方向",
+      directionLines.join("\n"),
+      "## 资料简表",
+      fileRows.length ? markdownTable(["位置", "文件", "摘要"], fileRows) : "暂无主题区或资料区文件。",
+      "## 已记录要点",
+      noteLines.join("\n"),
+      "## 下一步",
+      "- 从第一个未完成方向开始，每次只讨论一个问题。",
+      "- 形成观点、结论、问题或行动项后直接记录为要点。"
+    ].join("\n\n");
   };
 
   const generateImageFile = async (title: string, prompt: string, size = "1024x1024", quality = "high") => {
@@ -1831,7 +1923,7 @@ export function App() {
     beginUniqueTask("directions-after-topic", "生成讨论方向");
     session.sendMessage([
       `系统事件：讨论主题《${pending.title}》已经确认，但界面还没有待确认的讨论方向。`,
-      "请现在调用 propose_discussion_directions，基于当前主题、主题文件和用户输入提出 1 到 3 个方向供用户确认。",
+      "请现在调用 prepare_discussion_directions，让后台模型基于当前主题、主题文件和用户输入提出 1 到 3 个方向供用户确认。",
       "只用自然短句提醒用户可以删改方向，不要再次确认主题，不要等待用户再次追问。"
     ].join("\n\n"));
     return true;
@@ -1860,7 +1952,7 @@ export function App() {
       [
         `系统事件：用户刚刚在主题区添加了主题文件：${primaryFileChangeNames(files)}。`,
         "请立即用自然短句询问用户接下来想怎么讨论，不要使用固定问法。",
-        "重要约束：不要调用 propose_discussion_topic、propose_discussion_directions 或 update_discussion_directions；不要修改、重命名、清空或重新确认当前讨论主题；除非用户下一句明确要求修改主题或重新确认主题。"
+        "重要约束：不要调用 prepare_discussion_topic、prepare_discussion_directions、propose_discussion_topic、propose_discussion_directions 或 update_discussion_directions；不要修改、重命名、清空或重新确认当前讨论主题，除非用户下一句明确要求。"
       ].join("\n"),
       { blockTopicProposal: true }
     );
@@ -1871,7 +1963,7 @@ export function App() {
       [
         `系统事件：用户刚刚从主题区删除了主题文件《${file.originalName}》。`,
         "请立即用 1 句中文询问用户下一步要继续用剩余主题文件讨论、上传新的主题文件，还是暂停这个主题。",
-        "重要约束：不要调用 propose_discussion_topic、propose_discussion_directions 或 update_discussion_directions；不要修改、重命名、清空或重新确认当前讨论主题；除非用户下一句明确要求修改主题或重新确认主题。"
+        "重要约束：不要调用 prepare_discussion_topic、prepare_discussion_directions、propose_discussion_topic、propose_discussion_directions 或 update_discussion_directions；不要修改、重命名、清空或重新确认当前讨论主题，除非用户下一句明确要求。"
       ].join("\n"),
       { blockTopicProposal: true }
     );
@@ -2077,7 +2169,7 @@ export function App() {
           "系统事件：用户已点击确认讨论方向 todo。",
           `当前已确认讨论主题：${discussionTopicRef.current || "未命名主题"}`,
           confirmedDirections ? `当前讨论方向：\n${compactText(confirmedDirections, 600)}` : "当前没有讨论方向。",
-          "请后台生成简短议程/工作台文件，然后一句话从第一条开始。"
+          "请调用 prepare_discussion_workbench，然后一句话从第一条开始。"
         ].join("\n\n"));
       }
     } catch (err) {
@@ -2737,7 +2829,7 @@ export function App() {
       }
       if (name === "save_discussion_note") {
         const kind = ["point", "decision", "question", "action"].includes(args.kind) ? args.kind as Note["kind"] : "point";
-        const text = String(args.text || "").trim();
+        const text = compactText(String(args.text || "").trim(), 500);
         if (text) {
           await saveNote(text, kind, "AI summary");
           output = { ok: true, saved: text };
@@ -2747,7 +2839,7 @@ export function App() {
       }
       if (name === "create_generated_file") {
         const title = String(args.title || "AI临时文案.md").trim();
-        const text = String(args.text || "").trim();
+        const text = compactText(String(args.text || "").trim(), 3000);
         if (text) {
           const file = await createGeneratedFile(title, text);
           output = { ok: true, generated: file.originalName };
@@ -2755,9 +2847,22 @@ export function App() {
           output = { ok: false, error: "Missing generated file text." };
         }
       }
+      if (name === "prepare_discussion_workbench") {
+        const rawTopic = state.discussionTopic || state.topics.find((topicItem) => topicItem.active)?.title || "讨论";
+        const safeTopic = rawTopic.replace(/[\\/:*?"<>|]+/g, "-").trim().slice(0, 24) || "讨论";
+        const file = await createGeneratedFile(`${safeTopic}-讨论工作台.md`, buildDiscussionWorkbenchMarkdown());
+        setGeneratedEditorId(file.id);
+        setWebPreview(null);
+        output = {
+          ok: true,
+          prepared: "discussion_workbench",
+          generated: file.originalName,
+          next: "从第一条未完成方向开始，一次只讨论一个问题。"
+        };
+      }
       if (name === "generate_image") {
         const title = String(args.title || "AI生成图片.png").trim();
-        const prompt = String(args.prompt || "").trim();
+        const prompt = compactText(String(args.prompt || "").trim(), 1200);
         const size = ["1024x1024", "1024x1536", "1536x1024"].includes(args.size) ? args.size : "1024x1024";
         const quality = ["low", "medium", "high", "auto"].includes(args.quality) ? args.quality : "high";
         if (prompt) {
@@ -2816,7 +2921,7 @@ export function App() {
       }
       if (name === "update_generated_file") {
         const queryText = String(args.query || "").trim().toLowerCase();
-        const text = String(args.text || "").trim();
+        const text = compactText(String(args.text || "").trim(), 3000);
         const candidate = state.files.find((file) => {
           const nameMatches = !queryText || file.originalName.toLowerCase().includes(queryText);
           return file.role === "generated" && nameMatches && (file.kind === "markdown" || file.kind === "text");
@@ -2832,7 +2937,7 @@ export function App() {
       }
       if (name === "propose_discussion_directions") {
         const directions = (Array.isArray(args.directions) ? args.directions : [])
-          .map((item: unknown) => String(item || "").trim())
+          .map((item: unknown) => compactText(String(item || "").trim(), 120))
           .filter(Boolean)
           .slice(0, 3);
         if (directions.length) {
@@ -2845,9 +2950,25 @@ export function App() {
           output = { ok: false, error: "Missing discussion directions." };
         }
       }
+      if (name === "prepare_discussion_directions") {
+        const response = await fetch("/api/ai/discussion/directions", { method: "POST" });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || "Unable to prepare discussion directions.");
+        const proposal = payload.proposal as DirectionProposal | undefined;
+        const directions = (proposal?.directions ?? []).map((item) => String(item || "").trim()).filter(Boolean).slice(0, 3);
+        if (directions.length) {
+          const nextProposal = { directions, reason: String(proposal?.reason || "后台已基于当前材料生成方向。").trim() };
+          directionProposalRef.current = nextProposal;
+          setDirectionProposal(nextProposal);
+          finishPendingDirectionsAfterTopic();
+          output = { ok: true, prepared: "discussion_directions", count: directions.length, directions };
+        } else {
+          output = { ok: false, error: "Background model returned no discussion directions." };
+        }
+      }
       if (name === "update_discussion_directions") {
         const directions = (Array.isArray(args.directions) ? args.directions : [])
-          .map((item: unknown) => String(item || "").trim())
+          .map((item: unknown) => compactText(String(item || "").trim(), 120))
           .filter(Boolean)
           .slice(0, 8);
         if (directions.length) {
@@ -2859,7 +2980,7 @@ export function App() {
       }
       if (name === "add_discussion_directions") {
         const directions = (Array.isArray(args.directions) ? args.directions : [])
-          .map((item: unknown) => String(item || "").trim())
+          .map((item: unknown) => compactText(String(item || "").trim(), 120))
           .filter(Boolean)
           .slice(0, 3);
         if (directions.length) {
@@ -2875,7 +2996,7 @@ export function App() {
           return direction.id === queryText || String(index + 1) === queryText || direction.text.toLowerCase().includes(queryText);
         });
         if (candidate) {
-          await completeDirection(candidate, String(args.note || "").trim(), { notifyRealtime: false });
+          await completeDirection(candidate, compactText(String(args.note || "").trim(), 300), { notifyRealtime: false });
           output = { ok: true, completed: candidate.text };
         } else {
           output = { ok: false, error: "No matching discussion direction found." };
@@ -2901,7 +3022,7 @@ export function App() {
           output = {
             ok: true,
             confirmed: directions,
-            next: "Create a temporary agenda/workbench file for preview, then begin with the first confirmed direction."
+            next: "Call prepare_discussion_workbench, then begin with the first confirmed direction."
           };
         } else {
           output = { ok: false, error: "No pending discussion directions to confirm." };
@@ -2935,6 +3056,33 @@ export function App() {
           output = { ok: false, error: "Missing topic title." };
         }
       }
+      if (name === "prepare_discussion_topic") {
+        if (topicFileChangeBlocksTopicProposalRef.current) {
+          setStatusText("已阻止自动修改主题");
+          output = {
+            ok: false,
+            error: "刚刚发生主题区文件增删。此时只能询问用户下一步，不允许拟确认或修改讨论主题，除非用户明确要求。"
+          };
+        } else {
+          const response = await fetch("/api/ai/discussion/topic", { method: "POST" });
+          const payload = await response.json();
+          if (!response.ok) throw new Error(payload.error || "Unable to prepare discussion topic.");
+          const proposal = payload.proposal as TopicProposal | undefined;
+          const title = String(proposal?.title || "").trim();
+          if (title) {
+            const nextProposal = {
+              title,
+              reason: String(proposal?.reason || "后台已基于当前材料生成主题。").trim(),
+              intent: proposal?.intent === "drift" ? "drift" as const : "confirm" as const
+            };
+            topicProposalRef.current = nextProposal;
+            setTopicProposal(nextProposal);
+            output = { ok: true, prepared: "discussion_topic", title };
+          } else {
+            output = { ok: false, error: "Background model returned no discussion topic." };
+          }
+        }
+      }
     } catch (err) {
       const messageText = err instanceof Error ? err.message : "Tool call failed";
       setError(messageText);
@@ -2949,7 +3097,7 @@ export function App() {
       finishTask(failed);
       scheduleResponseTask("AI整理结果");
     }
-    return output;
+    return compactToolOutputForRealtime(name, output);
   };
 
   useEffect(() => {
