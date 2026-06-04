@@ -96,6 +96,7 @@ export type BackgroundTask = {
     summary: string;
     previewUrl: string;
   } | null;
+  postActions: Array<"add_to_topic" | "open_preview">;
   error: string;
   createdAt: string;
   startedAt: string;

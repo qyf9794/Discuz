@@ -310,6 +310,7 @@ function toolCallLabel(name = "任务") {
   return ({
     search_context: "检索本地材料",
     web_search: "联网搜索",
+    research_request: "研究路由",
     read_web_page: "读取网页",
     open_web_page: "打开网页",
     import_url_as_topic_file: "导入链接文件",
@@ -376,6 +377,33 @@ function toolCallLabel(name = "任务") {
     confirm_discussion_directions: "确认待定方向",
     end_voice_discussion: "结束语音讨论"
   } as Record<string, string>)[name] || name;
+}
+
+const backgroundResearchIntentPattern = /全部|完整|所有|全量|整理|生成|保存|导出|打开|预览|主题卡片|主题区|卡片|文件|表格|报告|清单|列表|名单|赛程|日程|赛果|fixture|fixtures|schedule|calendar|timetable|full|all|complete|list|table|report|file|card|open/i;
+const artifactResearchPattern = /整理|生成|保存|导出|打开|预览|主题卡片|主题区|卡片|文件|表格|报告|markdown|md|table|report|file|card|open/i;
+
+function shouldUseBackgroundResearch(args: Record<string, any> = {}) {
+  const query = String(args.query || args.prompt || "").trim();
+  const purpose = String(args.purpose || args.title || "").trim();
+  const output = String(args.output || "").trim();
+  const combined = `${query}\n${purpose}\n${output}`;
+  const expectedItems = Number(args.expectedItems || args.limit || 0);
+  if (args.addToTopic === true || args.openWhenDone === true) return true;
+  if (["cards", "table", "file", "report"].includes(output)) return true;
+  if (expectedItems > 8) return true;
+  if (artifactResearchPattern.test(combined)) return true;
+  return /全部|完整|所有|全量|full|all|complete/i.test(combined) && backgroundResearchIntentPattern.test(combined);
+}
+
+function researchPostActions(args: Record<string, any> = {}) {
+  const query = String(args.query || args.prompt || "").trim();
+  const purpose = String(args.purpose || args.title || "").trim();
+  const combined = `${query}\n${purpose}`;
+  const actions: Array<"add_to_topic" | "open_preview"> = [];
+  if (args.addToTopic === true || /主题卡片|主题区|卡片|topic card|topic/i.test(combined)) actions.push("add_to_topic");
+  if (args.openWhenDone === true || /打开|预览|open|preview/i.test(combined)) actions.push("open_preview");
+  if (actions.includes("open_preview") && !actions.includes("add_to_topic") && /主题|卡片|topic|card/i.test(combined)) actions.unshift("add_to_topic");
+  return actions.filter((action, index, list) => list.indexOf(action) === index);
 }
 
 function realtimeEventToolName(...values: unknown[]) {
@@ -1551,7 +1579,7 @@ export function App() {
     }
     const importantKeys = [
       "ok", "opened", "generated", "downloaded", "saved", "copied", "moved", "added", "updated",
-      "queued", "taskId", "status", "prepared", "confirmed", "count", "title", "ambientMode", "cancelled", "ending", "next"
+      "route", "reason", "queued", "taskId", "status", "postActions", "prepared", "confirmed", "count", "title", "ambientMode", "cancelled", "ending", "next"
     ];
     const output: Record<string, unknown> = {};
     importantKeys.forEach((key) => {
@@ -1694,6 +1722,36 @@ export function App() {
     } finally {
       finishTask();
     }
+  };
+
+  const queueBackgroundTask = async (options: {
+    kind?: "generic" | "file_analysis" | "web_search" | "report" | "code";
+    title: string;
+    prompt: string;
+    outputMode?: "summary" | "file" | "both";
+    targetFileIds?: string[];
+    postActions?: Array<"add_to_topic" | "open_preview">;
+  }) => {
+    const response = await fetch("/api/background-tasks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        kind: options.kind || "generic",
+        title: compactText(options.title || "后台任务", 80),
+        prompt: compactText(options.prompt || "", 1200),
+        outputMode: options.outputMode || "file",
+        targetFileIds: options.targetFileIds ?? [],
+        postActions: options.postActions ?? []
+      })
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "Unable to queue background task.");
+    setState((current) => ({
+      ...current,
+      backgroundTasks: payload.backgroundTasks ?? current.backgroundTasks,
+      activities: payload.activities ?? current.activities
+    }));
+    return payload.task as AppState["backgroundTasks"][number] | undefined;
   };
 
   const buildDiscussionWorkbenchMarkdown = () => {
@@ -1947,16 +2005,50 @@ export function App() {
       if (notifiedBackgroundTaskIdsRef.current.has(task.id)) return;
       notifiedBackgroundTaskIdsRef.current.add(task.id);
       setStatusText(task.status === "done" ? `后台任务完成：${task.title}` : `后台任务失败：${task.title}`);
+      const postActions = task.postActions ?? [];
+      if (task.status === "done" && task.resultFileId && postActions.length) {
+        void (async () => {
+          let openedName = task.resultFile?.name || task.title;
+          if (postActions.includes("add_to_topic")) {
+            const response = await fetch(`/api/files/${encodeURIComponent(task.resultFileId)}/promote-primary`, { method: "POST" });
+            const payload = await response.json();
+            if (response.ok) {
+              const promotedFile = payload.file as DiscuzFile | undefined;
+              openedName = promotedFile?.originalName || openedName;
+              setState((current) => ({
+                ...current,
+                files: payload.files ?? current.files,
+                activities: payload.activities ?? current.activities,
+                topics: payload.topics ?? current.topics
+              }));
+            }
+          }
+          if (postActions.includes("open_preview")) {
+            setSelectedId(task.resultFileId);
+            setPreviewFileId(task.resultFileId);
+            setGeneratedEditorId(null);
+            setPreviewRecordId(null);
+            setActiveTool(null);
+            setWebPreview(null);
+          }
+          await loadState(task.resultFileId);
+          setStatusText(`后台任务完成：${openedName}`);
+        })().catch((error) => setError(error instanceof Error ? error.message : String(error)));
+      }
       const resultLine = task.status === "done"
         ? `结果文件：${task.resultFile?.name || task.resultFileId || "已生成"}；摘要：${compactText(task.resultSummary || "", 500)}`
         : `错误：${compactText(task.error || "后台任务失败", 400)}`;
+      const actionLine = task.status === "done" && postActions.length
+        ? `后续动作：${postActions.includes("add_to_topic") ? "加入主题区" : ""}${postActions.includes("open_preview") ? "，打开预览" : ""}`
+        : "";
       sendRealtimeSystemEvent([
         `系统事件：后台任务“${task.title}”${task.status === "done" ? "已完成" : "失败"}。`,
         resultLine,
+        actionLine,
         "请用一句话告诉用户结果已准备好；如果有结果文件，提示用户可以在 AI 临时文件区查看。"
-      ].join("\n\n"));
+      ].filter(Boolean).join("\n\n"));
     });
-  }, [state.backgroundTasks]);
+  }, [loadState, state.backgroundTasks]);
 
   const flushRealtimeResponse = useCallback(() => {
     if (!responsePendingRef.current) return;
@@ -2357,11 +2449,69 @@ export function App() {
       }
       if (name === "web_search") {
         if (!webEnabled) output = { error: "Web search is disabled by the user." };
+        else if (shouldUseBackgroundResearch(args)) {
+          const prompt = String(args.query || "").trim();
+          const postActions = researchPostActions(args);
+          const task = await queueBackgroundTask({
+            kind: "web_search",
+            title: compactText(String(args.title || prompt || "联网研究").trim(), 80),
+            prompt,
+            outputMode: "file",
+            postActions
+          });
+          output = {
+            ok: true,
+            route: "background",
+            queued: task?.title || prompt || "联网研究",
+            taskId: task?.id,
+            status: task?.status || "queued",
+            postActions,
+            next: postActions.includes("open_preview")
+              ? "这类请求会产生较多搜索结果，已转入后台整理；完成后会加入主题区并打开。"
+              : "这类请求会产生较多搜索结果，已转入后台整理。"
+          };
+        }
         else {
           const query = encodeURIComponent(args.query || "");
           const limit = args.limit ? `&limit=${encodeURIComponent(args.limit)}` : "";
           const response = await fetch(`/api/web/search?q=${query}${limit}`);
           output = await response.json();
+        }
+      }
+      if (name === "research_request") {
+        if (!webEnabled) output = { error: "Web search is disabled by the user." };
+        else if (shouldUseBackgroundResearch(args)) {
+          const queryText = String(args.query || "").trim();
+          const title = compactText(String(args.title || queryText || "联网研究").trim(), 80);
+          const postActions = researchPostActions(args);
+          const task = await queueBackgroundTask({
+            kind: "web_search",
+            title,
+            prompt: [
+              queryText,
+              args.purpose ? `用途：${String(args.purpose).trim()}` : "",
+              args.output ? `期望输出：${String(args.output).trim()}` : ""
+            ].filter(Boolean).join("\n"),
+            outputMode: "file",
+            postActions
+          });
+          output = {
+            ok: true,
+            route: "background",
+            reason: "任务需要整理较多联网结果或生成可查看成果，已避免把大结果塞入实时语音上下文。",
+            queued: task?.title || title,
+            taskId: task?.id,
+            status: task?.status || "queued",
+            postActions,
+            next: postActions.includes("open_preview")
+              ? "完成后会按要求加入主题区并打开预览。"
+              : "完成后会生成 AI 临时文件。"
+          };
+        } else {
+          const query = encodeURIComponent(args.query || "");
+          const limitValue = args.expectedItems ? Math.min(8, Math.max(1, Number(args.expectedItems))) : 6;
+          const response = await fetch(`/api/web/search?q=${query}&limit=${encodeURIComponent(limitValue)}`);
+          output = { ...(await response.json()), route: "direct" };
         }
       }
       if (name === "read_web_page") {
@@ -2544,6 +2694,7 @@ export function App() {
             kind: task.kind,
             status: task.status,
             resultFile: task.resultFile ? { id: task.resultFile.id, name: task.resultFile.name } : null,
+            postActions: task.postActions ?? [],
             error: compactText(task.error || "", 160)
           })),
           statusText,
@@ -2595,30 +2746,27 @@ export function App() {
           })
           .slice(0, 8)
           .map((file) => file.id);
-        const response = await fetch("/api/background-tasks", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            kind,
-            title: compactText(String(args.title || "后台任务").trim(), 80),
-            prompt: compactText(String(args.prompt || "").trim(), 1200),
-            outputMode: args.output === "summary" || args.output === "both" ? args.output : "file",
-            targetFileIds
-          })
+        const postActions = Array.isArray(args.postActions)
+          ? args.postActions.filter((item: unknown) => item === "add_to_topic" || item === "open_preview")
+          : researchPostActions(args);
+        const task = await queueBackgroundTask({
+          kind,
+          title: compactText(String(args.title || "后台任务").trim(), 80),
+          prompt: compactText(String(args.prompt || "").trim(), 1200),
+          outputMode: args.output === "summary" || args.output === "both" ? args.output : "file",
+          targetFileIds,
+          postActions
         });
-        const payload = await response.json();
-        if (!response.ok) throw new Error(payload.error || "Unable to queue background task.");
-        setState((current) => ({
-          ...current,
-          backgroundTasks: payload.backgroundTasks ?? current.backgroundTasks,
-          activities: payload.activities ?? current.activities
-        }));
         output = {
           ok: true,
-          queued: payload.task?.title || args.title || "后台任务",
-          taskId: payload.task?.id,
-          status: payload.task?.status || "queued",
-          next: "后台任务已排队。完成后会在 AI 临时文件区生成结果文件。"
+          route: "background",
+          queued: task?.title || args.title || "后台任务",
+          taskId: task?.id,
+          status: task?.status || "queued",
+          postActions,
+          next: postActions.includes("open_preview")
+            ? "后台任务已排队。完成后会生成结果文件，并按要求打开。"
+            : "后台任务已排队。完成后会在 AI 临时文件区生成结果文件。"
         };
       }
       if (name === "start_break") {

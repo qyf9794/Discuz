@@ -157,6 +157,7 @@ db.exec(`
     status TEXT NOT NULL DEFAULT 'queued',
     result_summary TEXT NOT NULL DEFAULT '',
     result_file_id TEXT NOT NULL DEFAULT '',
+    post_actions TEXT NOT NULL DEFAULT '[]',
     error TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     started_at TEXT NOT NULL DEFAULT '',
@@ -201,6 +202,7 @@ addColumnIfMissing("background_tasks", "output_mode", "TEXT NOT NULL DEFAULT 'fi
 addColumnIfMissing("background_tasks", "status", "TEXT NOT NULL DEFAULT 'queued'");
 addColumnIfMissing("background_tasks", "result_summary", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("background_tasks", "result_file_id", "TEXT NOT NULL DEFAULT ''");
+addColumnIfMissing("background_tasks", "post_actions", "TEXT NOT NULL DEFAULT '[]'");
 addColumnIfMissing("background_tasks", "error", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("background_tasks", "created_at", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("background_tasks", "started_at", "TEXT NOT NULL DEFAULT ''");
@@ -1456,10 +1458,16 @@ function getActivities() {
 function rowToBackgroundTask(row) {
   if (!row) return null;
   let targetFileIds = [];
+  let postActions = [];
   try {
     targetFileIds = JSON.parse(row.target_file_ids || "[]");
   } catch {
     targetFileIds = [];
+  }
+  try {
+    postActions = JSON.parse(row.post_actions || "[]");
+  } catch {
+    postActions = [];
   }
   const resultFile = row.result_file_id
     ? db.prepare("SELECT * FROM files WHERE id = ? AND topic_id = ?").get(row.result_file_id, row.topic_id)
@@ -1476,6 +1484,7 @@ function rowToBackgroundTask(row) {
     resultSummary: row.result_summary,
     resultFileId: row.result_file_id,
     resultFile: resultFile ? rowToCompactFile(resultFile) : null,
+    postActions,
     error: row.error,
     createdAt: row.created_at,
     startedAt: row.started_at,
@@ -1814,7 +1823,7 @@ function buildDiscussionContext() {
     "主题规则：需要拟定主题时调用 prepare_discussion_topic；主题确认用 confirm_discussion_topic。需要拟定方向时调用 prepare_discussion_directions；方向确认用 confirm_discussion_directions。用户确认语义包括“确认、可以、就这个、对、没问题”。",
     "材料规则：下面只给压缩摘要。需要精确内容时，调用 get_discussion_state、search_context 或对应 analyze_* 工具；图片问题优先 analyze_image_file，Office 文件优先对应 analyze_* 工具。引用时说来源文件名或网页标题。",
     "压缩规则：工具结果可能被压缩。若用户要原文细节、证据、完整清单、逐项比较或文件深度分析，而返回片段不足，不要硬答；继续调用更具体的读取/分析工具，或说明需要后台深度分析。",
-    "联网规则：用户有明确具体的联网需求时，结果必须贴合需求组织。用户要赛程、日程、清单、价格、步骤、名单、对比或“全部”时，调用 web_search 后按返回 cards 逐项回答，不要只给摘要；卡片不足时说明缺口并给来源。",
+    "联网规则：用户有明确具体的联网需求时，结果必须贴合需求组织。小事实或少量链接用 web_search。用户要求完整/全部赛程、日程、清单、名单、表格、报告，或要求整理成主题卡片/文件并打开时，必须调用 research_request，不要直接 web_search。",
     "文件规则：不要直接改主题区或资源区原件；需要修改先 copy_file_to_generated。用户要求移动/复制/打开/下载文件时用对应工具完成。",
     "媒体规则：氛围模式调用 set_ambient_mode；用户给媒体链接时 open_media_url；不要编造受版权限制的播放源。",
     "系统事件规则：主题文件添加/删除时，只用 1 句问用户下一步怎么讨论；不要自动改主题或生成方向，除非用户明确要求。",
@@ -2800,13 +2809,18 @@ app.post("/api/background-tasks", (req, res) => {
     .map((item) => cleanText(item))
     .filter(Boolean)
     .slice(0, 8);
+  const postActions = (Array.isArray(req.body?.postActions) ? req.body.postActions : [])
+    .map((item) => cleanText(item))
+    .filter((item) => ["add_to_topic", "open_preview"].includes(item))
+    .filter((item, index, items) => items.indexOf(item) === index)
+    .slice(0, 2);
   const createdAt = now();
   const id = crypto.randomUUID();
   db.prepare(`
     INSERT INTO background_tasks (
       id, topic_id, kind, title, prompt, target_file_ids, output_mode,
-      status, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+      post_actions, status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
   `).run(
     id,
     getActiveTopicId(),
@@ -2815,6 +2829,7 @@ app.post("/api/background-tasks", (req, res) => {
     prompt,
     JSON.stringify(targetFileIds),
     outputMode,
+    JSON.stringify(postActions),
     createdAt,
     createdAt
   );
@@ -3344,12 +3359,31 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "web_search",
-      description: "Search the public web when local materials are insufficient. Returns structured result cards. If the user asks for schedules, lists, prices, steps, names, comparisons, or all items, answer from the cards item by item instead of giving only a summary.",
+      description: "Search the public web for a small, immediate answer. Use only when the user needs a short answer or a few links. Do not use for complete schedules, long lists, files, reports, topic cards, tables, or open-preview workflows; use research_request instead.",
       parameters: {
         type: "object",
         properties: {
           query: { type: "string", description: "A focused web search query." },
           limit: { type: "number", description: "Optional number of results/cards to return, 1 to 25." }
+        },
+        required: ["query"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "research_request",
+      description: "Route a web research request. The app will choose direct web_search for small questions and background queue for complete schedules, lists, reports, files, topic cards, tables, or open-preview workflows.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", maxLength: 1200, description: "The user's concrete research question." },
+          title: { type: "string", maxLength: 80, description: "Short result title or file name." },
+          purpose: { type: "string", maxLength: 400, description: "What the result should be used for." },
+          expectedItems: { type: "number", description: "Estimated number of result items if known." },
+          output: { type: "string", enum: ["answer", "cards", "table", "file", "report"], description: "Desired output shape." },
+          addToTopic: { type: "boolean", description: "Whether the final result should be placed in the topic card/primary area." },
+          openWhenDone: { type: "boolean", description: "Whether the final result should open automatically when ready." }
         },
         required: ["query"],
         additionalProperties: false
@@ -3540,7 +3574,13 @@ function buildRealtimeToolDefinitions() {
           prompt: { type: "string", maxLength: 1200, description: "Concrete task request and desired output." },
           role: { type: "string", enum: ["primary", "context", "generated"], description: "Optional file area to search for target files." },
           query: { type: "string", maxLength: 80, description: "Optional filename keyword for target files." },
-          output: { type: "string", enum: ["summary", "file", "both"], description: "Whether the user needs a short summary, a generated file, or both." }
+          output: { type: "string", enum: ["summary", "file", "both"], description: "Whether the user needs a short summary, a generated file, or both." },
+          postActions: {
+            type: "array",
+            maxItems: 2,
+            items: { type: "string", enum: ["add_to_topic", "open_preview"] },
+            description: "Optional actions after completion. Use add_to_topic/open_preview when the user asks to create a topic card and open it."
+          }
         },
         required: ["title", "prompt"],
         additionalProperties: false
