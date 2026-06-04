@@ -1474,8 +1474,20 @@ export function App() {
     if (result?.error || result?.ok === false) {
       return { ok: false, error: compactText(String(result.error || "Tool failed"), 240) };
     }
+    const wantsStructuredList = (text: unknown) => /全部|完整|所有|列表|清单|日程|赛程|赛果|比赛|名单|价格|步骤|对比|证据|引用|all|full|list|schedule|fixture|price|steps|compare|evidence/i.test(String(text || ""));
+    const compactDetails = (details: unknown) => {
+      if (!details || typeof details !== "object") return undefined;
+      const output: Record<string, string> = {};
+      Object.entries(details as Record<string, unknown>).slice(0, 10).forEach(([key, entry]) => {
+        const text = Array.isArray(entry) ? entry.join(" / ") : String(entry || "");
+        const compacted = compactText(text, 180).replace(/\n/g, " ").trim();
+        if (compacted) output[key] = compacted;
+      });
+      return Object.keys(output).length ? output : undefined;
+    };
     if (name === "search_context") {
-      const results = Array.isArray(result.results) ? result.results.slice(0, 3) : [];
+      const maxResults = wantsStructuredList(result.query) ? 6 : 4;
+      const results = Array.isArray(result.results) ? result.results.slice(0, maxResults) : [];
       return { ok: true, query: result.query, results };
     }
     if (name === "web_search") {
@@ -1486,12 +1498,12 @@ export function App() {
         title: compactText(String(item.title || ""), 120),
         url: String(item.url || ""),
         snippet: compactText(String(item.snippet || ""), 220),
-        details: item.details && typeof item.details === "object" ? item.details : undefined
+        details: compactDetails(item.details)
       }));
       return {
         ok: true,
         resultType,
-        answer: compactText(String(result.answer || ""), 500),
+        answer: compactText(String(result.answer || ""), 700),
         count: result.count ?? cards.length,
         cards,
         results: cards
@@ -1503,7 +1515,7 @@ export function App() {
         title: compactText(String(result.title || ""), 120),
         url: String(result.url || ""),
         source: result.source,
-        text: compactText(String(result.text || result.resultText || ""), 1200)
+        text: compactText(String(result.text || result.resultText || ""), 2500)
       };
     }
     if (["analyze_word_file", "analyze_spreadsheet_file", "analyze_presentation_file", "compare_files"].includes(name)) {
@@ -1514,8 +1526,8 @@ export function App() {
         files: result.files,
         focus: compactText(String(result.focus || ""), 120),
         structure: result.structure,
-        content: compactText(String(result.content || result.firstContent || ""), 1000),
-        secondContent: result.secondContent ? compactText(String(result.secondContent), 1000) : undefined
+        content: compactText(String(result.content || result.firstContent || ""), 1800),
+        secondContent: result.secondContent ? compactText(String(result.secondContent), 1800) : undefined
       };
     }
     if (name === "get_discussion_state") {

@@ -1737,6 +1737,7 @@ function buildDiscussionContext() {
     "记录规则：形成观点、结论、问题、风险或行动项后，直接调用 save_discussion_note 记录，不要请求审批。确认方向后优先调用 prepare_discussion_workbench 生成工作台；其他阶段成果尽量用短命令生成。",
     "主题规则：需要拟定主题时调用 prepare_discussion_topic；主题确认用 confirm_discussion_topic。需要拟定方向时调用 prepare_discussion_directions；方向确认用 confirm_discussion_directions。用户确认语义包括“确认、可以、就这个、对、没问题”。",
     "材料规则：下面只给压缩摘要。需要精确内容时，调用 get_discussion_state、search_context 或对应 analyze_* 工具；图片问题优先 analyze_image_file，Office 文件优先对应 analyze_* 工具。引用时说来源文件名或网页标题。",
+    "压缩规则：工具结果可能被压缩。若用户要原文细节、证据、完整清单、逐项比较或文件深度分析，而返回片段不足，不要硬答；继续调用更具体的读取/分析工具，或说明需要后台深度分析。",
     "联网规则：用户有明确具体的联网需求时，结果必须贴合需求组织。用户要赛程、日程、清单、价格、步骤、名单、对比或“全部”时，调用 web_search 后按返回 cards 逐项回答，不要只给摘要；卡片不足时说明缺口并给来源。",
     "文件规则：不要直接改主题区或资源区原件；需要修改先 copy_file_to_generated。用户要求移动/复制/打开/下载文件时用对应工具完成。",
     "媒体规则：氛围模式调用 set_ambient_mode；用户给媒体链接时 open_media_url；不要编造受版权限制的播放源。",
