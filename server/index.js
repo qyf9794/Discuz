@@ -4689,33 +4689,69 @@ function buildRealtimeSessionConfig(aiSettings) {
   };
 }
 
-app.post("/api/realtime/session", async (req, res) => {
-  const openAiApiKey = getOpenAiApiKey();
-  if (!openAiApiKey) {
-    return res.status(500).json({ error: "OPENAI_API_KEY is not configured" });
-  }
-  const aiSettings = getAiSettingsState();
-  const session = buildRealtimeSessionConfig(aiSettings);
-  const client = new OpenAI({ apiKey: openAiApiKey });
-  const clientSecret = await client.realtime.clientSecrets.create({
+function compatibleRealtimeSessionConfig(session) {
+  const fallback = { ...session };
+  delete fallback.max_response_output_tokens;
+  delete fallback.truncation;
+  return fallback;
+}
+
+async function createRealtimeClientSecret(client, session) {
+  const params = {
     session,
     expires_after: {
       anchor: "created_at",
       seconds: 600
     }
-  });
-  writeTopicSnapshot();
-  return res.json({
-    clientSecret: clientSecret.value,
-    expiresAt: clientSecret.expires_at,
-    model: aiSettings.realtimeModel,
-    instructions: session.instructions,
-    tools: session.tools,
-    max_response_output_tokens: session.max_response_output_tokens,
-    truncation: session.truncation,
-    audio: session.audio,
-    settings: aiSettings
-  });
+  };
+  try {
+    const clientSecret = await client.realtime.clientSecrets.create(params);
+    return { clientSecret, session, fallbackReason: "" };
+  } catch (error) {
+    const status = Number(error?.status || error?.code || 0);
+    if (status && status !== 400) throw error;
+    const fallbackSession = compatibleRealtimeSessionConfig(session);
+    const clientSecret = await client.realtime.clientSecrets.create({
+      ...params,
+      session: fallbackSession
+    });
+    console.warn("Realtime session config fallback used:", error?.message || error);
+    return {
+      clientSecret,
+      session: fallbackSession,
+      fallbackReason: cleanText(error?.message || "Realtime session config rejected by API")
+    };
+  }
+}
+
+app.post("/api/realtime/session", async (req, res) => {
+  try {
+    const openAiApiKey = getOpenAiApiKey();
+    if (!openAiApiKey) {
+      return res.status(500).json({ error: "OPENAI_API_KEY is not configured" });
+    }
+    const aiSettings = getAiSettingsState();
+    const requestedSession = buildRealtimeSessionConfig(aiSettings);
+    const client = new OpenAI({ apiKey: openAiApiKey });
+    const { clientSecret, session, fallbackReason } = await createRealtimeClientSecret(client, requestedSession);
+    writeTopicSnapshot();
+    return res.json({
+      clientSecret: clientSecret.value,
+      expiresAt: clientSecret.expires_at,
+      model: aiSettings.realtimeModel,
+      instructions: session.instructions,
+      tools: session.tools,
+      max_response_output_tokens: session.max_response_output_tokens,
+      truncation: session.truncation,
+      realtimeConfigFallback: fallbackReason,
+      audio: session.audio,
+      settings: aiSettings
+    });
+  } catch (error) {
+    return res.status(Number(error?.status) || 500).json({
+      error: error instanceof Error ? error.message : "Unable to create realtime session"
+    });
+  }
 });
 
 if (process.env.NODE_ENV === "production" && fs.existsSync(clientDistDir)) {

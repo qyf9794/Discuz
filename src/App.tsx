@@ -3984,7 +3984,11 @@ export function App() {
       const realtimeTurnDetection = normalizeRealtimeTurnDetection(
         bootstrap.audio.input?.turnDetection ?? bootstrap.audio.input?.turn_detection
       );
-      const maxResponseOutputTokens = bootstrap.max_response_output_tokens ?? bootstrap.maxResponseOutputTokens ?? 300;
+      const maxResponseOutputTokens = bootstrap.max_response_output_tokens ?? bootstrap.maxResponseOutputTokens;
+      const realtimeProviderData = {
+        ...(maxResponseOutputTokens ? { max_response_output_tokens: maxResponseOutputTokens } : {}),
+        ...(bootstrap.truncation ? { truncation: bootstrap.truncation } : {})
+      };
       const session = new RealtimeSession(agent, {
         model: bootstrap.model,
         transport,
@@ -3992,10 +3996,7 @@ export function App() {
           outputModalities: ["audio"],
           toolChoice: "auto",
           parallelToolCalls: true,
-          providerData: {
-            max_response_output_tokens: maxResponseOutputTokens,
-            ...(bootstrap.truncation ? { truncation: bootstrap.truncation } : {})
-          },
+          ...(Object.keys(realtimeProviderData).length ? { providerData: realtimeProviderData } : {}),
           audio: {
             input: {
               transcription: bootstrap.audio.input?.transcription ?? { model: bootstrap.settings.transcriptionModel, language: "zh" },
