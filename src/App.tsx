@@ -1969,10 +1969,10 @@ export function App() {
       topicProposalRef.current = null;
       setDirectionProposal(null);
       directionProposalRef.current = null;
-      pendingDirectionsAfterTopicRef.current = { title: confirmedTitle, attempts: 0, awaitingPermission: true };
-      setStatusText("等待确认是否生成讨论方向");
+      pendingDirectionsAfterTopicRef.current = null;
+      setStatusText("等待补充基本情况");
       const session = realtimeSessionRef.current;
-      recordConversationDiagnostic("directions_after_topic:awaiting_permission", { title: confirmedTitle });
+      recordConversationDiagnostic("topic_confirmed:awaiting_background", { title: confirmedTitle });
       if (options.notifyRealtime !== false && session) {
         if (responseActiveRef.current) {
           session.interrupt();
@@ -1981,8 +1981,9 @@ export function App() {
         }
         session.sendMessage([
           `系统事件：用户已确认讨论主题《${confirmedTitle}》。`,
-          "请先用一句自然短句询问用户：是否需要你整理 1 到 3 个讨论方向供他确认。",
-          "在用户明确同意之前，不要调用 propose_discussion_directions，不要生成 todo。"
+          "请按议程式讨论流程继续：先询问用户的基本情况、目标、限制和希望产出的形式。",
+          "如果用户说不清或没有补充，请主动读取当前主题区文件、资源背景文件和讨论状态，用两三句概述你看到的背景，再询问用户想讨论哪些方面。",
+          "只有完成背景概述后，才提出 1 到 3 条讨论方向并调用 propose_discussion_directions 写进主题卡片供用户确认。"
         ].join("\n\n"));
       }
     } catch (err) {
@@ -2028,7 +2029,7 @@ export function App() {
           "系统事件：用户已点击确认讨论方向 todo。",
           `当前已确认讨论主题：${discussionTopicRef.current || "未命名主题"}`,
           confirmedDirections ? `当前讨论方向与完成状态：\n${confirmedDirections}` : "当前没有讨论方向。",
-          "请立即承接这个状态，只用一句自然短句确认已记录，并询问用户想先从哪个方向开始。不要再次要求用户确认这些方向，除非用户提出修改。"
+          "请立即承接这个状态：先调用 create_generated_file 生成一个简短的“讨论议程/工作台”临时文件，列出主题、背景、方向和预期产物；然后用一句自然短句邀请用户从第一条开始。不要再次要求用户确认这些方向，除非用户提出修改。"
         ].join("\n\n"));
       }
     } catch (err) {
@@ -2827,7 +2828,7 @@ export function App() {
           output = {
             ok: true,
             confirmed: title,
-            next: "Briefly acknowledge the confirmed topic, then ask whether the user wants you to prepare 1 to 3 discussion directions. Do not call propose_discussion_directions until the user explicitly agrees."
+            next: "Briefly acknowledge the confirmed topic, then ask for the user's basic situation, goals, constraints, and desired output. If the user cannot add details, inspect the topic/resource files and summarize the background before proposing discussion directions."
           };
         } else {
           output = { ok: false, error: "No pending discussion topic to confirm." };
@@ -2840,7 +2841,7 @@ export function App() {
           output = {
             ok: true,
             confirmed: directions,
-            next: "Briefly acknowledge that the direction todo list is confirmed and ask where to start."
+            next: "Create a temporary agenda/workbench file for preview, then begin with the first confirmed direction."
           };
         } else {
           output = { ok: false, error: "No pending discussion directions to confirm." };
