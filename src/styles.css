@@ -2518,7 +2518,7 @@ a.icon-button {
     --voice-input-gap: 4px;
     width: 100vw !important;
     height: auto !important;
-    min-height: 100vh !important;
+    min-height: 100svh !important;
     flex-direction: column;
     gap: 12px;
     padding-bottom: calc(var(--bottom-discussion-safe-area) + 42px);
@@ -2609,7 +2609,7 @@ a.icon-button {
   }
 
   .glass-select-menu {
-    max-height: min(220px, 42dvh);
+    max-height: min(220px, 42svh);
   }
 
   .column-resizer,
@@ -2626,11 +2626,21 @@ a.icon-button {
   }
 
   .panel {
+    height: 360px;
     min-height: 360px;
+    max-height: 360px;
+  }
+
+  .fullscreen-panel {
+    height: auto;
+    min-height: 0;
+    max-height: none;
   }
 
   .topic-panel {
-    min-height: min(520px, 58dvh);
+    height: clamp(440px, 58svh, 500px);
+    min-height: clamp(440px, 58svh, 500px);
+    max-height: clamp(440px, 58svh, 500px);
   }
 
   .topic-preview {
@@ -2638,8 +2648,8 @@ a.icon-button {
   }
 
   .topic-file-list {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    justify-content: stretch;
+    grid-template-columns: minmax(0, min(290px, 100%));
+    justify-content: center;
     gap: 12px;
     padding: 12px;
   }
@@ -2665,9 +2675,9 @@ a.icon-button {
   }
 
   .record-panel {
-    height: min(560px, 62dvh);
-    min-height: 360px;
-    max-height: min(560px, 62dvh);
+    height: clamp(420px, 62svh, 520px);
+    min-height: clamp(420px, 62svh, 520px);
+    max-height: clamp(420px, 62svh, 520px);
   }
 
   .record-list {
@@ -2724,12 +2734,12 @@ a.icon-button {
   }
 
   .topic-file-list {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: minmax(0, min(290px, 100%));
   }
 
   .record-panel {
-    height: min(520px, calc(100dvh - var(--bottom-discussion-safe-area) - 48px));
-    max-height: min(520px, calc(100dvh - var(--bottom-discussion-safe-area) - 48px));
+    height: clamp(420px, 62svh, 520px);
+    max-height: clamp(420px, 62svh, 520px);
   }
 
   .bottom-discussion-bar {
@@ -2798,6 +2808,6 @@ a.icon-button {
   .record-preview-window,
   .whiteboard-window {
     width: calc(100vw - 24px);
-    height: calc(100dvh - 24px);
+    height: calc(100svh - 24px);
   }
 }
