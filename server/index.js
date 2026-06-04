@@ -1818,13 +1818,14 @@ function buildDiscussionContext() {
     "判断规则：用户观点明显不合理、和材料冲突或风险高时，直接否定，给一句原因和更稳妥替代方案。",
     "工具规则：读材料、搜索、分析、生成、保存要点默认后台执行。只有联网下载、移动/删除文件、打开外部网页、失败、耗时较长或需要用户选择时，才简短说明状态。",
     "后台任务规则：用户要求长分析、深度报告、代码/脚本处理、较慢网页研究或需要生成结果文件时，优先调用 run_background_task 排队；排队后先简短回应，任务完成后再根据系统事件提示用户查看结果文件。",
+    "即时操作规则：系统页面操作、布局切换、打开/关闭窗口、预览文件、播放媒体、取消/暂停/继续、下载/移动/复制等需要即时反馈的命令，必须直接调用对应前台工具，不要进入后台任务队列。",
     "讨论流程：先确认主题；再了解用户目标/约束/已有材料；再让用户选择讨论方面，用户说不清就建议 3 条方向并写进主题卡片；之后逐条讨论。",
     "记录规则：形成观点、结论、问题、风险或行动项后，直接调用 save_discussion_note 记录，不要请求审批。确认方向后优先调用 prepare_discussion_workbench 生成工作台；其他阶段成果尽量用短命令生成。",
     "主题规则：需要拟定主题时调用 prepare_discussion_topic；主题确认用 confirm_discussion_topic。需要拟定方向时调用 prepare_discussion_directions；方向确认用 confirm_discussion_directions。用户确认语义包括“确认、可以、就这个、对、没问题”。",
     "材料规则：下面只给压缩摘要。需要精确内容时，调用 get_discussion_state、search_context 或对应 analyze_* 工具；图片问题优先 analyze_image_file，Office 文件优先对应 analyze_* 工具。引用时说来源文件名或网页标题。",
     "压缩规则：工具结果可能被压缩。若用户要原文细节、证据、完整清单、逐项比较或文件深度分析，而返回片段不足，不要硬答；继续调用更具体的读取/分析工具，或说明需要后台深度分析。",
-    "文件分析路由：用户要求完整/详细/深度文件分析、长文件对比、报告、表格、清单、生成文件、加入主题卡片或打开预览时，必须调用 run_background_task，不要直接把大文件内容通过 analyze_* 或 compare_files 带入实时上下文。",
-    "联网规则：用户有明确具体的联网需求时，结果必须贴合需求组织。小事实或少量链接用 web_search。用户要求完整/全部赛程、日程、清单、名单、表格、报告，或要求整理成主题卡片/文件并打开时，必须调用 research_request，不要直接 web_search。",
+    "文件分析路由：用户要求完整/详细/深度文件分析、长文件对比、报告、表格、清单、生成文件或加入主题卡片时，必须调用 run_background_task，不要直接把大文件内容通过 analyze_* 或 compare_files 带入实时上下文；单纯打开/预览已有文件仍用 open_file_preview。",
+    "联网规则：用户有明确具体的联网需求时，结果必须贴合需求组织。小事实或少量链接用 web_search。用户要求完整/全部赛程、日程、清单、名单、表格、报告，或要求整理成主题卡片/文件时，必须调用 research_request，不要直接 web_search；单纯打开网页用 open_web_page。",
     "文件规则：不要直接改主题区或资源区原件；需要修改先 copy_file_to_generated。用户要求移动/复制/打开/下载文件时用对应工具完成。",
     "媒体规则：氛围模式调用 set_ambient_mode；用户给媒体链接时 open_media_url；不要编造受版权限制的播放源。",
     "系统事件规则：主题文件添加/删除时，只用 1 句问用户下一步怎么讨论；不要自动改主题或生成方向，除非用户明确要求。",
@@ -3360,7 +3361,7 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "web_search",
-      description: "Search the public web for a small, immediate answer. Use only when the user needs a short answer or a few links. Do not use for complete schedules, long lists, files, reports, topic cards, tables, or open-preview workflows; use research_request instead.",
+      description: "Search the public web for a small, immediate answer. Use only when the user needs a short answer or a few links. Do not use for complete schedules, long lists, generated files, reports, topic cards, or tables; use research_request instead.",
       parameters: {
         type: "object",
         properties: {
@@ -3374,7 +3375,7 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "research_request",
-      description: "Route a web research request. The app will choose direct web_search for small questions and background queue for complete schedules, lists, reports, files, topic cards, tables, or open-preview workflows.",
+      description: "Route a web research request. The app will choose direct web_search for small questions and background queue for complete schedules, lists, reports, generated files, topic cards, or tables. Do not use for simple page opening.",
       parameters: {
         type: "object",
         properties: {
@@ -3670,7 +3671,7 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "analyze_word_file",
-      description: "Load brief structured context for a Word .doc/.docx file. Use for small, immediate questions. For full review, detailed report, table/list output, topic-card/file/open workflows, use run_background_task.",
+      description: "Load brief structured context for a Word .doc/.docx file. Use for small, immediate questions. For full review, detailed report, table/list output, topic-card or generated-file workflows, use run_background_task. For simple opening/preview use open_file_preview.",
       parameters: {
         type: "object",
         properties: {
@@ -3685,7 +3686,7 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "analyze_spreadsheet_file",
-      description: "Load brief structured context for a spreadsheet. Use for small, immediate questions about fields or visible rows. For full analysis, calculations, reports, tables, files, or open workflows, use run_background_task.",
+      description: "Load brief structured context for a spreadsheet. Use for small, immediate questions about fields or visible rows. For full analysis, calculations, reports, tables, or generated files, use run_background_task. For simple opening/preview use open_file_preview.",
       parameters: {
         type: "object",
         properties: {
@@ -3700,7 +3701,7 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "analyze_presentation_file",
-      description: "Load brief structured context for a PowerPoint file. Use for small, immediate questions. For full deck review, detailed rewrite plan, report, file, topic-card, or open workflows, use run_background_task.",
+      description: "Load brief structured context for a PowerPoint file. Use for small, immediate questions. For full deck review, detailed rewrite plan, report, generated file, or topic-card workflow, use run_background_task. For simple opening/preview use open_file_preview.",
       parameters: {
         type: "object",
         properties: {

@@ -379,9 +379,10 @@ function toolCallLabel(name = "任务") {
   } as Record<string, string>)[name] || name;
 }
 
-const backgroundResearchIntentPattern = /全部|完整|所有|全量|整理|生成|保存|导出|打开|预览|主题卡片|主题区|卡片|文件|表格|报告|清单|列表|名单|赛程|日程|赛果|fixture|fixtures|schedule|calendar|timetable|full|all|complete|list|table|report|file|card|open/i;
-const artifactResearchPattern = /整理|生成|保存|导出|打开|预览|主题卡片|主题区|卡片|文件|表格|报告|markdown|md|table|report|file|card|open/i;
-const deepFileTaskPattern = /全部|完整|全面|详细|深度|逐项|全文|长文|报告|表格|清单|列表|对比|比较|审查|方案|整理|生成|保存|导出|打开|预览|主题卡片|主题区|卡片|文件|full|complete|detailed|deep|report|table|list|compare|review|audit|plan|file|card|open|preview/i;
+const backgroundResearchIntentPattern = /全部|完整|所有|全量|整理|生成|保存|导出|主题卡片|主题区|卡片|文件|表格|报告|清单|列表|名单|赛程|日程|赛果|fixture|fixtures|schedule|calendar|timetable|full|all|complete|list|table|report|file|card/i;
+const artifactResearchPattern = /整理|生成|保存|导出|主题卡片|主题区|卡片|文件|表格|报告|markdown|md|table|report|file|card/i;
+const deepFileTaskPattern = /全部|完整|全面|详细|深度|逐项|全文|长文|报告|表格|清单|列表|对比|比较|审查|方案|整理|生成|保存|导出|主题卡片|主题区|卡片|文件|full|complete|detailed|deep|report|table|list|compare|review|audit|plan|file|card/i;
+const immediateUiRequestPattern = /^(打开|开启|关闭|切换|显示|隐藏|预览|放大|缩小|全屏|退出全屏|移动|复制|下载|取消|停止|暂停|继续|播放|静音|open\b|close\b|show\b|hide\b|preview\b|fullscreen\b|download\b|cancel\b|stop\b|pause\b|resume\b|play\b)/i;
 
 function shouldUseBackgroundResearch(args: Record<string, any> = {}) {
   const query = String(args.query || args.prompt || "").trim();
@@ -389,6 +390,12 @@ function shouldUseBackgroundResearch(args: Record<string, any> = {}) {
   const output = String(args.output || "").trim();
   const combined = `${query}\n${purpose}\n${output}`;
   const expectedItems = Number(args.expectedItems || args.limit || 0);
+  if (
+    immediateUiRequestPattern.test(query)
+    && !artifactResearchPattern.test(combined)
+    && !["cards", "table", "file", "report"].includes(output)
+    && args.addToTopic !== true
+  ) return false;
   if (args.addToTopic === true || args.openWhenDone === true) return true;
   if (["cards", "table", "file", "report"].includes(output)) return true;
   if (expectedItems > 8) return true;
@@ -410,6 +417,7 @@ function researchPostActions(args: Record<string, any> = {}) {
 function shouldQueueFileAnalysis(file: DiscuzFile, focus = "", extra = "") {
   const text = `${focus}\n${extra}`;
   const sourceLength = (file.extractedText || file.summary || "").length;
+  if (immediateUiRequestPattern.test(focus) && !deepFileTaskPattern.test(text)) return false;
   if (deepFileTaskPattern.test(text)) return true;
   return sourceLength > 16000;
 }
