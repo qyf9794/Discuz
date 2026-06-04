@@ -11,6 +11,7 @@
     "preview": "vite preview --host 0.0.0.0",
     "start": "node server/index.js",
     "diagnose:conversation": "node scripts/diagnose-conversation.mjs",
+    "check:render": "node scripts/check-render-deployment.mjs",
     "lint": "eslint ."
   },
   "dependencies": {
