@@ -26,7 +26,7 @@ const agent = new RealtimeAgent({
 });
 
 const session = new RealtimeSession(agent, {
-  model: "gpt-realtime",
+  model: "gpt-realtime-2",
 });
 
 await session.connect({
@@ -106,7 +106,7 @@ Allowed low-level access:
 
 ## Web Tooling
 
-`gpt-realtime` does not browse the web by itself. Discuz gives the realtime
+`gpt-realtime-2` does not browse the web by itself. Discuz gives the realtime
 agent explicit tools:
 
 - `web_search`: discover candidate public web pages.

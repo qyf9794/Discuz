@@ -13,7 +13,6 @@ import multer from "multer";
 import mammoth from "mammoth";
 import JSZip from "jszip";
 import { XMLParser } from "fast-xml-parser";
-import OpenAI from "openai";
 
 const execFileAsync = promisify(execFile);
 const officeConverterCandidates = [
@@ -36,7 +35,7 @@ const port = Number(process.env.PORT || 8787);
 const defaultImageGenerationModel = process.env.OPENAI_IMAGE_MODEL || "gpt-image-1.5";
 const aiSettingsDefaults = {
   assistantName: "Discuz",
-  realtimeModel: "gpt-realtime",
+  realtimeModel: "gpt-realtime-2",
   realtimeVoice: "shimmer",
   transcriptionModel: "gpt-4o-transcribe",
   imageModel: defaultImageGenerationModel,
@@ -221,6 +220,7 @@ const upload = multer({
 
 const app = express();
 app.use(cors());
+app.use(express.text({ type: ["application/sdp", "text/plain"], limit: "2mb" }));
 app.use(express.json({ limit: "2mb" }));
 app.get("/api/raw/:topicId/:storedName", (req, res) => {
   const topicId = cleanText(req.params.topicId);
@@ -1460,7 +1460,7 @@ function getAiSettingsState() {
   const tavilyState = getWebSearchSecretState("tavily");
   return {
     assistantName: cleanText(getSetting("ai_assistant_name")) || aiSettingsDefaults.assistantName,
-    realtimeModel: oneOf(getSetting("ai_realtime_model"), ["gpt-realtime"], aiSettingsDefaults.realtimeModel),
+    realtimeModel: oneOf(getSetting("ai_realtime_model"), ["gpt-realtime-2", "gpt-realtime"], aiSettingsDefaults.realtimeModel),
     realtimeVoice: oneOf(getSetting("ai_realtime_voice"), ["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"], aiSettingsDefaults.realtimeVoice),
     transcriptionModel: oneOf(getSetting("ai_transcription_model"), ["gpt-4o-transcribe", "gpt-4o-mini-transcribe"], aiSettingsDefaults.transcriptionModel),
     imageModel: oneOf(getSetting("ai_image_model"), ["gpt-image-1.5", "gpt-image-1"], aiSettingsDefaults.imageModel),
@@ -1485,7 +1485,7 @@ function saveAiSettings(payload = {}) {
   const current = getAiSettingsState();
   const next = {
     assistantName: cleanText(payload.assistantName ?? current.assistantName).slice(0, 40) || aiSettingsDefaults.assistantName,
-    realtimeModel: oneOf(payload.realtimeModel ?? current.realtimeModel, ["gpt-realtime"], current.realtimeModel),
+    realtimeModel: oneOf(payload.realtimeModel ?? current.realtimeModel, ["gpt-realtime-2", "gpt-realtime"], current.realtimeModel),
     realtimeVoice: oneOf(payload.realtimeVoice ?? current.realtimeVoice, ["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"], current.realtimeVoice),
     transcriptionModel: oneOf(payload.transcriptionModel ?? current.transcriptionModel, ["gpt-4o-transcribe", "gpt-4o-mini-transcribe"], current.transcriptionModel),
     imageModel: oneOf(payload.imageModel ?? current.imageModel, ["gpt-image-1.5", "gpt-image-1"], current.imageModel),
@@ -3654,41 +3654,74 @@ app.post("/api/realtime/session", async (req, res) => {
   if (!openAiApiKey) {
     return res.status(500).json({ error: "OPENAI_API_KEY is not configured" });
   }
+  const aiSettings = getAiSettingsState();
+  const session = buildRealtimeSessionConfig(aiSettings);
+  addActivity("Realtime", "Voice session bootstrap created", now());
+  writeTopicSnapshot();
+  return res.json({
+    clientSecret: "server-proxy",
+    expiresAt: Math.floor(Date.now() / 1000) + 600,
+    model: aiSettings.realtimeModel,
+    realtimeCallUrl: "/api/realtime/calls",
+    useServerProxy: true,
+    instructions: session.instructions,
+    tools: session.tools,
+    audio: session.audio,
+    settings: aiSettings
+  });
+});
+
+app.post("/api/realtime/calls", async (req, res) => {
+  const openAiApiKey = getOpenAiApiKey();
+  if (!openAiApiKey) {
+    return res.status(500).type("text/plain").send("OPENAI_API_KEY is not configured");
+  }
+  const sdp = String(req.body || "").trim();
+  if (!sdp) {
+    return res.status(400).type("text/plain").send("Missing WebRTC SDP offer");
+  }
+  const aiSettings = getAiSettingsState();
+  const form = new FormData();
+  form.set("sdp", sdp);
+  form.set("session", JSON.stringify(buildRealtimeSessionConfig(aiSettings)));
   try {
-    const aiSettings = getAiSettingsState();
-    const session = buildRealtimeSessionConfig(aiSettings);
-    const client = new OpenAI({ apiKey: openAiApiKey });
-    const clientSecret = await client.realtime.clientSecrets.create({
-      session,
-      expires_after: {
-        anchor: "created_at",
-        seconds: 600
+    const response = await fetch("https://api.openai.com/v1/realtime/calls", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${openAiApiKey}`
+      },
+      body: form
+    });
+    const answer = await response.text();
+    if (!response.ok) {
+      let payload = {};
+      try {
+        payload = JSON.parse(answer);
+      } catch {
+        payload = { message: answer };
       }
-    });
-    addActivity("Realtime", "Voice session token created", now());
-    writeTopicSnapshot();
-    return res.json({
-      clientSecret: clientSecret.value,
-      expiresAt: clientSecret.expires_at,
-      model: aiSettings.realtimeModel,
-      instructions: session.instructions,
-      tools: session.tools,
-      audio: session.audio,
-      settings: aiSettings
-    });
+      const error = payload?.error || payload;
+      const status = response.status || getOpenAiErrorStatus(error);
+      console.error("Failed to create OpenAI realtime call", {
+        status,
+        code: error?.code,
+        type: error?.type,
+        message: error?.message || answer
+      });
+      return res.status(status).type("text/plain").send(getOpenAiErrorMessage({ ...error, status }, answer || "Unable to create OpenAI realtime call"));
+    }
+    const location = response.headers.get("Location");
+    if (location) res.setHeader("Location", location);
+    return res.status(200).type("application/sdp").send(answer);
   } catch (error) {
     const status = getOpenAiErrorStatus(error);
-    console.error("Failed to create OpenAI realtime client secret", {
+    console.error("Failed to proxy OpenAI realtime call", {
       status,
       code: error?.code || error?.error?.code,
       type: error?.type || error?.error?.type,
       message: error?.message || error?.error?.message
     });
-    return res.status(status).json({
-      error: getOpenAiErrorMessage(error, "Unable to create OpenAI realtime session"),
-      openaiStatus: status,
-      openaiCode: cleanText(error?.code || error?.error?.code || "")
-    });
+    return res.status(status).type("text/plain").send(getOpenAiErrorMessage(error, "Unable to reach OpenAI realtime API from Render"));
   }
 });
 

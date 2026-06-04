@@ -44,7 +44,7 @@ const emptyState: AppState = {
     wallpaperUrl: "",
     ai: {
       assistantName: "Discuz",
-      realtimeModel: "gpt-realtime",
+      realtimeModel: "gpt-realtime-2",
       realtimeVoice: "shimmer",
       transcriptionModel: "gpt-4o-transcribe",
       imageModel: "gpt-image-1.5",
@@ -84,6 +84,8 @@ type RealtimeSessionBootstrap = {
   clientSecret: string;
   expiresAt: number;
   model: string;
+  realtimeCallUrl?: string;
+  useServerProxy?: boolean;
   instructions: string;
   tools: RealtimeToolDefinition[];
     audio: {
@@ -3199,6 +3201,8 @@ export function App() {
         tools: realtimeTools
       });
       const transport = new OpenAIRealtimeWebRTC({
+        baseUrl: bootstrap.realtimeCallUrl || undefined,
+        useInsecureApiKey: Boolean(bootstrap.useServerProxy),
         mediaStream: stream,
         audioElement: audioRef.current ?? undefined,
         changePeerConnection: (peer) => {
@@ -5117,6 +5121,7 @@ const SettingsPopover = forwardRef<HTMLElement, {
             <GlassSelect
               value={aiDraft.realtimeModel}
               options={[
+                { value: "gpt-realtime-2", label: "gpt-realtime-2" },
                 { value: "gpt-realtime", label: "gpt-realtime" }
               ]}
               onChange={(value) => setAiDraft((draft) => ({ ...draft, realtimeModel: value }))}
