@@ -26,6 +26,7 @@ const officeConverterCandidates = [
 let cachedOfficeConverter;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
+const clientDistDir = path.join(rootDir, "dist");
 const dataDir = path.join(rootDir, "data");
 const legacyUploadDir = path.join(dataDir, "uploads");
 const topicsDir = path.join(dataDir, "topics");
@@ -3651,6 +3652,13 @@ app.post("/api/realtime/session", async (req, res) => {
     settings: aiSettings
   });
 });
+
+if (process.env.NODE_ENV === "production" && fs.existsSync(clientDistDir)) {
+  app.use(express.static(clientDistDir));
+  app.get(/^(?!\/api\/).*/, (_req, res) => {
+    res.sendFile(path.join(clientDistDir, "index.html"));
+  });
+}
 
 app.listen(port, () => {
   console.log(`Discuz server listening on http://localhost:${port}`);

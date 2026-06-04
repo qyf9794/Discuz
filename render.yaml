@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: discuz
+    runtime: node
+    plan: starter
+    branch: codex/discussion-todo-workflow
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 24.14.1
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: PORT
+        value: 10000
+    disks:
+      - name: discuz-data
+        mountPath: /opt/render/project/src/data
+        sizeGB: 1
