@@ -957,8 +957,14 @@ function backgroundAiModel() {
   return cleanText(process.env.OPENAI_BACKGROUND_MODEL || getSetting("ai_background_model")) || "gpt-4.1-mini";
 }
 
-function backgroundAiTimeoutMs() {
-  const configured = Number(process.env.OPENAI_BACKGROUND_TIMEOUT_MS || getSetting("ai_background_timeout_ms") || 2500);
+function discussionSuggestionTimeoutMs() {
+  const configured = Number(
+    process.env.OPENAI_DISCUSSION_SUGGESTION_TIMEOUT_MS ||
+    getSetting("ai_discussion_suggestion_timeout_ms") ||
+    process.env.OPENAI_BACKGROUND_TIMEOUT_MS ||
+    getSetting("ai_background_timeout_ms") ||
+    2500
+  );
   return Number.isFinite(configured) ? Math.min(8000, Math.max(800, configured)) : 2500;
 }
 
@@ -966,7 +972,7 @@ async function runBackgroundTextJson(prompt, maxOutputTokens = 500) {
   const openAiApiKey = getOpenAiApiKey();
   if (!openAiApiKey) throw new Error("OPENAI_API_KEY is not configured");
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), backgroundAiTimeoutMs());
+  const timer = setTimeout(() => controller.abort(), discussionSuggestionTimeoutMs());
   const response = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     signal: controller.signal,
