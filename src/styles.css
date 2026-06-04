@@ -2315,11 +2315,15 @@ a.icon-button {
 }
 
 .status-log-panel {
+  --discussion-input-width: min(560px, calc(var(--topic-pane-width, 50%) - 48px));
+  --status-log-edge-gap: clamp(24px, 2.5vw, 40px);
+  --status-log-input-gap: 20px;
   position: absolute;
-  left: 40px;
-  right: calc(50% + 86px + min(560px, calc(50vw - 118px)) + 14px);
+  left: var(--status-log-edge-gap);
+  right: calc(100% - ((var(--topic-pane-width, 50%) - var(--discussion-input-width)) / 2) + var(--status-log-input-gap));
   bottom: var(--discussion-input-lift);
   height: 44px;
+  min-width: 0;
   pointer-events: auto;
 }
 
@@ -2346,7 +2350,10 @@ a.icon-button {
 }
 
 .status-log-scroll p {
+  overflow: hidden;
   margin: 0 0 4px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .status-log-scroll p.error {
