@@ -203,7 +203,7 @@ function realtimeRetryDelayMs(message: string) {
   if (!match) return 800;
   const seconds = Number(match[1]);
   if (!Number.isFinite(seconds)) return 800;
-  return Math.min(15000, Math.max(800, Math.ceil(seconds * 1000) + 450));
+  return Math.min(65000, Math.max(800, Math.ceil(seconds * 1000) + 700));
 }
 
 function voiceStartErrorMessage(error: unknown) {
@@ -1582,6 +1582,15 @@ export function App() {
         text: compactText(String(result.text || result.resultText || ""), 2500)
       };
     }
+    if (name === "analyze_image_file") {
+      return {
+        ok: true,
+        file: result.file,
+        cached: result.cached,
+        focus: compactText(String(result.focus || ""), 120),
+        analysis: compactText(String(result.analysis || ""), 1400)
+      };
+    }
     if (["analyze_word_file", "analyze_spreadsheet_file", "analyze_presentation_file", "compare_files"].includes(name)) {
       return {
         ok: true,
@@ -2689,23 +2698,63 @@ export function App() {
       if (name === "analyze_image_file") {
         const role = args.role === "primary" || args.role === "context" || args.role === "generated" ? args.role as DiscuzFile["role"] : undefined;
         const candidate = selectFileByQuery(state.files, String(args.query || ""), role, ["image"]);
+        const focus = String(args.focus || "").trim();
         if (!candidate) {
           output = { ok: false, error: "No matching image file found. Ask the user to upload or specify an image." };
         } else {
-          const response = await fetch(`/api/files/${encodeURIComponent(candidate.id)}/analyze-image`, { method: "POST" });
-          const payload = await response.json();
-          if (!response.ok) throw new Error(payload.error || "Image analysis failed");
-          setState((current) => ({
-            ...current,
-            files: payload.files ?? current.files,
-            activities: payload.activities ?? current.activities
-          }));
-          output = {
-            ok: true,
-            file: fileBrief(payload.file ?? candidate),
-            focus: String(args.focus || "").trim(),
-            analysis: compactText(payload.file?.extractedText || candidate.extractedText || candidate.summary || "", 1200)
-          };
+          const cachedAnalysis = (candidate.extractedText || candidate.summary || "").trim();
+          const wantsFreshAnalysis = /重新分析|重新识别|再分析|更详细|详细|完整|报告|表格|清单|生成|卡片|fresh|reanaly|full|report|table|card/i.test(focus);
+          if (candidate.extractionStatus === "complete" && cachedAnalysis && !wantsFreshAnalysis) {
+            output = {
+              ok: true,
+              cached: true,
+              file: fileBrief(candidate),
+              focus,
+              analysis: compactText(cachedAnalysis, 1200)
+            };
+          } else if (cachedAnalysis && shouldQueueFileAnalysis(candidate, focus, "image")) {
+            const postActions = fileAnalysisPostActions(focus);
+            const task = await queueBackgroundTask({
+              kind: "file_analysis",
+              title: compactText(`${candidate.originalName} 图片分析`, 80),
+              prompt: [
+                `请分析图片：${candidate.originalName}`,
+                focus ? `分析重点：${focus}` : "分析重点：根据图片内容整理对象、场景、文字、判断和可讨论点。",
+                "如果用户要求报告、表格、清单、完整分析或打开预览，请生成结构化 Markdown 成果。"
+              ].join("\n"),
+              outputMode: "file",
+              targetFileIds: [candidate.id],
+              postActions
+            });
+            output = {
+              ok: true,
+              route: "background",
+              reason: "该图片分析需要生成较长结果，已转入后台，避免占用实时语音上下文。",
+              queued: task?.title || `${candidate.originalName} 图片分析`,
+              taskId: task?.id,
+              status: task?.status || "queued",
+              postActions,
+              next: postActions.includes("open_preview")
+                ? "完成后会按要求加入主题区或打开预览。"
+                : "完成后会在 AI 临时文件区生成分析结果。"
+            };
+          } else {
+            const response = await fetch(`/api/files/${encodeURIComponent(candidate.id)}/analyze-image`, { method: "POST" });
+            const payload = await response.json();
+            if (!response.ok) throw new Error(payload.error || "Image analysis failed");
+            setState((current) => ({
+              ...current,
+              files: payload.files ?? current.files,
+              activities: payload.activities ?? current.activities
+            }));
+            output = {
+              ok: true,
+              cached: false,
+              file: fileBrief(payload.file ?? candidate),
+              focus,
+              analysis: compactText(payload.file?.extractedText || candidate.extractedText || candidate.summary || "", 1200)
+            };
+          }
         }
       }
       if (name === "read_current_focus") {

@@ -598,12 +598,13 @@ function compactPromptText(value, maxChars) {
 
 function compactFilePromptLine(file, maxChars = 900) {
   const status = file.extractionStatus && file.extractionStatus !== "complete" ? `｜${file.extractionStatus}` : "";
-  const summary = compactPromptText(file.summary, 260);
-  const excerpt = compactPromptText(file.extractedText, maxChars);
+  const promptLimit = file.kind === "image" ? Math.min(maxChars, 280) : maxChars;
+  const summary = compactPromptText(file.summary, file.kind === "image" ? 180 : 260);
+  const excerpt = compactPromptText(file.extractedText, promptLimit);
   const text = summary && excerpt && !excerpt.startsWith(summary)
     ? `${summary} 片段：${excerpt}`
     : summary || excerpt || "暂无可读摘要。";
-  return `- ${file.originalName}｜${file.kind}${status}: ${compactPromptText(text, maxChars)}`;
+  return `- ${file.originalName}｜${file.kind}${status}: ${compactPromptText(text, promptLimit)}`;
 }
 
 function rowToCompactFile(row) {
