@@ -351,6 +351,7 @@ function detectKindFromMetadata(originalName, mimeType = "", storedName = "") {
   if (mime.startsWith("audio/")) return "audio";
   if (mime.startsWith("video/")) return "video";
   if (mime === "application/pdf" || ext === ".pdf") return "pdf";
+  if (mime === "application/epub+zip" || ext === ".epub") return "epub";
   if (mime === "application/msword" || ext === ".doc") return "doc";
   if (ext === ".docx") return "docx";
   if (mime === "application/vnd.ms-powerpoint" || ext === ".ppt") return "ppt";
@@ -377,6 +378,25 @@ function cleanHtml(value) {
   return String(value || "")
     .replace(/\u0000/g, "")
     .trim();
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function entityCodePoint(value, radix = 10) {
+  const codePoint = parseInt(value, radix);
+  if (!Number.isFinite(codePoint) || codePoint < 0 || codePoint > 0x10ffff) return " ";
+  try {
+    return String.fromCodePoint(codePoint);
+  } catch {
+    return " ";
+  }
 }
 
 async function resolveOfficeConverter() {
@@ -567,6 +587,21 @@ async function extractDoc(filePath) {
   }
 }
 
+function stripHtmlToText(value = "") {
+  return String(value || "")
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, "\"")
+    .replace(/&#39;/gi, "'")
+    .replace(/&#(\d+);/g, (_match, code) => entityCodePoint(code))
+    .replace(/&#x([0-9a-f]+);/gi, (_match, code) => entityCodePoint(code, 16));
+}
+
 function collectText(value, output = []) {
   if (value == null) return output;
   if (typeof value === "string" || typeof value === "number") {
@@ -585,6 +620,78 @@ function collectText(value, output = []) {
     });
   }
   return output;
+}
+
+function zipPathDir(filePath = "") {
+  const normalized = String(filePath || "").replace(/\\/g, "/");
+  const index = normalized.lastIndexOf("/");
+  return index >= 0 ? normalized.slice(0, index + 1) : "";
+}
+
+function resolveZipPath(baseDir, target = "") {
+  const rawTarget = String(target || "").split(/[?#]/)[0];
+  let decodedTarget = rawTarget;
+  try {
+    decodedTarget = decodeURIComponent(rawTarget);
+  } catch {
+    decodedTarget = rawTarget;
+  }
+  const normalizedTarget = decodedTarget.replace(/\\/g, "/").replace(/^\/+/, "");
+  const parts = `${baseDir || ""}${normalizedTarget}`.split("/");
+  const resolved = [];
+  for (const part of parts) {
+    if (!part || part === ".") continue;
+    if (part === "..") resolved.pop();
+    else resolved.push(part);
+  }
+  return resolved.join("/");
+}
+
+async function extractEpub(filePath) {
+  const zip = await JSZip.loadAsync(fs.readFileSync(filePath));
+  const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_" });
+  const containerXml = zip.files["META-INF/container.xml"] ? await zip.files["META-INF/container.xml"].async("string") : "";
+  const container = containerXml ? parser.parse(containerXml) : {};
+  const rootfile = asArray(container?.container?.rootfiles?.rootfile)[0];
+  const opfPath = rootfile?.["@_full-path"] || Object.keys(zip.files).find((name) => /\.opf$/i.test(name));
+  if (!opfPath || !zip.files[opfPath]) {
+    throw new Error("无法解析 EPUB：未找到 OPF 目录文件。");
+  }
+  const opfXml = await zip.files[opfPath].async("string");
+  const opf = parser.parse(opfXml);
+  const opfDir = zipPathDir(opfPath);
+  const manifestItems = asArray(opf?.package?.manifest?.item);
+  const manifest = new Map(manifestItems.map((item) => [item?.["@_id"], item]));
+  const spine = asArray(opf?.package?.spine?.itemref)
+    .map((item) => manifest.get(item?.["@_idref"]))
+    .filter(Boolean);
+  const readingItems = spine.length
+    ? spine
+    : manifestItems.filter((item) => /xhtml|html/i.test(`${item?.["@_media-type"] || ""}`) || /\.x?html?$/i.test(`${item?.["@_href"] || ""}`));
+  const title = cleanText(collectText(opf?.package?.metadata?.["dc:title"] ?? opf?.package?.metadata?.title, []).join(" "));
+  const sections = [];
+  const htmlParts = [];
+  let totalChars = 0;
+  const maxChars = 100000;
+  for (const item of readingItems) {
+    if (totalChars >= maxChars) break;
+    const href = item?.["@_href"];
+    if (!href) continue;
+    const chapterPath = resolveZipPath(opfDir, href);
+    const chapterFile = zip.files[chapterPath];
+    if (!chapterFile) continue;
+    const rawHtml = await chapterFile.async("string");
+    const chapterTitle = cleanText(stripHtmlToText(rawHtml.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || ""));
+    const text = cleanText(stripHtmlToText(rawHtml));
+    if (!text) continue;
+    const heading = chapterTitle || path.basename(chapterPath);
+    const section = `${heading}\n${text}`.slice(0, Math.max(0, maxChars - totalChars));
+    totalChars += section.length;
+    sections.push(section);
+    htmlParts.push(`<section><h2>${escapeHtml(heading)}</h2><p>${escapeHtml(text).replace(/\n{2,}/g, "</p><p>").replace(/\n/g, "<br />")}</p></section>`);
+  }
+  const text = cleanText([title ? `书名：${title}` : "", ...sections].join("\n\n"));
+  return { text, html: cleanHtml(htmlParts.join("\n")) };
 }
 
 async function extractPptx(filePath) {
@@ -819,6 +926,7 @@ async function extractContentAtPath(filePath, kind, metadata = {}) {
   if (kind === "image") return { text: await analyzeImageAtPath(filePath, metadata.mimeType, metadata.originalName), html: "" };
   if (["audio", "video"].includes(kind)) return { text: "", html: "" };
   if (kind === "pdf") return extractPdf(filePath);
+  if (kind === "epub") return extractEpub(filePath);
   if (kind === "doc") return extractDoc(filePath);
   if (kind === "docx") return extractDocx(filePath);
   if (kind === "ppt") return extractPpt(filePath);
@@ -838,7 +946,7 @@ async function extractContentFromFile(file, kind) {
 }
 
 function shouldExtractInBackground(kind) {
-  return ["image", "pdf", "doc", "docx", "ppt", "pptx", "spreadsheet", "markdown", "text"].includes(kind);
+  return ["image", "pdf", "epub", "doc", "docx", "ppt", "pptx", "spreadsheet", "markdown", "text"].includes(kind);
 }
 
 function pendingExtractionSummary(kind) {

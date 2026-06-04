@@ -589,6 +589,7 @@ function fileExtractionLabel(file: DiscuzFile) {
   if (file.kind === "spreadsheet") return "后台解析表格";
   if (file.kind === "ppt" || file.kind === "pptx") return "后台解析PPT";
   if (file.kind === "doc" || file.kind === "docx") return "后台解析Word";
+  if (file.kind === "epub") return "后台解析EPUB";
   if (file.kind === "pdf") return "后台解析PDF";
   return "后台解析文字";
 }
@@ -4274,7 +4275,7 @@ function FilePreview({ file }: { file: DiscuzFile }) {
   if (file.kind === "audio") return <audio className="media-preview" src={file.previewUrl} controls />;
   if (file.kind === "video") return <video className="media-preview" src={file.previewUrl} controls />;
   if (file.kind === "pdf") return <iframe className="document-frame" title={file.originalName} src={file.previewUrl} />;
-  if ((file.kind === "doc" || file.kind === "docx") && file.renderedHtml) {
+  if ((file.kind === "doc" || file.kind === "docx" || file.kind === "epub") && file.renderedHtml) {
     return <iframe className="document-frame word-frame" title={file.originalName} sandbox="" srcDoc={wordPreviewHtml(file.renderedHtml)} />;
   }
   return (
@@ -4305,7 +4306,7 @@ function FileMiniPreview({ file }: { file: DiscuzFile }) {
   if (file.kind === "video") return <video src={file.previewUrl} muted preload="metadata" />;
   if (file.kind === "audio") return <div className="mini-icon"><Music size={22} /></div>;
   if (file.kind === "pdf") return <div className="mini-document"><iframe title="" src={file.previewUrl} /></div>;
-  if ((file.kind === "doc" || file.kind === "docx") && file.renderedHtml) {
+  if ((file.kind === "doc" || file.kind === "docx" || file.kind === "epub") && file.renderedHtml) {
     return <div className="mini-document"><iframe title="" sandbox="" srcDoc={wordPreviewHtml(file.renderedHtml)} /></div>;
   }
   const markdownImage = file.extractedText.match(/!\[[^\]]*]\(([^)\s]+)(?:\s+"[^"]*")?\)/);
