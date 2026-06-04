@@ -957,11 +957,19 @@ function backgroundAiModel() {
   return cleanText(process.env.OPENAI_BACKGROUND_MODEL || getSetting("ai_background_model")) || "gpt-4.1-mini";
 }
 
+function backgroundAiTimeoutMs() {
+  const configured = Number(process.env.OPENAI_BACKGROUND_TIMEOUT_MS || getSetting("ai_background_timeout_ms") || 2500);
+  return Number.isFinite(configured) ? Math.min(8000, Math.max(800, configured)) : 2500;
+}
+
 async function runBackgroundTextJson(prompt, maxOutputTokens = 500) {
   const openAiApiKey = getOpenAiApiKey();
   if (!openAiApiKey) throw new Error("OPENAI_API_KEY is not configured");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), backgroundAiTimeoutMs());
   const response = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
+    signal: controller.signal,
     headers: {
       Authorization: `Bearer ${openAiApiKey}`,
       "Content-Type": "application/json"
@@ -974,7 +982,7 @@ async function runBackgroundTextJson(prompt, maxOutputTokens = 500) {
         content: [{ type: "input_text", text: prompt }]
       }]
     })
-  });
+  }).finally(() => clearTimeout(timer));
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(payload?.error?.message || `OpenAI background request failed: ${response.status}`);
   const text = responseOutputText(payload);
