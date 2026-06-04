@@ -418,7 +418,7 @@ function selectOfficeFile(files: DiscuzFile[], kind: OfficeAnalysisKind, role?: 
   }) ?? null;
 }
 
-function compactText(value: string, maxChars = 18000) {
+function compactText(value: string, maxChars = 5000) {
   const text = value.trim();
   return text.length > maxChars ? `${text.slice(0, maxChars)}\n\n... 已截断，以上为前 ${maxChars} 字。` : text;
 }
@@ -490,7 +490,7 @@ function buildWordAnalysisPayload(file: DiscuzFile, focus: string) {
     .split(/\n+/)
     .map((line) => line.trim())
     .filter(Boolean);
-  const possibleHeadings = paragraphs.filter((line) => line.length <= 80 && !/[。！？!?；;]$/.test(line)).slice(0, 12);
+  const possibleHeadings = paragraphs.filter((line) => line.length <= 80 && !/[。！？!?；;]$/.test(line)).slice(0, 8);
   return {
     ok: true,
     mode: "word",
@@ -499,13 +499,13 @@ function buildWordAnalysisPayload(file: DiscuzFile, focus: string) {
     structure: {
       paragraphCount: paragraphs.length,
       possibleHeadings,
-      openingParagraphs: paragraphs.slice(0, 8)
+      openingParagraphs: paragraphs.slice(0, 4)
     },
     instructions: [
       "Use the Documents skill discussion bridge: review structure, argument, clarity, gaps, risks, and possible edits.",
       "Do not claim visual DOCX layout verification unless a separate render-and-review workflow is run."
     ],
-    content: compactText(file.extractedText || file.summary || "")
+    content: compactText(file.extractedText || file.summary || "", 4000)
   };
 }
 
@@ -521,7 +521,7 @@ function buildSpreadsheetAnalysisPayload(file: DiscuzFile, focus: string) {
     return {
       name,
       visibleRowCount: dataRows.length,
-      firstRows: dataRows.slice(0, 12),
+      firstRows: dataRows.slice(0, 6),
       truncatedNote: lines.find((line) => line.startsWith("... 已截取")) || ""
     };
   });
@@ -532,13 +532,13 @@ function buildSpreadsheetAnalysisPayload(file: DiscuzFile, focus: string) {
     focus,
     structure: {
       sheetCount: sheets.length,
-      sheets
+      sheets: sheets.slice(0, 6)
     },
     instructions: [
       "Use the Spreadsheets skill discussion bridge: inspect sheets, fields, row patterns, formulas if visible, anomalies, trends, missing columns, and next analysis steps.",
       "If exact calculations are needed, ask the user to confirm the target sheet/range or request a generated analysis workbook."
     ],
-    content: compactText(file.extractedText || file.summary || "")
+    content: compactText(file.extractedText || file.summary || "", 4000)
   };
 }
 
@@ -552,7 +552,7 @@ function buildPresentationAnalysisPayload(file: DiscuzFile, focus: string) {
       return {
         number: Number(lines[0]?.match(/\d+/)?.[0] || index + 1),
         title: lines[1] || `Slide ${index + 1}`,
-        text: lines.slice(1, 12)
+        text: lines.slice(1, 7)
       };
     });
   return {
@@ -562,13 +562,13 @@ function buildPresentationAnalysisPayload(file: DiscuzFile, focus: string) {
     focus,
     structure: {
       slideCount: slides.length,
-      slides: slides.slice(0, 30)
+      slides: slides.slice(0, 12)
     },
     instructions: [
       "Use the Presentations skill discussion bridge: review narrative spine, slide claims, proof objects, flow, audience fit, missing evidence, and improvement opportunities.",
       "Do not claim visual slide QA unless the deck is rendered and inspected separately."
     ],
-    content: compactText(file.extractedText || file.summary || "")
+    content: compactText(file.extractedText || file.summary || "", 4000)
   };
 }
 
@@ -578,7 +578,7 @@ function fileBrief(file: DiscuzFile) {
     name: file.originalName,
     role: file.role,
     kind: file.kind,
-    summary: file.summary,
+    summary: compactText(file.summary || file.extractedText || "", 220),
     previewUrl: file.previewUrl
   };
 }
@@ -1838,7 +1838,7 @@ export function App() {
   }, [beginUniqueTask, finishPendingDirectionsAfterTopic]);
 
   const notifyForegroundDiscussion = (title: string, text: string) => {
-    sendRealtimeSystemEvent(`系统事件：用户打开了前台讨论窗口《${title}》。这个窗口现在是当前临时讨论对象，请先阅读以下内容，再围绕它继续讨论。\n\n${text.slice(0, 6000)}`);
+    sendRealtimeSystemEvent(`系统事件：用户打开了前台讨论窗口《${title}》。这个窗口现在是当前临时讨论对象。以下是压缩摘要，精确细节请调用分析或检索工具。\n\n${compactText(text, 1200)}`);
   };
 
   const describeFileForDiscussion = (file: DiscuzFile) => {
@@ -1846,7 +1846,8 @@ export function App() {
       `文件名：${file.originalName}`,
       `区域：${file.role}`,
       `类型：${file.kind}`,
-      file.extractedText ? `内容：\n${file.extractedText}` : `摘要：${file.summary || "无可读文本"}`,
+      file.summary ? `摘要：${compactText(file.summary, 260)}` : "",
+      file.extractedText ? `片段：\n${compactText(file.extractedText, 1200)}` : "",
       file.previewUrl ? `预览地址：${file.previewUrl}` : ""
     ].filter(Boolean).join("\n\n");
   };
@@ -1986,7 +1987,7 @@ export function App() {
           responseActiveRef.current = false;
           clearResponseWatchdog();
         }
-        session.sendMessage(`用户文字输入：${text}`);
+        session.sendMessage(`用户文字输入：${compactText(text, 1200)}`);
       } else {
         setStatusText("Saved for next discussion");
       }
@@ -2030,9 +2031,7 @@ export function App() {
         }
         session.sendMessage([
           `系统事件：用户已确认讨论主题《${confirmedTitle}》。`,
-          "请按议程式讨论流程继续：先询问用户的基本情况、目标、限制和希望产出的形式。",
-          "如果用户说不清或没有补充，请主动读取当前主题区文件、资源背景文件和讨论状态，用两三句概述你看到的背景，再询问用户想讨论哪些方面。",
-          "只有完成背景概述后，才提出 1 到 3 条讨论方向并调用 propose_discussion_directions 写进主题卡片供用户确认。"
+          "下一步只问用户基本情况、目标、限制和希望产出的形式。用户说不清时，再读取压缩材料概述背景。"
         ].join("\n\n"));
       }
     } catch (err) {
@@ -2077,8 +2076,8 @@ export function App() {
         session.sendMessage([
           "系统事件：用户已点击确认讨论方向 todo。",
           `当前已确认讨论主题：${discussionTopicRef.current || "未命名主题"}`,
-          confirmedDirections ? `当前讨论方向与完成状态：\n${confirmedDirections}` : "当前没有讨论方向。",
-          "请立即承接这个状态：先调用 create_generated_file 生成一个简短的“讨论议程/工作台”临时文件，列出主题、背景、方向和预期产物；然后用一句自然短句邀请用户从第一条开始。不要再次要求用户确认这些方向，除非用户提出修改。"
+          confirmedDirections ? `当前讨论方向：\n${compactText(confirmedDirections, 600)}` : "当前没有讨论方向。",
+          "请后台生成简短议程/工作台文件，然后一句话从第一条开始。"
         ].join("\n\n"));
       }
     } catch (err) {
@@ -2353,7 +2352,7 @@ export function App() {
             ok: true,
             file: fileBrief(payload.file ?? candidate),
             focus: String(args.focus || "").trim(),
-            analysis: payload.file?.extractedText || candidate.extractedText || candidate.summary
+            analysis: compactText(payload.file?.extractedText || candidate.extractedText || candidate.summary || "", 1200)
           };
         }
       }
@@ -2378,21 +2377,28 @@ export function App() {
           topic: state.discussionTopic,
           activeTopicId: state.activeTopicId,
           files: state.files.map(fileBrief),
-          directions: state.directions,
-          notes: state.notes.slice(-20),
-          meetingMessages: state.meetingMessages.slice(-40),
-          records: state.records.slice(-10),
-          pendingTasks,
+          directions: state.directions.slice(-8).map((direction) => ({ ...direction, text: compactText(direction.text, 160) })),
+          notes: state.notes.slice(-8).map((note) => ({ ...note, text: compactText(note.text, 180) })),
+          meetingMessages: state.meetingMessages.slice(-8).map((message) => ({ ...message, text: compactText(message.text, 180) })),
+          records: state.records.slice(-3).map((record) => ({ id: record.id, title: record.title, noteCount: record.noteCount, startedAt: record.startedAt, endedAt: record.endedAt })),
+          pendingTasks: pendingTasks.map((task) => ({ id: task.id, label: task.label })),
           statusText,
           foreground: { activeTool, previewFile: previewFile ? fileBrief(previewFile) : null, webPreview },
           governance: {
-            discussionContract,
-            discussionAgenda,
+            discussionContract: discussionContract ? {
+              goal: compactText(discussionContract.goal, 160),
+              outputFormat: compactText(discussionContract.outputFormat, 120),
+              responseLength: discussionContract.responseLength
+            } : null,
+            discussionAgenda: discussionAgenda.slice(0, 6).map((item) => ({
+              title: compactText(item.title, 100),
+              status: item.status
+            })),
             agendaLocked,
             currentAgendaIndex,
             responseScope,
             userCognitiveLoad,
-            outputRubric
+            outputRubric: outputRubric.slice(0, 5).map((item) => compactText(item, 100))
           }
         };
       }
@@ -2483,7 +2489,7 @@ export function App() {
               editPlan,
               "",
               "## 原表格摘录",
-              compactText(candidate.extractedText || candidate.summary || "", 12000)
+              compactText(candidate.extractedText || candidate.summary || "", 3000)
             ].join("\n")
           );
           output = { ok: true, generated: file.originalName, sourceFile: fileBrief(candidate) };
@@ -2510,8 +2516,8 @@ export function App() {
           output = {
             ok: true,
             files: [fileBrief(first), fileBrief(second)],
-            firstContent: compactText(first.extractedText || first.summary || "", 10000),
-            secondContent: compactText(second.extractedText || second.summary || "", 10000),
+            firstContent: compactText(first.extractedText || first.summary || "", 3000),
+            secondContent: compactText(second.extractedText || second.summary || "", 3000),
             instruction: "Compare these two files and summarize differences, risks, and suggested next edits."
           };
         }

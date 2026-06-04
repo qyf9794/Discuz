@@ -572,6 +572,20 @@ function compactFilePromptLine(file, maxChars = 900) {
   return `- ${file.originalName}｜${file.kind}${status}: ${compactPromptText(text, maxChars)}`;
 }
 
+function rowToCompactFile(row) {
+  const file = rowToFile(row);
+  if (!file) return null;
+  return {
+    id: file.id,
+    name: file.originalName,
+    role: file.role,
+    kind: file.kind,
+    summary: compactPromptText(file.summary || file.extractedText, 240),
+    extractionStatus: file.extractionStatus,
+    previewUrl: file.previewUrl
+  };
+}
+
 async function extractPdf(filePath) {
   const { PDFParse } = await import("pdf-parse");
   const dataBuffer = fs.readFileSync(filePath);
@@ -2091,7 +2105,7 @@ async function readWebPageWithJina(url, maxChars) {
   };
 }
 
-async function readPublicWebPage(rawUrl, maxChars = 10000) {
+async function readPublicWebPage(rawUrl, maxChars = 6000) {
   const url = normalizeWebUrl(rawUrl);
   const useJina = process.env.WEB_READ_USE_JINA !== "false";
   try {
@@ -2565,8 +2579,8 @@ app.get("/api/context/search", (req, res) => {
       const lower = text.toLowerCase();
       const score = terms.reduce((sum, term) => sum + (lower.includes(term) ? 1 : 0), 0);
       const firstHit = terms.map((term) => lower.indexOf(term)).filter((index) => index >= 0).sort((a, b) => a - b)[0] ?? 0;
-      const snippet = cleanText(text.slice(Math.max(0, firstHit - 120), firstHit + 360));
-      return { file: rowToFile(row), score, snippet };
+      const snippet = compactPromptText(text.slice(Math.max(0, firstHit - 120), firstHit + 360), 480);
+      return { file: rowToCompactFile(row), score, snippet };
     })
     .filter((item) => !terms.length || item.score > 0)
     .sort((a, b) => b.score - a.score)
@@ -2611,7 +2625,7 @@ app.get("/api/web/read", async (req, res) => {
   const rawUrl = cleanText(req.query.url || "");
   if (!rawUrl) return res.status(400).json({ ok: false, error: "Missing URL." });
   try {
-    const maxChars = Math.max(1200, Math.min(20000, Number(req.query.maxChars || 10000) || 10000));
+    const maxChars = Math.max(1200, Math.min(8000, Number(req.query.maxChars || 6000) || 6000));
     const page = await readPublicWebPage(rawUrl, maxChars);
     addActivity("Web", `读取网页：${page.title}`, now());
     writeTopicSnapshot();
@@ -3744,9 +3758,34 @@ function stripSchemaDescriptions(value) {
 function compactRealtimeToolDefinition(definition) {
   return {
     ...definition,
-    description: compactPromptText(definition.description, 140),
+    description: compactPromptText(definition.description, 90),
     parameters: stripSchemaDescriptions(definition.parameters)
   };
+}
+
+const omittedRealtimeTools = new Set([
+  "ask_user_confirmation",
+  "queue_task",
+  "set_discussion_contract",
+  "check_topic_alignment",
+  "advance_discussion_step",
+  "mark_uncertainty",
+  "limit_response_scope",
+  "create_discussion_agenda",
+  "lock_discussion_agenda",
+  "request_agenda_change",
+  "score_discussion_progress",
+  "summarize_current_step",
+  "detect_overlong_answer",
+  "set_user_cognitive_load",
+  "pause_and_wait",
+  "define_output_rubric"
+]);
+
+function realtimeToolDefinitionsForSession() {
+  return buildRealtimeToolDefinitions()
+    .filter((definition) => !omittedRealtimeTools.has(definition.name))
+    .map(compactRealtimeToolDefinition);
 }
 
 function buildRealtimeSessionConfig(aiSettings) {
@@ -3754,7 +3793,7 @@ function buildRealtimeSessionConfig(aiSettings) {
     type: "realtime",
     model: aiSettings.realtimeModel,
     instructions: buildDiscussionContext(),
-    tools: buildRealtimeToolDefinitions().map(compactRealtimeToolDefinition),
+    tools: realtimeToolDefinitionsForSession(),
     tool_choice: "auto",
     audio: {
       input: {
@@ -3792,7 +3831,6 @@ app.post("/api/realtime/session", async (req, res) => {
       seconds: 600
     }
   });
-  addActivity("Realtime", "Voice session token created", now());
   writeTopicSnapshot();
   return res.json({
     clientSecret: clientSecret.value,
