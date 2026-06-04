@@ -80,17 +80,33 @@ type ToolDiagnosticResult = DiagnosticSnapshot & {
   observedTask: boolean;
 };
 type RealtimeToolDefinition = { type: "function"; name: string; description: string; parameters: Record<string, unknown> };
+type RealtimeTurnDetection = {
+  type?: string;
+  createResponse?: boolean;
+  create_response?: boolean;
+  interruptResponse?: boolean;
+  interrupt_response?: boolean;
+  prefixPaddingMs?: number;
+  prefix_padding_ms?: number;
+  silenceDurationMs?: number;
+  silence_duration_ms?: number;
+  threshold?: number;
+  idleTimeoutMs?: number;
+  idle_timeout_ms?: number;
+};
 type RealtimeSessionBootstrap = {
   clientSecret: string;
   expiresAt: number;
   model: string;
   instructions: string;
   tools: RealtimeToolDefinition[];
-    audio: {
-      input?: {
-        transcription?: { model?: string; language?: string };
-      };
-      output?: { voice?: string };
+  audio: {
+    input?: {
+      transcription?: { model?: string; language?: string };
+      turnDetection?: RealtimeTurnDetection;
+      turn_detection?: RealtimeTurnDetection;
+    };
+    output?: { voice?: string };
   };
   settings: AiSettings;
 };
@@ -187,6 +203,29 @@ function voiceStartErrorMessage(error: unknown) {
     return "麦克风暂时不可用，可能被其他应用占用。请关闭占用麦克风的应用后再试。";
   }
   return message || "无法启动语音。";
+}
+
+const defaultRealtimeTurnDetection = {
+  type: "server_vad",
+  createResponse: true,
+  interruptResponse: true,
+  prefixPaddingMs: 300,
+  silenceDurationMs: 650,
+  threshold: 0.45,
+  idleTimeoutMs: 6000
+};
+
+function normalizeRealtimeTurnDetection(value?: RealtimeTurnDetection | null) {
+  if (!value) return defaultRealtimeTurnDetection;
+  return {
+    type: value.type || defaultRealtimeTurnDetection.type,
+    createResponse: value.createResponse ?? value.create_response ?? defaultRealtimeTurnDetection.createResponse,
+    interruptResponse: value.interruptResponse ?? value.interrupt_response ?? defaultRealtimeTurnDetection.interruptResponse,
+    prefixPaddingMs: value.prefixPaddingMs ?? value.prefix_padding_ms ?? defaultRealtimeTurnDetection.prefixPaddingMs,
+    silenceDurationMs: value.silenceDurationMs ?? value.silence_duration_ms ?? defaultRealtimeTurnDetection.silenceDurationMs,
+    threshold: value.threshold ?? defaultRealtimeTurnDetection.threshold,
+    idleTimeoutMs: value.idleTimeoutMs ?? value.idle_timeout_ms ?? defaultRealtimeTurnDetection.idleTimeoutMs
+  };
 }
 
 function isVoicePermissionError(error: unknown) {
@@ -1694,11 +1733,21 @@ export function App() {
     }
     responseActiveRef.current = true;
     responsePendingRef.current = false;
-    requestResponse();
+    try {
+      requestResponse();
+    } catch (error) {
+      responseActiveRef.current = false;
+      responsePendingRef.current = false;
+      clearResponseWatchdog();
+      finishResponseTask();
+      setVoiceState("error");
+      setError(error instanceof Error ? error.message : "Realtime response request failed");
+      return false;
+    }
     scheduleResponseTask("AI处理中");
     startResponseWatchdog();
     return true;
-  }, [scheduleResponseTask, startResponseWatchdog]);
+  }, [clearResponseWatchdog, finishResponseTask, scheduleResponseTask, startResponseWatchdog]);
 
   useEffect(() => {
     requestRealtimeResponseRef.current = requestRealtimeResponse;
@@ -3230,6 +3279,9 @@ export function App() {
           return peer;
         }
       });
+      const realtimeTurnDetection = normalizeRealtimeTurnDetection(
+        bootstrap.audio.input?.turnDetection ?? bootstrap.audio.input?.turn_detection
+      );
       const session = new RealtimeSession(agent, {
         model: bootstrap.model,
         transport,
@@ -3239,7 +3291,8 @@ export function App() {
           parallelToolCalls: true,
           audio: {
             input: {
-              transcription: bootstrap.audio.input?.transcription ?? { model: bootstrap.settings.transcriptionModel, language: "zh" }
+              transcription: bootstrap.audio.input?.transcription ?? { model: bootstrap.settings.transcriptionModel, language: "zh" },
+              turnDetection: realtimeTurnDetection as any
             },
             output: { voice: bootstrap.audio.output?.voice ?? bootstrap.settings.realtimeVoice }
           }
@@ -3271,6 +3324,23 @@ export function App() {
         try {
           if (!String(message.type || "").endsWith(".delta")) {
             recordConversationDiagnostic("realtime_event", message);
+          }
+          if (message.type === "input_audio_buffer.speech_started") {
+            if (continuationNudgeTimerRef.current) window.clearTimeout(continuationNudgeTimerRef.current);
+            continuationNudgeTimerRef.current = null;
+            if (!responseActiveRef.current) {
+              setVoiceState("live");
+              setStatusText("正在听");
+            }
+          }
+          if (message.type === "input_audio_buffer.speech_stopped" || message.type === "input_audio_buffer.committed") {
+            if (!responseActiveRef.current) setStatusText("AI处理中");
+          }
+          if (message.type === "input_audio_buffer.timeout_triggered") {
+            if (!responseActiveRef.current) {
+              setStatusText("检测到停顿，正在回应");
+              window.setTimeout(() => requestRealtimeResponseRef.current(), 0);
+            }
           }
           if (message.type === "response.created") {
             if (continuationNudgeTimerRef.current) window.clearTimeout(continuationNudgeTimerRef.current);

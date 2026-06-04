@@ -3723,6 +3723,15 @@ function buildRealtimeSessionConfig(aiSettings) {
     tool_choice: "auto",
     audio: {
       input: {
+        turn_detection: {
+          type: "server_vad",
+          create_response: true,
+          interrupt_response: true,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 650,
+          threshold: 0.45,
+          idle_timeout_ms: 6000
+        },
         transcription: {
           model: aiSettings.transcriptionModel,
           language: "zh"

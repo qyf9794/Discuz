@@ -2476,6 +2476,18 @@ a.icon-button {
 }
 
 @media (max-width: 820px) {
+  :root {
+    --empty-topic-space: min(340px, calc(100vw - 64px));
+    --empty-topic-fan-size: min(300px, var(--empty-topic-space));
+    --empty-topic-card-width: clamp(112px, calc(100vw - 256px), 138px);
+    --empty-topic-card-spread: min(54px, 13vw);
+    --empty-topic-card-lift: 20px;
+    --empty-topic-card-bottom: 64px;
+    --empty-topic-label-offset: 138px;
+    --empty-topic-hover-center-lift: 28px;
+    --empty-topic-icon-size: 36px;
+  }
+
   html,
   body {
     min-height: 100%;
@@ -2618,7 +2630,56 @@ a.icon-button {
   }
 
   .topic-panel {
-    min-height: 66vh;
+    min-height: min(520px, 58dvh);
+  }
+
+  .topic-preview {
+    margin: 0 14px;
+  }
+
+  .topic-file-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    justify-content: stretch;
+    gap: 12px;
+    padding: 12px;
+  }
+
+  .topic-file-card {
+    width: 100%;
+    height: auto;
+    min-height: 0;
+    aspect-ratio: 150 / 230;
+    grid-template-rows: minmax(0, 1fr) auto;
+    gap: 8px;
+    padding: 8px;
+    border-radius: 16px;
+  }
+
+  .topic-card-preview {
+    aspect-ratio: auto;
+    border-radius: 12px;
+  }
+
+  .topic-file-card footer {
+    padding: 0 6px 2px;
+  }
+
+  .record-panel {
+    height: min(560px, 62dvh);
+    min-height: 360px;
+    max-height: min(560px, 62dvh);
+  }
+
+  .record-list {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+    margin: 0 14px 14px;
+    overflow: hidden;
+  }
+
+  .record-current,
+  .record-history {
+    min-height: 0;
   }
 }
 
@@ -2660,6 +2721,15 @@ a.icon-button {
 
   .resource-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .topic-file-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .record-panel {
+    height: min(520px, calc(100dvh - var(--bottom-discussion-safe-area) - 48px));
+    max-height: min(520px, calc(100dvh - var(--bottom-discussion-safe-area) - 48px));
   }
 
   .bottom-discussion-bar {
