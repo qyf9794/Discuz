@@ -5093,6 +5093,13 @@ const SettingsPopover = forwardRef<HTMLElement, {
           </button>
           {message && <span>{message}</span>}
         </div>
+        <p>
+          {settings.openaiApiKeySource === "local"
+            ? "当前优先使用设置页保存的 Key；清除本地 Key 后会回到 Render 的 OPENAI_API_KEY。"
+            : settings.openaiApiKeySource === "env"
+              ? "当前使用 Render 环境变量 OPENAI_API_KEY；在这里保存新 Key 会临时覆盖它。"
+              : "未配置 Key。Render 环境变量和这里保存的 Key 二选一即可。"}
+        </p>
       </section>
 
       <section className="settings-section ai-settings-section">

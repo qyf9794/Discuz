@@ -2509,6 +2509,56 @@ a.icon-button {
     grid-template-columns: minmax(0, 1fr);
   }
 
+  .settings-popover {
+    left: max(12px, env(safe-area-inset-left)) !important;
+    right: max(12px, env(safe-area-inset-right)) !important;
+    top: calc(12px + env(safe-area-inset-top)) !important;
+    bottom: calc(var(--bottom-discussion-safe-area) + 12px + env(safe-area-inset-bottom)) !important;
+    box-sizing: border-box;
+    width: auto;
+    max-width: none !important;
+    max-height: none !important;
+    padding: 16px;
+    overflow-x: hidden;
+    overflow-y: auto;
+    border-radius: 24px;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .settings-head {
+    position: sticky;
+    top: -16px;
+    z-index: 2;
+    margin: -16px -16px 14px;
+    padding: 16px 16px 12px;
+    border-radius: 24px 24px 0 0;
+    background:
+      linear-gradient(145deg, rgba(255, 255, 255, 0.5), rgba(255, 255, 255, 0.2)),
+      rgba(224, 243, 252, 0.58);
+    backdrop-filter: blur(18px) saturate(1.1);
+    -webkit-backdrop-filter: blur(18px) saturate(1.1);
+  }
+
+  .ai-settings-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .api-key-row,
+  .device-row {
+    grid-template-columns: minmax(0, 1fr) 64px;
+  }
+
+  .settings-actions {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+
+  .glass-select-menu {
+    max-height: min(220px, 42dvh);
+  }
+
   .column-resizer,
   .row-resizer {
     display: none;
@@ -2573,6 +2623,22 @@ a.icon-button {
 
   .bottom-discussion-bar {
     height: var(--bottom-discussion-height);
+  }
+
+  .settings-popover {
+    left: max(10px, env(safe-area-inset-left)) !important;
+    right: max(10px, env(safe-area-inset-right)) !important;
+    top: calc(10px + env(safe-area-inset-top)) !important;
+    bottom: calc(var(--bottom-discussion-safe-area) + 10px + env(safe-area-inset-bottom)) !important;
+    padding: 14px;
+    border-radius: 22px;
+  }
+
+  .settings-head {
+    top: -14px;
+    margin: -14px -14px 12px;
+    padding: 14px 14px 11px;
+    border-radius: 22px 22px 0 0;
   }
 
   .discussion-text-form {
