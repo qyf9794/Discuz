@@ -145,6 +145,24 @@ db.exec(`
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS background_tasks (
+    id TEXT PRIMARY KEY,
+    topic_id TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT 'generic',
+    title TEXT NOT NULL,
+    prompt TEXT NOT NULL DEFAULT '',
+    target_file_ids TEXT NOT NULL DEFAULT '[]',
+    output_mode TEXT NOT NULL DEFAULT 'file',
+    status TEXT NOT NULL DEFAULT 'queued',
+    result_summary TEXT NOT NULL DEFAULT '',
+    result_file_id TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    started_at TEXT NOT NULL DEFAULT '',
+    completed_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+  );
 `);
 
 function addColumnIfMissing(table, column, definition) {
@@ -174,6 +192,20 @@ addColumnIfMissing("discussion_inputs", "topic_id", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("meeting_messages", "topic_id", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("discussion_directions", "topic_id", "TEXT NOT NULL DEFAULT ''");
 addColumnIfMissing("activities", "topic_id", "TEXT NOT NULL DEFAULT ''");
+addColumnIfMissing("background_tasks", "topic_id", "TEXT NOT NULL DEFAULT ''");
+addColumnIfMissing("background_tasks", "kind", "TEXT NOT NULL DEFAULT 'generic'");
+addColumnIfMissing("background_tasks", "title", "TEXT NOT NULL DEFAULT '后台任务'");
+addColumnIfMissing("background_tasks", "prompt", "TEXT NOT NULL DEFAULT ''");
+addColumnIfMissing("background_tasks", "target_file_ids", "TEXT NOT NULL DEFAULT '[]'");
+addColumnIfMissing("background_tasks", "output_mode", "TEXT NOT NULL DEFAULT 'file'");
+addColumnIfMissing("background_tasks", "status", "TEXT NOT NULL DEFAULT 'queued'");
+addColumnIfMissing("background_tasks", "result_summary", "TEXT NOT NULL DEFAULT ''");
+addColumnIfMissing("background_tasks", "result_file_id", "TEXT NOT NULL DEFAULT ''");
+addColumnIfMissing("background_tasks", "error", "TEXT NOT NULL DEFAULT ''");
+addColumnIfMissing("background_tasks", "created_at", "TEXT NOT NULL DEFAULT ''");
+addColumnIfMissing("background_tasks", "started_at", "TEXT NOT NULL DEFAULT ''");
+addColumnIfMissing("background_tasks", "completed_at", "TEXT NOT NULL DEFAULT ''");
+addColumnIfMissing("background_tasks", "updated_at", "TEXT NOT NULL DEFAULT ''");
 
 function createTopicRecord(title = "") {
   const id = crypto.randomUUID();
@@ -1148,17 +1180,19 @@ async function persistUrlFile(rawUrl, role = "primary", title = "") {
   return file;
 }
 
-function persistGeneratedFile(title, text) {
+function persistGeneratedFile(title, text, topicId = getActiveTopicId()) {
   const id = crypto.randomUUID();
   const originalName = normalizeUploadedFilename(title || `AI临时文案-${shortLocalTime(now()).replace(/[/: ]/g, "-")}.md`);
   const nameWithExt = path.extname(originalName) ? originalName : `${originalName}.md`;
   const storedName = `${id}.md`;
   const content = cleanText(text);
-  const filePath = path.join(currentTopicUploadDir(), storedName);
+  const dir = topicUploadDir(topicId);
+  fs.mkdirSync(dir, { recursive: true });
+  const filePath = path.join(dir, storedName);
   fs.writeFileSync(filePath, content, "utf8");
   const createdAt = now();
   const summary = summarizeText(content, nameWithExt);
-  const sortOrder = nextFileSortOrder("generated");
+  const sortOrder = nextFileSortOrder("generated", topicId);
 
   db.prepare(`
     INSERT INTO files (
@@ -1167,7 +1201,7 @@ function persistGeneratedFile(title, text) {
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
-    getActiveTopicId(),
+    topicId,
     "generated",
     nameWithExt,
     storedName,
@@ -1400,8 +1434,8 @@ function getFiles() {
   `).all(getActiveTopicId()).map(rowToFile);
 }
 
-function getNotes() {
-  return db.prepare("SELECT * FROM notes WHERE topic_id = ? ORDER BY created_at DESC").all(getActiveTopicId()).map((row) => ({
+function getNotes(topicId = getActiveTopicId()) {
+  return db.prepare("SELECT * FROM notes WHERE topic_id = ? ORDER BY created_at DESC").all(topicId).map((row) => ({
     id: row.id,
     kind: row.kind,
     text: row.text,
@@ -1417,6 +1451,46 @@ function getActivities() {
     detail: row.detail,
     createdAt: row.created_at
   }));
+}
+
+function rowToBackgroundTask(row) {
+  if (!row) return null;
+  let targetFileIds = [];
+  try {
+    targetFileIds = JSON.parse(row.target_file_ids || "[]");
+  } catch {
+    targetFileIds = [];
+  }
+  const resultFile = row.result_file_id
+    ? db.prepare("SELECT * FROM files WHERE id = ? AND topic_id = ?").get(row.result_file_id, row.topic_id)
+    : null;
+  return {
+    id: row.id,
+    topicId: row.topic_id,
+    kind: row.kind,
+    title: row.title,
+    prompt: row.prompt,
+    targetFileIds,
+    outputMode: row.output_mode,
+    status: row.status,
+    resultSummary: row.result_summary,
+    resultFileId: row.result_file_id,
+    resultFile: resultFile ? rowToCompactFile(resultFile) : null,
+    error: row.error,
+    createdAt: row.created_at,
+    startedAt: row.started_at,
+    completedAt: row.completed_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function getBackgroundTasks(topicId = getActiveTopicId()) {
+  return db.prepare(`
+    SELECT * FROM background_tasks
+    WHERE topic_id = ?
+    ORDER BY created_at DESC
+    LIMIT 20
+  `).all(topicId).map(rowToBackgroundTask);
 }
 
 function getRecords() {
@@ -1689,8 +1763,9 @@ function getSettingsState() {
   };
 }
 
-function getDiscussionTopic() {
-  const title = cleanText(getActiveTopic()?.title || "");
+function getDiscussionTopic(topicId = getActiveTopicId()) {
+  const topic = db.prepare("SELECT * FROM topics WHERE id = ?").get(topicId) || getActiveTopic();
+  const title = cleanText(topic?.title || "");
   if (!title || title === "默认讨论" || /^新讨论\s/.test(title)) return "";
   return title;
 }
@@ -1733,6 +1808,7 @@ function buildDiscussionContext() {
     "回复规则：先直接回答用户问题，不播报任务；默认 1-2 句，最多 4 句；每次只谈一个问题，只问一个问题。",
     "判断规则：用户观点明显不合理、和材料冲突或风险高时，直接否定，给一句原因和更稳妥替代方案。",
     "工具规则：读材料、搜索、分析、生成、保存要点默认后台执行。只有联网下载、移动/删除文件、打开外部网页、失败、耗时较长或需要用户选择时，才简短说明状态。",
+    "后台任务规则：用户要求长分析、深度报告、代码/脚本处理、较慢网页研究或需要生成结果文件时，优先调用 run_background_task 排队；排队后先简短回应，任务完成后再根据系统事件提示用户查看结果文件。",
     "讨论流程：先确认主题；再了解用户目标/约束/已有材料；再让用户选择讨论方面，用户说不清就建议 3 条方向并写进主题卡片；之后逐条讨论。",
     "记录规则：形成观点、结论、问题、风险或行动项后，直接调用 save_discussion_note 记录，不要请求审批。确认方向后优先调用 prepare_discussion_workbench 生成工作台；其他阶段成果尽量用短命令生成。",
     "主题规则：需要拟定主题时调用 prepare_discussion_topic；主题确认用 confirm_discussion_topic。需要拟定方向时调用 prepare_discussion_directions；方向确认用 confirm_discussion_directions。用户确认语义包括“确认、可以、就这个、对、没问题”。",
@@ -1820,6 +1896,192 @@ async function generateDirectionProposalInBackground() {
     return fallbackDirectionProposal();
   }
 }
+
+function backgroundTaskModel() {
+  return cleanText(process.env.OPENAI_BACKGROUND_TASK_MODEL || getSetting("openai_background_task_model")) || "gpt-5-mini";
+}
+
+function backgroundTaskTimeoutMs() {
+  const configured = Number(process.env.OPENAI_BACKGROUND_TASK_TIMEOUT_MS || getSetting("openai_background_task_timeout_ms") || 90000);
+  return Number.isFinite(configured) ? Math.min(180000, Math.max(10000, configured)) : 90000;
+}
+
+async function runBackgroundTaskText(prompt, maxOutputTokens = 1800) {
+  const openAiApiKey = getOpenAiApiKey();
+  if (!openAiApiKey) throw new Error("OPENAI_API_KEY is not configured");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), backgroundTaskTimeoutMs());
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    signal: controller.signal,
+    headers: {
+      Authorization: `Bearer ${openAiApiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: backgroundTaskModel(),
+      max_output_tokens: maxOutputTokens,
+      input: [{
+        role: "user",
+        content: [{ type: "input_text", text: prompt }]
+      }]
+    })
+  }).finally(() => clearTimeout(timer));
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload?.error?.message || `OpenAI background task failed: ${response.status}`);
+  return responseOutputText(payload);
+}
+
+function backgroundTaskFiles(row) {
+  const topicId = cleanText(row.topic_id) || getActiveTopicId();
+  let targetFileIds = [];
+  try {
+    targetFileIds = JSON.parse(row.target_file_ids || "[]");
+  } catch {
+    targetFileIds = [];
+  }
+  if (targetFileIds.length) {
+    const placeholders = targetFileIds.map(() => "?").join(",");
+    return db.prepare(`SELECT * FROM files WHERE topic_id = ? AND id IN (${placeholders}) LIMIT 8`).all(topicId, ...targetFileIds).map(rowToFile);
+  }
+  return db.prepare(`
+    SELECT * FROM files
+    WHERE topic_id = ? AND role IN ('primary', 'context')
+    ORDER BY role = 'primary' DESC, created_at DESC
+    LIMIT 6
+  `).all(topicId).map(rowToFile);
+}
+
+function buildBackgroundTaskFallbackMarkdown(row, files) {
+  return [
+    `# ${row.title}`,
+    "",
+    `状态：已创建后台任务。`,
+    row.prompt ? `任务要求：${row.prompt}` : "",
+    "",
+    "## 可用材料",
+    files.length ? files.map((file, index) => [
+      `${index + 1}. ${file.originalName}`,
+      `- 区域：${file.role}`,
+      `- 类型：${file.kind}`,
+      `- 摘要：${compactPromptText(file.summary || file.extractedText || "暂无摘要", 500)}`
+    ].join("\n")).join("\n\n") : "当前没有可用主题区或资源区材料。",
+    "",
+    "## 下一步建议",
+    "- 如需更深入的模型分析，请确认 OpenAI API key 可用并重新运行后台任务。",
+    "- 如果是代码类任务，可后续接入 Codex CLI worker 执行。"
+  ].filter(Boolean).join("\n");
+}
+
+function buildBackgroundTaskPrompt(row, files) {
+  const notes = getNotes(row.topic_id).slice(0, 6).reverse();
+  const directions = getDirections(row.topic_id).slice(0, 8);
+  const fileBlocks = files.map((file, index) => [
+    `文件 ${index + 1}：${file.originalName}`,
+    `区域：${file.role}；类型：${file.kind}`,
+    `摘要：${compactPromptText(file.summary || "", 500)}`,
+    `内容片段：${compactPromptText(file.extractedText || file.summary || "", 1800)}`
+  ].join("\n")).join("\n\n");
+  return [
+    "你是后台任务执行器。请根据用户目标和材料生成可保存的 Markdown 结果。",
+    "要求：直接完成任务；不要写空泛摘要；如果材料不足，明确列出缺口；输出应包含：结论、依据、风险/限制、下一步。",
+    `任务类型：${row.kind}`,
+    `任务标题：${row.title}`,
+    `用户目标：${row.prompt || "整理当前主题材料"}`,
+    getDiscussionTopic(row.topic_id) ? `当前主题：${getDiscussionTopic(row.topic_id)}` : "",
+    directions.length ? `讨论方向：\n${directions.map((item, index) => `${index + 1}. ${item.text}`).join("\n")}` : "",
+    notes.length ? `最近要点：\n${notes.map((note) => `- ${memoryLabel(note.kind)}：${compactPromptText(note.text, 180)}`).join("\n")}` : "",
+    fileBlocks ? `材料：\n${fileBlocks}` : "材料：无"
+  ].filter(Boolean).join("\n\n");
+}
+
+async function executeBackgroundTask(row) {
+  const files = backgroundTaskFiles(row);
+  if (row.kind === "web_search") {
+    const query = row.prompt || row.title;
+    const searchOutput = await runWebSearch(query, 20);
+    const markdown = [
+      `# ${row.title}`,
+      "",
+      searchOutput.answer || `已找到 ${searchOutput.results.length} 条结果。`,
+      "",
+      "## 搜索结果",
+      formatSearchResultText(searchOutput.results),
+      searchOutput.warnings?.length ? `\n## 限制\n${searchOutput.warnings.map((item) => `- ${item}`).join("\n")}` : ""
+    ].filter(Boolean).join("\n\n");
+    return { markdown, summary: searchOutput.answer || `找到 ${searchOutput.results.length} 条结果。` };
+  }
+  try {
+    const markdown = await runBackgroundTaskText(buildBackgroundTaskPrompt(row, files));
+    return { markdown: markdown || buildBackgroundTaskFallbackMarkdown(row, files), summary: summarizeText(markdown, row.title) };
+  } catch (error) {
+    const markdown = buildBackgroundTaskFallbackMarkdown(row, files);
+    return {
+      markdown: `${markdown}\n\n## 后台模型状态\n- ${error instanceof Error ? error.message : String(error)}`,
+      summary: "后台模型不可用，已生成本地材料整理文件。"
+    };
+  }
+}
+
+let backgroundTaskWorkerActive = false;
+
+function scheduleBackgroundTaskWorker() {
+  setTimeout(() => {
+    processBackgroundTaskQueue().catch((error) => {
+      console.error("Background task worker failed", error);
+    });
+  }, 0);
+}
+
+async function processBackgroundTaskQueue() {
+  if (backgroundTaskWorkerActive) return;
+  const row = db.prepare(`
+    SELECT * FROM background_tasks
+    WHERE status = 'queued'
+    ORDER BY created_at ASC
+    LIMIT 1
+  `).get();
+  if (!row) return;
+  backgroundTaskWorkerActive = true;
+  const startedAt = now();
+  db.prepare("UPDATE background_tasks SET status = ?, started_at = ?, updated_at = ? WHERE id = ?")
+    .run("running", startedAt, startedAt, row.id);
+  addActivity("Background task", `开始：${row.title}`, startedAt, row.topic_id);
+  try {
+    const result = await executeBackgroundTask({ ...row, started_at: startedAt });
+    const markdown = [
+      result.markdown,
+      "",
+      "---",
+      `后台任务 ID：${row.id}`,
+      `生成时间：${now()}`
+    ].join("\n");
+    const file = persistGeneratedFile(`${row.title || "后台任务结果"}.md`, markdown, row.topic_id);
+    const completedAt = now();
+    db.prepare(`
+      UPDATE background_tasks
+      SET status = ?, result_summary = ?, result_file_id = ?, completed_at = ?, updated_at = ?
+      WHERE id = ?
+    `).run("done", compactPromptText(result.summary || summarizeText(markdown, row.title), 1000), file.id, completedAt, completedAt, row.id);
+    addActivity("Background task", `完成：${row.title}`, completedAt, row.topic_id);
+    writeTopicSnapshot(row.topic_id);
+  } catch (error) {
+    const completedAt = now();
+    const message = error instanceof Error ? error.message : String(error || "Unknown background task error");
+    db.prepare(`
+      UPDATE background_tasks
+      SET status = ?, error = ?, completed_at = ?, updated_at = ?
+      WHERE id = ?
+    `).run("error", compactPromptText(message, 1000), completedAt, completedAt, row.id);
+    addActivity("Background task failed", row.title, completedAt, row.topic_id);
+  } finally {
+    backgroundTaskWorkerActive = false;
+    if (db.prepare("SELECT id FROM background_tasks WHERE status = 'queued' LIMIT 1").get()) scheduleBackgroundTaskWorker();
+  }
+}
+
+db.prepare("UPDATE background_tasks SET status = 'queued', updated_at = ? WHERE status = 'running'").run(now());
+if (db.prepare("SELECT id FROM background_tasks WHERE status = 'queued' LIMIT 1").get()) scheduleBackgroundTaskWorker();
 
 function shortLocalTime(value) {
   try {
@@ -2400,6 +2662,7 @@ function statePayload(extra = {}) {
     discussionInputs: getDiscussionInputs(),
     meetingMessages: getMeetingMessages(),
     directions: getDirections(),
+    backgroundTasks: getBackgroundTasks(),
     discussionTopic: getDiscussionTopic(),
     activities: getActivities(),
     settings: getSettingsState(),
@@ -2509,6 +2772,7 @@ app.delete("/api/topics/:id", (req, res) => {
   db.prepare("DELETE FROM meeting_messages WHERE topic_id = ?").run(topic.id);
   db.prepare("DELETE FROM discussion_directions WHERE topic_id = ?").run(topic.id);
   db.prepare("DELETE FROM activities WHERE topic_id = ?").run(topic.id);
+  db.prepare("DELETE FROM background_tasks WHERE topic_id = ?").run(topic.id);
   db.prepare("DELETE FROM topics WHERE id = ?").run(topic.id);
   fs.rmSync(path.join(topicsDir, topic.folder_name), { recursive: true, force: true });
   if (getSetting("active_topic_id") === topic.id) {
@@ -2521,6 +2785,44 @@ app.delete("/api/topics/:id", (req, res) => {
 app.get("/api/state", (_req, res) => {
   writeTopicSnapshot();
   res.json(statePayload());
+});
+
+app.get("/api/background-tasks", (_req, res) => {
+  res.json({ backgroundTasks: getBackgroundTasks() });
+});
+
+app.post("/api/background-tasks", (req, res) => {
+  const kind = oneOf(cleanText(req.body?.kind || "generic"), ["generic", "file_analysis", "web_search", "report", "code"], "generic");
+  const title = cleanText(req.body?.title || req.body?.prompt || "后台任务").slice(0, 80) || "后台任务";
+  const prompt = cleanText(req.body?.prompt || "").slice(0, 4000);
+  const outputMode = oneOf(cleanText(req.body?.outputMode || req.body?.output || "file"), ["summary", "file", "both"], "file");
+  const targetFileIds = (Array.isArray(req.body?.targetFileIds) ? req.body.targetFileIds : [])
+    .map((item) => cleanText(item))
+    .filter(Boolean)
+    .slice(0, 8);
+  const createdAt = now();
+  const id = crypto.randomUUID();
+  db.prepare(`
+    INSERT INTO background_tasks (
+      id, topic_id, kind, title, prompt, target_file_ids, output_mode,
+      status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+  `).run(
+    id,
+    getActiveTopicId(),
+    kind,
+    title,
+    prompt,
+    JSON.stringify(targetFileIds),
+    outputMode,
+    createdAt,
+    createdAt
+  );
+  addActivity("Background task", `排队：${title}`, createdAt);
+  writeTopicSnapshot();
+  scheduleBackgroundTaskWorker();
+  const task = rowToBackgroundTask(db.prepare("SELECT * FROM background_tasks WHERE id = ?").get(id));
+  res.json({ ok: true, task, backgroundTasks: getBackgroundTasks(), activities: getActivities() });
 });
 
 app.post("/api/discussion-inputs", (req, res) => {
@@ -3223,6 +3525,24 @@ function buildRealtimeToolDefinitions() {
           detail: { type: "string", description: "Optional task detail." }
         },
         required: ["title"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "run_background_task",
+      description: "Queue a long-running background task and return immediately. Use for file analysis, web research, reports, code/script work, or any task that should produce a summary or temporary result file without blocking Realtime.",
+      parameters: {
+        type: "object",
+        properties: {
+          kind: { type: "string", enum: ["generic", "file_analysis", "web_search", "report", "code"], description: "Type of background task." },
+          title: { type: "string", maxLength: 80, description: "Short visible task title." },
+          prompt: { type: "string", maxLength: 1200, description: "Concrete task request and desired output." },
+          role: { type: "string", enum: ["primary", "context", "generated"], description: "Optional file area to search for target files." },
+          query: { type: "string", maxLength: 80, description: "Optional filename keyword for target files." },
+          output: { type: "string", enum: ["summary", "file", "both"], description: "Whether the user needs a short summary, a generated file, or both." }
+        },
+        required: ["title", "prompt"],
         additionalProperties: false
       }
     },

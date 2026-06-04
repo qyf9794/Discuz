@@ -77,6 +77,32 @@ export type DiscussionDirection = {
   updatedAt: string;
 };
 
+export type BackgroundTask = {
+  id: string;
+  topicId: string;
+  kind: "generic" | "file_analysis" | "web_search" | "report" | "code";
+  title: string;
+  prompt: string;
+  targetFileIds: string[];
+  outputMode: "summary" | "file" | "both";
+  status: "queued" | "running" | "done" | "error";
+  resultSummary: string;
+  resultFileId: string;
+  resultFile?: {
+    id: string;
+    name: string;
+    role: DiscuzFile["role"];
+    kind: DiscuzFile["kind"];
+    summary: string;
+    previewUrl: string;
+  } | null;
+  error: string;
+  createdAt: string;
+  startedAt: string;
+  completedAt: string;
+  updatedAt: string;
+};
+
 export type AiSettings = {
   assistantName: string;
   realtimeModel: string;
@@ -112,6 +138,7 @@ export type AppState = {
   discussionInputs: DiscussionInput[];
   meetingMessages: MeetingMessage[];
   directions: DiscussionDirection[];
+  backgroundTasks: BackgroundTask[];
   discussionTopic: string;
   activeTopicId: string;
   topics: DiscussionTopic[];

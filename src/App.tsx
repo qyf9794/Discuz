@@ -34,6 +34,7 @@ const emptyState: AppState = {
   discussionInputs: [],
   meetingMessages: [],
   directions: [],
+  backgroundTasks: [],
   discussionTopic: "",
   activeTopicId: "",
   topics: [],
@@ -326,6 +327,7 @@ function toolCallLabel(name = "任务") {
     set_ambient_mode: "设置氛围模式",
     show_tool_activity: "查看工具活动",
     cancel_current_task: "取消当前任务",
+    run_background_task: "加入后台任务",
     edit_spreadsheet_file: "编辑表格请求",
     create_outline: "生成大纲",
     compare_files: "比较文件",
@@ -791,6 +793,8 @@ export function App() {
   const conversationDiagnosticPendingRef = useRef<ConversationDiagnosticEvent[]>([]);
   const conversationDiagnosticFlushTimerRef = useRef<number | null>(null);
   const lastRecordedMeetingMessageIdRef = useRef<string | null>(null);
+  const backgroundTaskNotificationReadyRef = useRef(false);
+  const notifiedBackgroundTaskIdsRef = useRef<Set<string>>(new Set());
 
   const flushConversationDiagnostics = useCallback(async () => {
     if (!isConversationRecorderEnabled()) return;
@@ -848,9 +852,21 @@ export function App() {
     })),
     [parsingFiles]
   );
+  const activeBackgroundTasks = useMemo(
+    () => (state.backgroundTasks ?? []).filter((task) => task.status === "queued" || task.status === "running"),
+    [state.backgroundTasks]
+  );
+  const backgroundQueueTasks = useMemo<TaskItem[]>(
+    () => activeBackgroundTasks.map((task) => ({
+      id: `background-${task.id}`,
+      label: task.status === "queued" ? `后台排队：${task.title}` : `后台执行：${task.title}`,
+      startedAt: task.startedAt || task.createdAt
+    })),
+    [activeBackgroundTasks]
+  );
   const visibleTasks = useMemo(
-    () => [...backgroundParsingTasks, ...pendingTasks],
-    [backgroundParsingTasks, pendingTasks]
+    () => [...backgroundParsingTasks, ...backgroundQueueTasks, ...pendingTasks],
+    [backgroundParsingTasks, backgroundQueueTasks, pendingTasks]
   );
   useEffect(() => {
     statusTextRef.current = statusText;
@@ -1016,12 +1032,12 @@ export function App() {
   }, [loadState]);
 
   useEffect(() => {
-    if (!hasParsingFiles) return;
+    if (!hasParsingFiles && !activeBackgroundTasks.length) return;
     const timer = window.setInterval(() => {
       loadState().catch((err) => setError(err.message));
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [hasParsingFiles, loadState]);
+  }, [activeBackgroundTasks.length, hasParsingFiles, loadState]);
 
   useEffect(() => {
     if (parsingFiles.length) {
@@ -1535,7 +1551,7 @@ export function App() {
     }
     const importantKeys = [
       "ok", "opened", "generated", "downloaded", "saved", "copied", "moved", "added", "updated",
-      "prepared", "confirmed", "count", "title", "ambientMode", "cancelled", "ending", "next"
+      "queued", "taskId", "status", "prepared", "confirmed", "count", "title", "ambientMode", "cancelled", "ending", "next"
     ];
     const output: Record<string, unknown> = {};
     importantKeys.forEach((key) => {
@@ -1916,6 +1932,31 @@ export function App() {
     session.sendMessage(text);
     return true;
   };
+
+  useEffect(() => {
+    const backgroundTasks = state.backgroundTasks ?? [];
+    if (!backgroundTaskNotificationReadyRef.current) {
+      backgroundTasks.forEach((task) => {
+        if (task.status === "done" || task.status === "error") notifiedBackgroundTaskIdsRef.current.add(task.id);
+      });
+      backgroundTaskNotificationReadyRef.current = true;
+      return;
+    }
+    backgroundTasks.forEach((task) => {
+      if (task.status !== "done" && task.status !== "error") return;
+      if (notifiedBackgroundTaskIdsRef.current.has(task.id)) return;
+      notifiedBackgroundTaskIdsRef.current.add(task.id);
+      setStatusText(task.status === "done" ? `后台任务完成：${task.title}` : `后台任务失败：${task.title}`);
+      const resultLine = task.status === "done"
+        ? `结果文件：${task.resultFile?.name || task.resultFileId || "已生成"}；摘要：${compactText(task.resultSummary || "", 500)}`
+        : `错误：${compactText(task.error || "后台任务失败", 400)}`;
+      sendRealtimeSystemEvent([
+        `系统事件：后台任务“${task.title}”${task.status === "done" ? "已完成" : "失败"}。`,
+        resultLine,
+        "请用一句话告诉用户结果已准备好；如果有结果文件，提示用户可以在 AI 临时文件区查看。"
+      ].join("\n\n"));
+    });
+  }, [state.backgroundTasks]);
 
   const flushRealtimeResponse = useCallback(() => {
     if (!responsePendingRef.current) return;
@@ -2497,6 +2538,14 @@ export function App() {
           meetingMessages: state.meetingMessages.slice(-8).map((message) => ({ ...message, text: compactText(message.text, 180) })),
           records: state.records.slice(-3).map((record) => ({ id: record.id, title: record.title, noteCount: record.noteCount, startedAt: record.startedAt, endedAt: record.endedAt })),
           pendingTasks: pendingTasks.map((task) => ({ id: task.id, label: task.label })),
+          backgroundTasks: (state.backgroundTasks ?? []).slice(0, 8).map((task) => ({
+            id: task.id,
+            title: compactText(task.title, 100),
+            kind: task.kind,
+            status: task.status,
+            resultFile: task.resultFile ? { id: task.resultFile.id, name: task.resultFile.name } : null,
+            error: compactText(task.error || "", 160)
+          })),
           statusText,
           foreground: { activeTool, previewFile: previewFile ? fileBrief(previewFile) : null, webPreview },
           governance: {
@@ -2533,6 +2582,44 @@ export function App() {
           createdAt: new Date().toISOString()
         }]);
         output = { ok: true, queued: title, detail };
+      }
+      if (name === "run_background_task") {
+        const kind = ["generic", "file_analysis", "web_search", "report", "code"].includes(args.kind) ? args.kind : "generic";
+        const role = args.role === "primary" || args.role === "context" || args.role === "generated" ? args.role as DiscuzFile["role"] : undefined;
+        const queryText = String(args.query || "").trim().toLowerCase();
+        const targetFileIds = state.files
+          .filter((file) => {
+            const roleMatches = !role || file.role === role;
+            const nameMatches = !queryText || file.originalName.toLowerCase().includes(queryText);
+            return roleMatches && nameMatches;
+          })
+          .slice(0, 8)
+          .map((file) => file.id);
+        const response = await fetch("/api/background-tasks", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            kind,
+            title: compactText(String(args.title || "后台任务").trim(), 80),
+            prompt: compactText(String(args.prompt || "").trim(), 1200),
+            outputMode: args.output === "summary" || args.output === "both" ? args.output : "file",
+            targetFileIds
+          })
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || "Unable to queue background task.");
+        setState((current) => ({
+          ...current,
+          backgroundTasks: payload.backgroundTasks ?? current.backgroundTasks,
+          activities: payload.activities ?? current.activities
+        }));
+        output = {
+          ok: true,
+          queued: payload.task?.title || args.title || "后台任务",
+          taskId: payload.task?.id,
+          status: payload.task?.status || "queued",
+          next: "后台任务已排队。完成后会在 AI 临时文件区生成结果文件。"
+        };
       }
       if (name === "start_break") {
         const minutes = Math.max(1, Math.min(30, Number(args.minutes || args.durationMinutes || 5)));
