@@ -41,9 +41,9 @@ const aiSettingsDefaults = {
   transcriptionModel: "gpt-4o-transcribe",
   imageModel: defaultImageGenerationModel,
   imageQuality: "high",
-  webSearchProviders: "brave,bing,google,serpapi,tavily,duckduckgo,wikipedia"
+  webSearchProviders: "openai,brave,bing,google,serpapi,tavily,duckduckgo,wikipedia"
 };
-const webSearchProviders = ["brave", "bing", "google", "serpapi", "tavily", "duckduckgo", "wikipedia"];
+const webSearchProviders = ["openai", "brave", "bing", "google", "serpapi", "tavily", "duckduckgo", "wikipedia"];
 const webSearchSecretSettings = {
   brave: { setting: "web_search_brave_api_key", env: ["BRAVE_SEARCH_API_KEY"] },
   bing: { setting: "web_search_bing_api_key", env: ["BING_SEARCH_API_KEY"] },
@@ -1737,6 +1737,7 @@ function buildDiscussionContext() {
     "记录规则：形成观点、结论、问题、风险或行动项后，直接调用 save_discussion_note 记录，不要请求审批。确认方向后优先调用 prepare_discussion_workbench 生成工作台；其他阶段成果尽量用短命令生成。",
     "主题规则：需要拟定主题时调用 prepare_discussion_topic；主题确认用 confirm_discussion_topic。需要拟定方向时调用 prepare_discussion_directions；方向确认用 confirm_discussion_directions。用户确认语义包括“确认、可以、就这个、对、没问题”。",
     "材料规则：下面只给压缩摘要。需要精确内容时，调用 get_discussion_state、search_context 或对应 analyze_* 工具；图片问题优先 analyze_image_file，Office 文件优先对应 analyze_* 工具。引用时说来源文件名或网页标题。",
+    "联网规则：用户有明确具体的联网需求时，结果必须贴合需求组织。用户要赛程、日程、清单、价格、步骤、名单、对比或“全部”时，调用 web_search 后按返回 cards 逐项回答，不要只给摘要；卡片不足时说明缺口并给来源。",
     "文件规则：不要直接改主题区或资源区原件；需要修改先 copy_file_to_generated。用户要求移动/复制/打开/下载文件时用对应工具完成。",
     "媒体规则：氛围模式调用 set_ambient_mode；用户给媒体链接时 open_media_url；不要编造受版权限制的播放源。",
     "系统事件规则：主题文件添加/删除时，只用 1 句问用户下一步怎么讨论；不要自动改主题或生成方向，除非用户明确要求。",
@@ -1868,14 +1869,18 @@ function officialWebSearchFallbackResults(query) {
   ];
 }
 
-function mergeSearchResults(...groups) {
+function mergeSearchResultsWithLimit(limit, ...groups) {
   const seen = new Set();
   return groups.flat().filter((item) => {
     const url = cleanText(item?.url);
     if (!url || seen.has(url)) return false;
     seen.add(url);
     return true;
-  }).slice(0, 10);
+  }).slice(0, limit);
+}
+
+function mergeSearchResults(...groups) {
+  return mergeSearchResultsWithLimit(10, ...groups);
 }
 
 function formatSearchResultText(results) {
@@ -1884,6 +1889,12 @@ function formatSearchResultText(results) {
     `${index + 1}. ${cleanText(result.title) || "Untitled"}`,
     `URL: ${cleanText(result.url)}`,
     result.snippet ? `摘要: ${cleanText(result.snippet)}` : "",
+    result.details?.date ? `日期: ${cleanText(result.details.date)}` : "",
+    result.details?.time ? `时间: ${cleanText(result.details.time)}` : "",
+    result.details?.venue ? `地点: ${cleanText(result.details.venue)}` : "",
+    result.details?.teams ? `对阵/对象: ${cleanText(Array.isArray(result.details.teams) ? result.details.teams.join(" vs ") : result.details.teams)}` : "",
+    result.details?.status ? `状态: ${cleanText(result.details.status)}` : "",
+    result.details?.notes ? `备注: ${cleanText(result.details.notes)}` : "",
     result.source ? `来源: ${cleanText(result.source)}` : ""
   ].filter(Boolean).join("\n")).join("\n\n");
 }
@@ -1930,16 +1941,17 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
 function searchLimit(value) {
   const limit = Number(value || 8);
   if (!Number.isFinite(limit)) return 8;
-  return Math.max(1, Math.min(10, Math.round(limit)));
+  return Math.max(1, Math.min(25, Math.round(limit)));
 }
 
-function providerResult(title, url, snippet = "", source = "web") {
+function providerResult(title, url, snippet = "", source = "web", details = undefined) {
   try {
     return {
       title: cleanText(title) || new URL(url).hostname,
       url: normalizeWebUrl(url),
       snippet: cleanText(snippet),
-      source
+      source,
+      details: details && typeof details === "object" ? details : undefined
     };
   } catch {
     return null;
@@ -1948,7 +1960,7 @@ function providerResult(title, url, snippet = "", source = "web") {
 
 function normalizeSearchResults(results, limit = 8) {
   return results
-    .map((item) => providerResult(item?.title, item?.url, item?.snippet, item?.source))
+    .map((item) => providerResult(item?.title, item?.url, item?.snippet, item?.source, item?.details))
     .filter(Boolean)
     .slice(0, limit);
 }
@@ -2112,7 +2124,152 @@ async function wikipediaSearch(query, limit) {
   };
 }
 
+function openAiWebSearchModel() {
+  return cleanText(process.env.OPENAI_WEB_SEARCH_MODEL || getSetting("openai_web_search_model")) || "gpt-5-mini";
+}
+
+function openAiWebSearchContextSize() {
+  return oneOf(
+    process.env.OPENAI_WEB_SEARCH_CONTEXT_SIZE || getSetting("openai_web_search_context_size"),
+    ["low", "medium", "high"],
+    "low"
+  );
+}
+
+function openAiWebSearchTimeoutMs() {
+  const configured = Number(process.env.OPENAI_WEB_SEARCH_TIMEOUT_MS || getSetting("openai_web_search_timeout_ms") || 60000);
+  return Number.isFinite(configured) ? Math.min(120000, Math.max(5000, configured)) : 60000;
+}
+
+function isStructuredWebQuery(query) {
+  return /全部|完整|所有|列表|清单|日程|赛程|赛果|比赛|行程|安排|名单|名录|价格|报价|费用|步骤|流程|对比|比较|排名|schedule|fixture|fixtures|calendar|timetable|all|full list|matches|price|pricing|cost|steps|compare|comparison|ranking/i.test(query);
+}
+
+function parseJsonObjectFromText(text) {
+  const raw = cleanText(text);
+  if (!raw) return null;
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
+  const candidate = fenced || raw.match(/\{[\s\S]*}/)?.[0] || raw;
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    return null;
+  }
+}
+
+function responseUrlCitations(payload) {
+  const citations = [];
+  const seen = new Set();
+  const add = (item) => {
+    const url = cleanText(item?.url);
+    if (!url || seen.has(url)) return;
+    try {
+      const normalized = normalizeWebUrl(url);
+      seen.add(normalized);
+      citations.push({
+        title: cleanText(item?.title) || new URL(normalized).hostname,
+        url: normalized,
+        snippet: cleanText(item?.snippet || item?.text || ""),
+        source: "openai"
+      });
+    } catch {
+      // Ignore malformed model/tool URLs.
+    }
+  };
+  const visit = (value) => {
+    if (!value) return;
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    if (typeof value !== "object") return;
+    if (value.type === "url_citation" || value.url) add(value);
+    if (Array.isArray(value.annotations)) visit(value.annotations);
+    if (Array.isArray(value.sources)) visit(value.sources);
+    if (Array.isArray(value.content)) visit(value.content);
+    if (Array.isArray(value.output)) visit(value.output);
+    if (value.action) visit(value.action);
+  };
+  visit(payload?.output);
+  return citations;
+}
+
+function normalizeOpenAiCards(cards, citations, limit) {
+  const citationByUrl = new Map(citations.map((item) => [item.url, item]));
+  const normalized = (Array.isArray(cards) ? cards : []).map((card, index) => {
+    const url = cleanText(card?.url || card?.sourceUrl || card?.source_url || card?.citationUrl || card?.citation_url || citations[index]?.url || "");
+    const citation = citationByUrl.get(url) || citations[index] || {};
+    const details = {};
+    Object.entries({
+      date: card?.date,
+      time: card?.time,
+      venue: card?.venue,
+      teams: Array.isArray(card?.teams) ? card.teams.join(" vs ") : card?.teams,
+      opponent: card?.opponent,
+      status: card?.status,
+      category: card?.category,
+      notes: card?.notes
+    }).forEach(([key, value]) => {
+      const cleaned = cleanText(value);
+      if (cleaned) details[key] = cleaned;
+    });
+    return providerResult(
+      card?.title || card?.name || citation.title || `结果 ${index + 1}`,
+      url || citation.url,
+      card?.snippet || card?.summary || card?.description || citation.snippet || "",
+      "openai",
+      details
+    );
+  }).filter(Boolean);
+  return mergeSearchResultsWithLimit(limit, normalized, citations);
+}
+
+async function openAiWebSearch(query, limit) {
+  const openAiApiKey = getOpenAiApiKey();
+  if (!openAiApiKey) return { skipped: "OPENAI_API_KEY is not configured" };
+  const cardLimit = isStructuredWebQuery(query) ? Math.max(limit, 20) : limit;
+  const response = await fetchWithTimeout("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${openAiApiKey}`,
+      "Content-Type": "application/json",
+      "Accept": "application/json"
+    },
+    body: JSON.stringify({
+      model: openAiWebSearchModel(),
+      max_output_tokens: isStructuredWebQuery(query) ? 2200 : 1200,
+      tools: [{
+        type: "web_search",
+        search_context_size: openAiWebSearchContextSize()
+      }],
+      tool_choice: "auto",
+      include: ["web_search_call.action.sources"],
+      input: [
+        "请使用网页搜索回答用户问题，并返回严格 JSON，不要输出 Markdown。不要只写泛泛摘要，必须按照用户的具体需求整理结果。",
+        "JSON 格式：{\"answer\":\"面向用户的直接回答\",\"resultType\":\"schedule|list|answer|links\",\"cards\":[{\"title\":\"卡片标题\",\"url\":\"来源URL\",\"snippet\":\"与用户问题直接相关的信息\",\"date\":\"可选\",\"time\":\"可选\",\"venue\":\"可选\",\"teams\":\"可选\",\"status\":\"可选\",\"notes\":\"可选\"}]}。",
+        `最多返回 ${cardLimit} 张卡片。用户要日程、赛程、比赛、列表、清单、名单、价格、步骤、对比或“全部”时，必须把搜索结果能确认的条目逐项列成 cards，不要只给摘要。`,
+        "如果用户要比赛日程，每张 card 尽量对应一场比赛或一个明确日程项，并填写 date、time、venue、teams/status/notes。",
+        "每张卡片必须有可点击来源 URL；如果不能确认某条信息，不要编造。",
+        `用户问题：${query}`
+      ].join("\n")
+    })
+  }, openAiWebSearchTimeoutMs());
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload?.error?.message || `OpenAI web search returned ${response.status}`);
+  const text = responseOutputText(payload);
+  const parsed = parseJsonObjectFromText(text) || {};
+  const citations = responseUrlCitations(payload);
+  const results = normalizeOpenAiCards(parsed.cards, citations, cardLimit);
+  return {
+    answer: cleanText(parsed.answer || text || (results.length ? `已找到 ${results.length} 条相关结果，请按卡片查看。` : "")),
+    resultType: cleanText(parsed.resultType || (isStructuredWebQuery(query) ? "list" : "answer")),
+    cards: results,
+    results
+  };
+}
+
 async function runSearchProvider(provider, query, limit) {
+  if (provider === "openai") return openAiWebSearch(query, limit);
   if (provider === "brave") return braveSearch(query, limit);
   if (provider === "bing") return bingSearch(query, limit);
   if (provider === "google") return googleSearch(query, limit);
@@ -2126,12 +2283,15 @@ async function runSearchProvider(provider, query, limit) {
 async function runWebSearch(query, limit = 8) {
   const providers = [];
   const warnings = [];
+  const targetLimit = isStructuredWebQuery(query) ? Math.max(limit, 20) : limit;
   let results = [];
+  let answer = "";
+  let resultType = "";
   for (const provider of searchProviderOrder()) {
     const record = { provider, status: "running", count: 0 };
     providers.push(record);
     try {
-      const output = await runSearchProvider(provider, query, limit);
+      const output = await runSearchProvider(provider, query, targetLimit);
       if (output.skipped) {
         record.status = "skipped";
         record.message = output.skipped;
@@ -2139,15 +2299,17 @@ async function runWebSearch(query, limit = 8) {
       }
       record.status = "ok";
       record.count = output.results?.length || 0;
-      results = mergeSearchResults(results, output.results || []).slice(0, limit);
-      if (results.length >= Math.min(limit, 6)) break;
+      if (!answer && output.answer) answer = cleanText(output.answer);
+      if (!resultType && output.resultType) resultType = cleanText(output.resultType);
+      results = mergeSearchResultsWithLimit(targetLimit, results, output.cards || output.results || []);
+      if (results.length >= Math.min(targetLimit, isStructuredWebQuery(query) ? 12 : 6)) break;
     } catch (error) {
       record.status = "failed";
       record.message = error.message;
       warnings.push(`${provider}: ${error.message}`);
     }
   }
-  return { results, providers, warnings };
+  return { answer, resultType, cards: results, results, providers, warnings };
 }
 
 function extractHtmlTitle(html, fallbackUrl = "") {
@@ -2714,14 +2876,18 @@ app.get("/api/web/search", async (req, res) => {
   if (!query) return res.json({ query, results: [] });
   try {
     const limit = searchLimit(req.query.limit);
+    const targetLimit = isStructuredWebQuery(query) ? Math.max(limit, 20) : limit;
     const officialFallback = officialWebSearchFallbackResults(query);
     const searchOutput = await runWebSearch(query, limit);
-    const results = mergeSearchResults(officialFallback, searchOutput.results).slice(0, limit);
+    const results = mergeSearchResultsWithLimit(targetLimit, officialFallback, searchOutput.results);
     const resultText = formatSearchResultText(results);
     addActivity("Web", query, now());
     writeTopicSnapshot();
     res.json({
       query,
+      answer: searchOutput.answer || "",
+      resultType: searchOutput.resultType || (isStructuredWebQuery(query) ? "list" : "links"),
+      cards: results,
       results,
       resultText,
       count: results.length,
@@ -2733,6 +2899,9 @@ app.get("/api/web/search", async (req, res) => {
     res.json({
       error: results.length ? "" : error.message,
       query,
+      answer: "",
+      resultType: isStructuredWebQuery(query) ? "list" : "links",
+      cards: results,
       results,
       resultText: formatSearchResultText(results),
       count: results.length,
@@ -2872,12 +3041,12 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "web_search",
-      description: "Search the public web when local materials are insufficient. This returns candidate URLs and snippets; call read_web_page for facts that need page-level grounding.",
+      description: "Search the public web when local materials are insufficient. Returns structured result cards. If the user asks for schedules, lists, prices, steps, names, comparisons, or all items, answer from the cards item by item instead of giving only a summary.",
       parameters: {
         type: "object",
         properties: {
           query: { type: "string", description: "A focused web search query." },
-          limit: { type: "number", description: "Optional number of results to return, 1 to 10." }
+          limit: { type: "number", description: "Optional number of results/cards to return, 1 to 25." }
         },
         required: ["query"],
         additionalProperties: false

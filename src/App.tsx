@@ -49,7 +49,7 @@ const emptyState: AppState = {
       transcriptionModel: "gpt-4o-transcribe",
       imageModel: "gpt-image-1.5",
       imageQuality: "high",
-      webSearchProviders: "brave,bing,google,serpapi,tavily,duckduckgo,wikipedia"
+      webSearchProviders: "openai,brave,bing,google,serpapi,tavily,duckduckgo,wikipedia"
     }
   }
 };
@@ -1479,12 +1479,23 @@ export function App() {
       return { ok: true, query: result.query, results };
     }
     if (name === "web_search") {
-      const results = Array.isArray(result.results) ? result.results.slice(0, 4).map((item: any) => ({
+      const resultType = String(result.resultType || "");
+      const sourceItems = Array.isArray(result.cards) ? result.cards : Array.isArray(result.results) ? result.results : [];
+      const keepCount = /schedule|list|price|steps|compare|ranking|日程|赛程|比赛|列表|清单|价格|步骤|对比|排名/i.test(resultType) ? 20 : 6;
+      const cards = sourceItems.slice(0, keepCount).map((item: any) => ({
         title: compactText(String(item.title || ""), 120),
         url: String(item.url || ""),
-        snippet: compactText(String(item.snippet || ""), 180)
-      })) : [];
-      return { ok: true, count: result.count ?? results.length, results };
+        snippet: compactText(String(item.snippet || ""), 220),
+        details: item.details && typeof item.details === "object" ? item.details : undefined
+      }));
+      return {
+        ok: true,
+        resultType,
+        answer: compactText(String(result.answer || ""), 500),
+        count: result.count ?? cards.length,
+        cards,
+        results: cards
+      };
     }
     if (name === "read_web_page") {
       return {
@@ -5466,7 +5477,7 @@ const SettingsPopover = forwardRef<HTMLElement, {
             <input
               value={aiDraft.webSearchProviders}
               onChange={(event) => setAiDraft((draft) => ({ ...draft, webSearchProviders: event.target.value }))}
-              placeholder="brave,bing,google,serpapi,tavily,duckduckgo,wikipedia"
+              placeholder="openai,brave,bing,google,serpapi,tavily,duckduckgo,wikipedia"
             />
           </label>
         </div>
