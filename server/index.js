@@ -4420,7 +4420,7 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "update_generated_file",
-      description: "Replace the content of an editable AI temporary text/markdown file. Use when the user asks you to revise or edit a temporary document by voice.",
+      description: "Replace the full content of an editable AI temporary text/markdown file. Do not use this to add a discussion direction result; call complete_discussion_direction instead.",
       parameters: {
         type: "object",
         properties: {
@@ -4491,7 +4491,7 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "complete_discussion_direction",
-      description: "Mark one discussion direction as complete and record the completion in notes.",
+      description: "Mark one discussion direction as complete, record the note, and append or update that result in the discussion workbench. Prefer this over update_generated_file for direction results.",
       parameters: {
         type: "object",
         properties: {
@@ -4628,6 +4628,7 @@ const compactRealtimeTools = new Set([
   "cancel_current_task",
   "analyze_image_file",
   "save_discussion_note",
+  "complete_discussion_direction",
   "create_generated_file",
   "prepare_discussion_workbench",
   "copy_file_to_generated",
@@ -4660,7 +4661,7 @@ function buildRealtimeSessionConfig(aiSettings) {
     instructions: buildDiscussionContext(),
     tools: realtimeToolDefinitionsForSession(aiSettings),
     tool_choice: "auto",
-    max_output_tokens: 300,
+    max_output_tokens: 900,
     truncation: {
       type: "retention_ratio",
       retention_ratio: 0.7,

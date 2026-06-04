@@ -1939,6 +1939,41 @@ export function App() {
     }
   };
 
+  const directionOrdinalLabel = (index: number) => {
+    const labels = ["第一", "第二", "第三", "第四", "第五", "第六", "第七", "第八"];
+    return labels[index] || `第${index + 1}`;
+  };
+
+  const findDiscussionWorkbenchFile = () => {
+    const topicText = compactText((state.discussionTopic || state.topics.find((topic) => topic.active)?.title || "").trim(), 24);
+    const editable = (file: DiscuzFile) => file.role === "generated" && (file.kind === "markdown" || file.kind === "text");
+    const isWorkbench = (file: DiscuzFile) => /讨论工作台/.test(file.originalName) || /讨论工作台/.test(file.summary || file.extractedText || "");
+    if (generatedEditorFile && editable(generatedEditorFile) && isWorkbench(generatedEditorFile)) return generatedEditorFile;
+    return state.files.find((file) => editable(file) && isWorkbench(file))
+      ?? (topicText ? state.files.find((file) => editable(file) && file.originalName.includes(topicText)) : undefined);
+  };
+
+  const upsertDiscussionWorkbenchDirection = async (direction: DiscussionDirection, note = "") => {
+    const candidate = findDiscussionWorkbenchFile();
+    if (!candidate) return null;
+    const orderedDirections = [...state.directions].sort((first, second) => first.sortOrder - second.sortOrder);
+    const directionIndex = Math.max(0, orderedDirections.findIndex((item) => item.id === direction.id));
+    const label = directionOrdinalLabel(directionIndex);
+    const cleanNote = compactText(String(note || "").trim().replace(/^已形成(?:建议|要点|结论)?[:：]?\s*/u, ""), 500)
+      || "本方向已完成，后续可继续细化实施要点。";
+    const nextLine = `${label}方向（${compactText(direction.text, 120)}）建议：${cleanNote}`;
+    const currentText = String(candidate.extractedText || candidate.summary || "").trim() || buildDiscussionWorkbenchMarkdown();
+    const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = new RegExp(`${escapedLabel}方向（[^）]*）建议：[\\s\\S]*?(?=\\n\\n第[一二三四五六七八九十]+方向（|\\n\\n## |$)`, "u");
+    const nextText = pattern.test(currentText)
+      ? currentText.replace(pattern, nextLine)
+      : `${currentText.replace(/\s+$/u, "")}\n\n${nextLine}`;
+    await updateGeneratedFile(candidate, nextText);
+    setGeneratedEditorId(candidate.id);
+    setWebPreview(null);
+    return candidate;
+  };
+
   const promoteFileToPrimary = async (file: DiscuzFile, requireConfirm = false) => {
     if (file.role === "primary") return file;
     if (requireConfirm && !window.confirm(`将“${file.originalName}”确认为成果并存入讨论主题？`)) return null;
@@ -2123,7 +2158,7 @@ export function App() {
     const recentHistory = history.slice(-12);
     const preservedSystem = history.filter((item: any) => item?.type === "message" && item.role === "system").slice(-1);
     const summaryItem = {
-      itemId: `summary-${crypto.randomUUID()}`,
+      itemId: `sum_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
       type: "message",
       role: "system",
       content: [{ type: "input_text", text: compactText(summary, 1600) }]
@@ -3509,8 +3544,15 @@ export function App() {
           return direction.id === queryText || String(index + 1) === queryText || direction.text.toLowerCase().includes(queryText);
         });
         if (candidate) {
-          await completeDirection(candidate, compactText(String(args.note || "").trim(), 300), { notifyRealtime: false });
-          output = { ok: true, completed: candidate.text };
+          const noteText = compactText(String(args.note || "").trim(), 500);
+          await completeDirection(candidate, noteText, { notifyRealtime: false });
+          const workbench = await upsertDiscussionWorkbenchDirection(candidate, noteText);
+          output = {
+            ok: true,
+            completed: candidate.text,
+            workbenchUpdated: workbench?.originalName || null,
+            next: "已直接写入讨论工作台，无需用户审批。"
+          };
         } else {
           output = { ok: false, error: "No matching discussion direction found." };
         }
