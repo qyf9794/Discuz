@@ -1875,7 +1875,7 @@ function buildDiscussionContext() {
     .join("\n");
   return [
     `你是 ${aiSettings.assistantName}，本地文件语音讨论主持人。围绕当前主题、文件和用户刚说的话推进讨论。`,
-    "回复规则：先直接回答用户问题，不播报任务；默认 1-2 句，最多 4 句；每次只谈一个问题，只问一个问题。",
+    "回复规则：先直接回答用户问题，不播报任务；语音默认 1 句，最多 2 句；每次只谈一个问题，只问一个问题。",
     "判断规则：用户观点明显不合理、和材料冲突或风险高时，直接否定，给一句原因和更稳妥替代方案。",
     "工具规则：读材料、搜索、分析、生成、保存要点默认后台执行。只有联网下载、移动/删除文件、打开外部网页、失败、耗时较长或需要用户选择时，才简短说明状态。",
     "后台任务规则：用户要求长分析、深度报告、代码/脚本处理、较慢网页研究或需要生成结果文件时，优先调用 run_background_task 排队；排队后先简短回应，任务完成后再根据系统事件提示用户查看结果文件。",
@@ -1886,7 +1886,7 @@ function buildDiscussionContext() {
     "材料规则：下面只给压缩摘要。需要精确内容时，调用 get_discussion_state、search_context 或对应 analyze_* 工具；图片问题优先 analyze_image_file，Office 文件优先对应 analyze_* 工具。引用时说来源文件名或网页标题。",
     "压缩规则：工具结果可能被压缩。若用户要原文细节、证据、完整清单、逐项比较或文件深度分析，而返回片段不足，不要硬答；继续调用更具体的读取/分析工具，或说明需要后台深度分析。",
     "文件分析路由：用户要求完整/详细/深度文件分析、长文件对比、报告、表格、清单、生成文件或加入主题卡片时，必须调用 run_background_task，不要直接把大文件内容通过 analyze_* 或 compare_files 带入实时上下文；单纯打开/预览已有文件仍用 open_file_preview。",
-    "联网规则：用户有明确具体的联网需求时，结果必须贴合需求组织。小事实或少量链接用 web_search。用户要求完整/全部赛程、日程、清单、名单、表格、报告，或要求整理成主题卡片/文件时，必须调用 research_request，不要直接 web_search；单纯打开网页用 open_web_page。",
+    "联网规则：用户有明确具体的联网需求时，结果必须贴合需求组织。小事实或少量链接用 web_search。用户要求完整/全部赛程、日程、清单、名单、表格、报告，或要求整理成主题卡片/文件时，必须调用 research_request，不要直接 web_search。用户要推荐、建议、选购、型号、配置、比较或“什么样的更合适”时，也必须调用 research_request，并倾向 output=file、openWhenDone=true；单纯打开网页用 open_web_page。",
     "文件规则：不要直接改主题区或资源区原件；需要修改先 copy_file_to_generated。用户要求移动/复制/打开/下载文件时用对应工具完成。",
     "媒体规则：氛围模式调用 set_ambient_mode；用户给媒体链接时 open_media_url；不要编造受版权限制的播放源。",
     "系统事件规则：主题文件添加/删除时，只用 1 句问用户下一步怎么讨论；不要自动改主题或生成方向，除非用户明确要求。",
@@ -3545,7 +3545,7 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "research_request",
-      description: "Route a web research request. The app will choose direct web_search for small questions and background queue for complete schedules, lists, reports, generated files, topic cards, or tables. Do not use for simple page opening.",
+      description: "Route a web research request. The app will choose direct web_search for small facts and background queue for complete schedules, lists, reports, generated files, topic cards, tables, recommendations, buying advice, model/config comparisons, or 'what is suitable' questions. Do not use for simple page opening.",
       parameters: {
         type: "object",
         properties: {
@@ -4674,10 +4674,10 @@ function buildRealtimeSessionConfig(aiSettings) {
         turn_detection: {
           type: "server_vad",
           create_response: true,
-          interrupt_response: true,
+          interrupt_response: false,
           prefix_padding_ms: 300,
-          silence_duration_ms: 650,
-          threshold: 0.45,
+          silence_duration_ms: 750,
+          threshold: 0.55,
           idle_timeout_ms: 6000
         },
         transcription: {

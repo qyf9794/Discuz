@@ -287,10 +287,10 @@ function voiceStartErrorMessage(error: unknown) {
 const defaultRealtimeTurnDetection = {
   type: "server_vad",
   createResponse: true,
-  interruptResponse: true,
+  interruptResponse: false,
   prefixPaddingMs: 300,
-  silenceDurationMs: 650,
-  threshold: 0.45,
+  silenceDurationMs: 750,
+  threshold: 0.55,
   idleTimeoutMs: 6000
 };
 
@@ -443,6 +443,7 @@ function toolCallLabel(name = "任务") {
 
 const backgroundResearchIntentPattern = /全部|完整|所有|全量|整理|生成|保存|导出|主题卡片|主题区|卡片|文件|表格|报告|清单|列表|名单|赛程|日程|赛果|fixture|fixtures|schedule|calendar|timetable|full|all|complete|list|table|report|file|card/i;
 const artifactResearchPattern = /整理|生成|保存|导出|主题卡片|主题区|卡片|文件|表格|报告|markdown|md|table|report|file|card/i;
+const recommendationResearchPattern = /推荐|建议|选购|选择|适合|合适|比较|对比|型号|机型|配置|清单|方案|买什么|什么样|recommend|recommendation|buying guide|which|compare|model|spec/i;
 const deepFileTaskPattern = /全部|完整|全面|详细|深度|逐项|全文|长文|报告|表格|清单|列表|对比|比较|审查|方案|整理|生成|保存|导出|主题卡片|主题区|卡片|文件|full|complete|detailed|deep|report|table|list|compare|review|audit|plan|file|card/i;
 const immediateUiRequestPattern = /^(打开|开启|关闭|切换|显示|隐藏|预览|放大|缩小|全屏|退出全屏|移动|复制|下载|取消|停止|暂停|继续|播放|静音|open\b|close\b|show\b|hide\b|preview\b|fullscreen\b|download\b|cancel\b|stop\b|pause\b|resume\b|play\b)/i;
 
@@ -462,6 +463,7 @@ function shouldUseBackgroundResearch(args: Record<string, any> = {}) {
   if (["cards", "table", "file", "report"].includes(output)) return true;
   if (expectedItems > 8) return true;
   if (artifactResearchPattern.test(combined)) return true;
+  if (recommendationResearchPattern.test(combined) && (expectedItems >= 3 || Boolean(args.title) || Boolean(args.purpose))) return true;
   return /全部|完整|所有|全量|full|all|complete/i.test(combined) && backgroundResearchIntentPattern.test(combined);
 }
 
@@ -474,6 +476,16 @@ function researchPostActions(args: Record<string, any> = {}) {
   if (args.openWhenDone === true || /打开|预览|open|preview/i.test(combined)) actions.push("open_preview");
   if (actions.includes("open_preview") && !actions.includes("add_to_topic") && /主题|卡片|topic|card/i.test(combined)) actions.unshift("add_to_topic");
   return actions.filter((action, index, list) => list.indexOf(action) === index);
+}
+
+function shouldAutoOpenResearchResult(args: Record<string, any> = {}) {
+  const combined = [
+    args.query || args.prompt || "",
+    args.purpose || "",
+    args.title || "",
+    args.output || ""
+  ].join("\n");
+  return recommendationResearchPattern.test(combined) || artifactResearchPattern.test(combined);
 }
 
 function shouldQueueFileAnalysis(file: DiscuzFile, focus = "", extra = "") {
@@ -2655,6 +2667,7 @@ export function App() {
         else if (shouldUseBackgroundResearch(args)) {
           const prompt = String(args.query || "").trim();
           const postActions = researchPostActions(args);
+          if (shouldAutoOpenResearchResult(args) && !postActions.includes("open_preview")) postActions.push("open_preview");
           const task = await queueBackgroundTask({
             kind: "web_search",
             title: compactText(String(args.title || prompt || "联网研究").trim(), 80),
@@ -2687,6 +2700,7 @@ export function App() {
           const queryText = String(args.query || "").trim();
           const title = compactText(String(args.title || queryText || "联网研究").trim(), 80);
           const postActions = researchPostActions(args);
+          if (shouldAutoOpenResearchResult(args) && !postActions.includes("open_preview")) postActions.push("open_preview");
           const task = await queueBackgroundTask({
             kind: "web_search",
             title,
