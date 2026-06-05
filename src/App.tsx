@@ -4151,6 +4151,9 @@ export function App() {
             const responseStatus = String(message.response?.status || "");
             const responseError = message.response?.status_details?.error?.message || "";
             const hadAudibleOutput = assistantResponseHadOutputRef.current || responseOutput.length > 0;
+            if (hadAudibleOutput) {
+              responsePendingRef.current = false;
+            }
             if (
               awaitingAssistantReplyRef.current
               && !hadAudibleOutput
