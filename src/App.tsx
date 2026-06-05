@@ -902,6 +902,7 @@ export function App() {
   const userTranscriptRef = useRef("");
   const awaitingAssistantReplyRef = useRef(false);
   const assistantResponseHadOutputRef = useRef(false);
+  const lastAudibleResponseAtRef = useRef(0);
   const emptyResponseRetryCountRef = useRef(0);
   const emptyResponseRetryTimerRef = useRef<number | null>(null);
   const realtimeRateLimitRef = useRef<RealtimeRateLimitState | null>(null);
@@ -2093,6 +2094,10 @@ export function App() {
   const requestRealtimeResponse = useCallback(() => {
     const session = realtimeSessionRef.current;
     if (!session || typeof session.transport.requestResponse !== "function") return false;
+    if (Date.now() - lastAudibleResponseAtRef.current < 1200 && !awaitingAssistantReplyRef.current) {
+      responsePendingRef.current = false;
+      return false;
+    }
     const rateLimitDelay = realtimeRateLimitDelayMs(realtimeRateLimitRef.current, 5000);
     if (rateLimitDelay > 0) {
       responsePendingRef.current = true;
@@ -2102,6 +2107,10 @@ export function App() {
       rateLimitResumeTimerRef.current = window.setTimeout(() => {
         rateLimitResumeTimerRef.current = null;
         if (activeSessionId !== voiceSessionRef.current || !responsePendingRef.current) return;
+        if (Date.now() - lastAudibleResponseAtRef.current < 1200 && !awaitingAssistantReplyRef.current) {
+          responsePendingRef.current = false;
+          return;
+        }
         const delayedSession = realtimeSessionRef.current;
         if (!delayedSession || typeof delayedSession.transport.requestResponse !== "function") return;
         responsePendingRef.current = false;
@@ -3578,7 +3587,7 @@ export function App() {
           output = {
             ok: true,
             confirmed: title,
-            next: "Briefly acknowledge the confirmed topic, then ask for the user's basic situation, goals, constraints, and desired output. If the user cannot add details, inspect the topic/resource files and summarize the background before proposing discussion directions."
+            next: "Acknowledge naturally in one short sentence. Ask one basic situation or goal question. If the user is vague, silent, or says continue/okay, call prepare_discussion_directions instead of waiting too long."
           };
         } else {
           output = { ok: false, error: "No pending discussion topic to confirm." };
@@ -3592,6 +3601,17 @@ export function App() {
             ok: true,
             confirmed: directions,
             next: "Call prepare_discussion_workbench, then begin with the first confirmed direction."
+          };
+        } else if (state.directions.length) {
+          const currentDirections = [...state.directions]
+            .sort((first, second) => first.sortOrder - second.sortOrder)
+            .slice(0, 8)
+            .map((direction) => direction.text);
+          output = {
+            ok: true,
+            alreadyConfirmed: true,
+            confirmed: currentDirections,
+            next: "Directions are already active. Do not confirm again; ask the user to choose one direction and begin."
           };
         } else {
           output = { ok: false, error: "No pending discussion directions to confirm." };
@@ -4152,7 +4172,9 @@ export function App() {
             const responseError = message.response?.status_details?.error?.message || "";
             const hadAudibleOutput = assistantResponseHadOutputRef.current || responseOutput.length > 0;
             if (hadAudibleOutput) {
+              lastAudibleResponseAtRef.current = Date.now();
               responsePendingRef.current = false;
+              clearRateLimitResume();
             }
             if (
               awaitingAssistantReplyRef.current

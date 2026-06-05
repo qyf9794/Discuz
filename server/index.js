@@ -33,6 +33,14 @@ const topicsDir = path.join(dataDir, "topics");
 const diagnosticsDir = path.join(dataDir, "diagnostics");
 const dbPath = path.join(dataDir, "discuz.sqlite");
 const port = Number(process.env.PORT || 8787);
+const deploymentInfo = {
+  commit: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || "",
+  branch: process.env.RENDER_GIT_BRANCH || process.env.GIT_BRANCH || "",
+  service: process.env.RENDER_SERVICE_NAME || "",
+  nodeEnv: process.env.NODE_ENV || "",
+  version: process.env.npm_package_version || "",
+  startedAt: new Date().toISOString()
+};
 const defaultImageGenerationModel = process.env.OPENAI_IMAGE_MODEL || "gpt-image-1.5";
 const aiSettingsDefaults = {
   assistantName: "Discuz",
@@ -1880,9 +1888,9 @@ function buildDiscussionContext() {
     "工具规则：读材料、搜索、分析、生成、保存要点默认后台执行。只有联网下载、移动/删除文件、打开外部网页、失败、耗时较长或需要用户选择时，才简短说明状态。",
     "后台任务规则：用户要求长分析、深度报告、代码/脚本处理、较慢网页研究或需要生成结果文件时，优先调用 run_background_task 排队；排队后先简短回应，任务完成后再根据系统事件提示用户查看结果文件。",
     "即时操作规则：系统页面操作、布局切换、打开/关闭窗口、预览文件、播放媒体、取消/暂停/继续、下载/移动/复制等需要即时反馈的命令，必须直接调用对应前台工具，不要进入后台任务队列。",
-    "讨论流程：先确认主题；再了解用户目标/约束/已有材料；再让用户选择讨论方面，用户说不清就建议 3 条方向并写进主题卡片；之后逐条讨论。",
+    "讨论流程：主动但自然。没有确认主题时，先用一句话提出一个贴近材料的主题让用户确认；用户含糊、停顿或说可以/继续，就推进。主题确认后只问一个基本情况；如果用户说不清或继续含糊，就调用 prepare_discussion_directions 生成 3 条具体方向并写进主题卡片。已有方向时不要反复确认，直接让用户从 3 条里选一条开始。",
     "记录规则：形成观点、结论、问题、风险或行动项后，直接调用 save_discussion_note 记录，不要请求审批。确认方向后优先调用 prepare_discussion_workbench 生成工作台；其他阶段成果尽量用短命令生成。",
-    "主题规则：需要拟定主题时调用 prepare_discussion_topic；主题确认用 confirm_discussion_topic。需要拟定方向时调用 prepare_discussion_directions；方向确认用 confirm_discussion_directions。用户确认语义包括“确认、可以、就这个、对、没问题”。",
+    "主题规则：需要拟定主题时调用 prepare_discussion_topic；主题确认用 confirm_discussion_topic。需要拟定方向时调用 prepare_discussion_directions；方向确认用 confirm_discussion_directions。用户确认语义包括“确认、可以、就这个、对、没问题、继续、嗯、好”。表达要像主持讨论，不要机械说流程名。",
     "材料规则：下面只给压缩摘要。需要精确内容时，调用 get_discussion_state、search_context 或对应 analyze_* 工具；图片问题优先 analyze_image_file，Office 文件优先对应 analyze_* 工具。引用时说来源文件名或网页标题。",
     "压缩规则：工具结果可能被压缩。若用户要原文细节、证据、完整清单、逐项比较或文件深度分析，而返回片段不足，不要硬答；继续调用更具体的读取/分析工具，或说明需要后台深度分析。",
     "文件分析路由：用户要求完整/详细/深度文件分析、长文件对比、报告、表格、清单、生成文件或加入主题卡片时，必须调用 run_background_task，不要直接把大文件内容通过 analyze_* 或 compare_files 带入实时上下文；单纯打开/预览已有文件仍用 open_file_preview。",
@@ -2966,6 +2974,10 @@ app.delete("/api/topics/:id", (req, res) => {
 app.get("/api/state", (_req, res) => {
   writeTopicSnapshot();
   res.json(statePayload());
+});
+
+app.get("/api/version", (_req, res) => {
+  res.json(deploymentInfo);
 });
 
 app.get("/api/background-tasks", (_req, res) => {
@@ -4746,6 +4758,7 @@ app.post("/api/realtime/session", async (req, res) => {
       truncation: session.truncation,
       realtimeConfigFallback: fallbackReason,
       audio: session.audio,
+      deployment: deploymentInfo,
       settings: aiSettings
     });
   } catch (error) {
