@@ -287,7 +287,7 @@ function voiceStartErrorMessage(error: unknown) {
 const defaultRealtimeTurnDetection = {
   type: "server_vad",
   createResponse: true,
-  interruptResponse: false,
+  interruptResponse: true,
   prefixPaddingMs: 300,
   silenceDurationMs: 750,
   threshold: 0.55,

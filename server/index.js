@@ -4674,7 +4674,7 @@ function buildRealtimeSessionConfig(aiSettings) {
         turn_detection: {
           type: "server_vad",
           create_response: true,
-          interrupt_response: false,
+          interrupt_response: true,
           prefix_padding_ms: 300,
           silence_duration_ms: 750,
           threshold: 0.55,
