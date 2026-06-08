@@ -22,10 +22,10 @@ import {
   Trash2,
   X
 } from "lucide-react";
-import { OpenAIRealtimeWebRTC, RealtimeAgent, RealtimeSession, tool } from "@openai/agents/realtime";
+import { OpenAIRealtimeWebRTC, OpenAIRealtimeWebSocket, RealtimeAgent, RealtimeSession, tool } from "@openai/agents/realtime";
 import { ChangeEvent, DragEvent, forwardRef, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, Dispatch, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, ReactNode, RefObject, SetStateAction } from "react";
-import type { AiSettings, AppState, DiscussionDirection, DiscussionRecord, DiscussionTopic, DiscuzFile, MeetingMessage, Note } from "./types";
+import type { Activity, AiSettings, AppState, BackgroundTask, DiscussionDirection, DiscussionInput, DiscussionRecord, DiscussionTopic, DiscuzFile, MeetingMessage, Note } from "./types";
 
 const emptyState: AppState = {
   files: [],
@@ -58,6 +58,7 @@ type TopicProposal = { title: string; reason: string; intent: "confirm" | "drift
 type DirectionProposal = { directions: string[]; reason: string };
 type SettingsState = NonNullable<AppState["settings"]>;
 type VoiceState = "idle" | "connecting" | "live" | "thinking" | "error";
+type RealtimeMode = "voice" | "text";
 type WebPreview = { url: string; title: string; embeddable?: boolean | null; embedReason?: string };
 type PanelId = "topic" | "resources" | "generated" | "record";
 type ToolId = "whiteboard" | "draft" | "image" | "video" | "audio";
@@ -135,7 +136,10 @@ type DiscuzDiagnostics = {
   runTools: (_items: Array<{ name: string; args?: Record<string, unknown> }>) => Promise<ToolDiagnosticResult[]>;
   runScenario: (_payload: DiagnosticScenarioPayload) => Promise<DiagnosticScenarioResult>;
 };
-type DiscuzDiagnosticWindow = Window & { __discuzDiagnostics?: DiscuzDiagnostics };
+type DiscuzDiagnosticWindow = Window & {
+  __discuzDiagnostics?: DiscuzDiagnostics;
+  __discuzQaSendDiscussion?: (_text: string) => Promise<void>;
+};
 type DiagnosticScenarioPayload = {
   id?: string;
   name?: string;
@@ -322,6 +326,57 @@ function loadStoredJson<T>(key: string, fallback: T): T {
   }
 }
 
+function safeArray<T>(value: unknown): T[] {
+  return Array.isArray(value) ? value as T[] : [];
+}
+
+function normalizeBoardItems(value: unknown): BoardItem[] {
+  return safeArray<Partial<BoardItem>>(value)
+    .filter((item) => item && (item.kind === "text" || item.kind === "image"))
+    .map((item) => ({
+      id: String(item.id || crypto.randomUUID()),
+      kind: item.kind === "image" ? "image" : "text",
+      value: String(item.value || ""),
+      x: Number.isFinite(item.x) ? Number(item.x) : 80,
+      y: Number.isFinite(item.y) ? Number(item.y) : 80
+    }));
+}
+
+function normalizeAppState(value: Partial<AppState> | null | undefined): AppState {
+  const next = value ?? {};
+  return {
+    ...emptyState,
+    ...next,
+    files: safeArray<DiscuzFile>(next.files).map((file) => ({
+      ...file,
+      originalName: String(file.originalName || file.storedName || "未命名文件"),
+      storedName: String(file.storedName || file.originalName || ""),
+      extractedText: String(file.extractedText || ""),
+      renderedHtml: String(file.renderedHtml || ""),
+      summary: String(file.summary || ""),
+      previewUrl: String(file.previewUrl || "")
+    })),
+    notes: safeArray<Note>(next.notes).map((note) => ({ ...note, text: String(note.text || ""), source: String(note.source || "") })),
+    records: safeArray<DiscussionRecord>(next.records).map((record) => ({ ...record, title: String(record.title || ""), content: String(record.content || "") })),
+    discussionInputs: safeArray<DiscussionInput>(next.discussionInputs),
+    meetingMessages: safeArray<MeetingMessage>(next.meetingMessages).map((message) => ({ ...message, text: String(message.text || "") })),
+    directions: safeArray<DiscussionDirection>(next.directions).map((direction) => ({ ...direction, text: String(direction.text || "") })),
+    backgroundTasks: safeArray<BackgroundTask>(next.backgroundTasks),
+    discussionTopic: String(next.discussionTopic || ""),
+    activeTopicId: String(next.activeTopicId || ""),
+    topics: safeArray<DiscussionTopic>(next.topics).map((topic) => ({ ...topic, title: String(topic.title || "") })),
+    activities: safeArray<Activity>(next.activities),
+    settings: {
+      ...emptyState.settings!,
+      ...(next.settings ?? {}),
+      ai: {
+        ...emptyState.settings!.ai,
+        ...(next.settings?.ai ?? {})
+      }
+    }
+  };
+}
+
 function shortTime(value: string) {
   return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit" }).format(new Date(value));
 }
@@ -391,6 +446,7 @@ function toolCallLabel(name = "任务") {
     show_tool_activity: "查看工具活动",
     cancel_current_task: "取消当前任务",
     run_background_task: "加入后台任务",
+    cancel_background_task: "取消后台任务",
     edit_spreadsheet_file: "编辑表格请求",
     create_outline: "生成大纲",
     compare_files: "比较文件",
@@ -446,6 +502,7 @@ const artifactResearchPattern = /整理|生成|保存|导出|主题卡片|主题
 const recommendationResearchPattern = /推荐|建议|选购|选择|适合|合适|比较|对比|型号|机型|配置|清单|方案|买什么|什么样|recommend|recommendation|buying guide|which|compare|model|spec/i;
 const deepFileTaskPattern = /全部|完整|全面|详细|深度|逐项|全文|长文|报告|表格|清单|列表|对比|比较|审查|方案|整理|生成|保存|导出|主题卡片|主题区|卡片|文件|full|complete|detailed|deep|report|table|list|compare|review|audit|plan|file|card/i;
 const immediateUiRequestPattern = /^(打开|开启|关闭|切换|显示|隐藏|预览|放大|缩小|全屏|退出全屏|移动|复制|下载|取消|停止|暂停|继续|播放|静音|open\b|close\b|show\b|hide\b|preview\b|fullscreen\b|download\b|cancel\b|stop\b|pause\b|resume\b|play\b)/i;
+const explicitInterruptPattern = /^(打断|中断|取消|停止|别继续|不要继续|不用继续|暂停|stop\b|cancel\b|interrupt\b|pause\b)/i;
 
 function shouldUseBackgroundResearch(args: Record<string, any> = {}) {
   const query = String(args.query || args.prompt || "").trim();
@@ -564,6 +621,25 @@ function parseHttpUrl(value: string) {
 
 function isLocalPreviewUrl(value: string) {
   return value.startsWith("/");
+}
+
+async function checkWebEmbed(url: string) {
+  if (isLocalPreviewUrl(url)) return { url, embeddable: true, reason: "" };
+  try {
+    const response = await fetch(`/api/web/embed-check?url=${encodeURIComponent(url)}`);
+    const payload = await response.json();
+    return {
+      url: String(payload.url || url),
+      embeddable: payload.embeddable !== false,
+      reason: String(payload.reason || "")
+    };
+  } catch (error) {
+    return {
+      url,
+      embeddable: false,
+      reason: error instanceof Error ? error.message : "无法检测网页嵌入状态"
+    };
+  }
 }
 
 function isDiagnosticsEnabled() {
@@ -812,8 +888,9 @@ export function App() {
   const [diagnosticInput, setDiagnosticInput] = useState("");
   const [topicProposal, setTopicProposal] = useState<TopicProposal | null>(null);
   const [draftText, setDraftText] = useState(() => localStorage.getItem("discuz-draft") || "");
+  const [realtimeMode, setRealtimeMode] = useState<RealtimeMode | null>(null);
   const [boardItems, setBoardItems] = useState<BoardItem[]>(
-    () => loadStoredJson("discuz-board-items", [])
+    () => normalizeBoardItems(loadStoredJson("discuz-board-items", []))
   );
   const [boardLinks, setBoardLinks] = useState<BoardLink[]>(
     () => loadStoredJson("discuz-board-links", [])
@@ -865,6 +942,7 @@ export function App() {
   const statusLogRef = useRef<HTMLDivElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const realtimeSessionRef = useRef<RealtimeSession | null>(null);
+  const startTextRealtimePromiseRef = useRef<Promise<RealtimeSession> | null>(null);
   const executeRealtimeToolRef = useRef<((_name: string, _args: Record<string, any>) => Promise<unknown>) | null>(null);
   const topicProposalRef = useRef<TopicProposal | null>(null);
   const directionProposalRef = useRef<DirectionProposal | null>(null);
@@ -879,12 +957,16 @@ export function App() {
   const diagnosticEventsRef = useRef<DiagnosticEvent[]>([]);
   const responseActiveRef = useRef(false);
   const responsePendingRef = useRef(false);
+  const queuedDiscussionInputsRef = useRef<string[]>([]);
+  const queuedDiscussionFlushTimerRef = useRef<number | null>(null);
+  const discussionTurnPendingRef = useRef(false);
   const topicFileChangeBlocksTopicProposalRef = useRef(false);
   const voiceSessionRef = useRef(0);
   const voiceSessionStartedAtRef = useRef<string | null>(null);
   const voiceReconnectTimerRef = useRef<number | null>(null);
   const responseWatchdogTimerRef = useRef<number | null>(null);
   const responseTaskTimerRef = useRef<number | null>(null);
+  const responseRequestTimerRef = useRef<number | null>(null);
   const pendingDirectionsAfterTopicRef = useRef<{ title: string; attempts: number; awaitingPermission: boolean } | null>(null);
   const activeTaskFinishersRef = useRef<Record<string, (_failed?: boolean) => void>>({});
   const activeTaskLabelsRef = useRef<Record<string, string>>({});
@@ -899,6 +981,8 @@ export function App() {
   const lastStatusLogRef = useRef("Ready");
   const lastErrorLogRef = useRef("");
   const assistantTranscriptRef = useRef("");
+  const assistantCompletedTextPartsRef = useRef<string[]>([]);
+  const assistantResponseSavedRef = useRef(false);
   const userTranscriptRef = useRef("");
   const awaitingAssistantReplyRef = useRef(false);
   const assistantResponseHadOutputRef = useRef(false);
@@ -1147,7 +1231,8 @@ export function App() {
 
   const loadState = useCallback(async (preferredSelectedId?: string | null) => {
     const response = await fetch("/api/state");
-    const nextState = await response.json();
+    if (!response.ok) throw new Error(`Unable to load state (${response.status})`);
+    const nextState = normalizeAppState(await response.json());
     setState(nextState);
     if (preferredSelectedId) {
       setSelectedId(preferredSelectedId);
@@ -1690,7 +1775,8 @@ export function App() {
     }
     const importantKeys = [
       "ok", "opened", "generated", "downloaded", "saved", "copied", "moved", "added", "updated",
-      "route", "reason", "queued", "taskId", "status", "postActions", "prepared", "confirmed", "count", "title", "ambientMode", "cancelled", "ending", "next"
+      "route", "mode", "reason", "queued", "taskId", "status", "postActions", "prepared", "confirmed", "count", "title", "externalLink", "markdownLink",
+      "userNotice", "noticeOnce", "ambientMode", "cancelled", "tasks", "ending", "next"
     ];
     const output: Record<string, unknown> = {};
     importantKeys.forEach((key) => {
@@ -1814,6 +1900,87 @@ export function App() {
     }
   };
 
+  const resetAssistantResponseCapture = () => {
+    assistantTranscriptRef.current = "";
+    assistantCompletedTextPartsRef.current = [];
+    assistantResponseSavedRef.current = false;
+  };
+
+  const captureAssistantCompletedText = (text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    assistantCompletedTextPartsRef.current = [...assistantCompletedTextPartsRef.current, trimmed].slice(-4);
+  };
+
+  const saveLastAssistantCompletedText = () => {
+    if (assistantResponseSavedRef.current) return false;
+    if (pendingTaskCountRef.current > 0) return false;
+    const text = assistantCompletedTextPartsRef.current.at(-1)?.trim();
+    if (!text) return false;
+    assistantResponseSavedRef.current = true;
+    assistantCompletedTextPartsRef.current = [];
+    awaitingAssistantReplyRef.current = false;
+    saveMeetingMessage(text, "assistant").catch((err) => setError(err instanceof Error ? err.message : "Unable to save meeting record"));
+    return true;
+  };
+
+  const addToolUserNotice = (name: string, value: Record<string, unknown>) => {
+    if (!value || typeof value !== "object") return value;
+    const result = value as Record<string, unknown>;
+    if (result.error || result.ok === false || result.userNotice) return value;
+    let userNotice = "";
+    if (typeof result.externalLink === "string") {
+      const title = typeof result.title === "string" && result.title.trim() ? result.title.trim() : "这个网页";
+      userNotice = `${title}不能嵌入到当前页面，我没有打开空白预览。请在浏览器中打开：${result.externalLink}`;
+    } else if (typeof result.generated === "string" && result.generated.trim()) {
+      userNotice = `已生成文件：${result.generated}`;
+    } else if (name === "open_file_preview" && typeof result.opened === "string" && result.opened.trim()) {
+      userNotice = `已打开文件：${result.opened}`;
+    } else if (typeof result.copied === "string" && result.copied.trim()) {
+      userNotice = `已生成临时副本：${result.copied}`;
+    } else if (typeof result.updated === "string" && result.updated.trim()) {
+      userNotice = `已更新文件：${result.updated}`;
+    } else if (name === "import_url_as_topic_file" && result.file && typeof result.file === "object") {
+      const fileName = String((result.file as { originalName?: unknown }).originalName || "").trim();
+      if (fileName) userNotice = `已生成主题文件：${fileName}`;
+    }
+    return userNotice ? { ...result, userNotice, noticeOnce: true } : value;
+  };
+
+  const discussionDirectionBase = () => {
+    const topic = state.discussionTopic || state.topics.find((topicItem) => topicItem.active)?.title || selectedFile?.originalName || "当前主题";
+    return compactText(topic.replace(/\.[^.]+$/u, ""), 24);
+  };
+
+  const isGenericDirectionText = (text: string) => {
+    const cleaned = text.trim();
+    if (!cleaned) return true;
+    const base = discussionDirectionBase();
+    const hasTopicSignal = base && cleaned.includes(base.slice(0, Math.min(6, base.length)));
+    const genericPatterns = [
+      /确认.*(核心|问题|目标|需求)/,
+      /梳理.*(材料|信息|关键)/,
+      /形成.*(结论|下一步|行动)/,
+      /明确.*(目标|范围|问题)/,
+      /收集.*(资料|信息)/,
+      /分析.*(现状|问题)/,
+      /制定.*(计划|方案)/,
+      /总结.*(要点|结论)/
+    ];
+    return genericPatterns.some((pattern) => pattern.test(cleaned)) && !hasTopicSignal;
+  };
+
+  const normalizeThemeDirections = (items: unknown[], maxItems: number) => {
+    const base = discussionDirectionBase();
+    const fallback = [`核验${base}依据`, `梳理${base}风险`, `确定${base}产出`];
+    const normalized = items
+      .map((item) => compactText(String(item || "").trim(), 120))
+      .filter(Boolean)
+      .filter((item) => !isGenericDirectionText(item));
+    return [...normalized, ...fallback.filter((item) => !normalized.includes(item))]
+      .slice(0, maxItems);
+  };
+
   const createGeneratedFile = async (title: string, text: string) => {
     const finishTask = beginTask("生成临时文案");
     try {
@@ -1863,6 +2030,25 @@ export function App() {
       activities: payload.activities ?? current.activities
     }));
     return payload.task as AppState["backgroundTasks"][number] | undefined;
+  };
+
+  const cancelBackgroundTask = async (options: { id?: string; query?: string } = {}) => {
+    const response = await fetch("/api/background-tasks/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: options.id || "",
+        query: options.query || ""
+      })
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "Unable to cancel background task.");
+    setState((current) => ({
+      ...current,
+      backgroundTasks: payload.backgroundTasks ?? current.backgroundTasks,
+      activities: payload.activities ?? current.activities
+    }));
+    return payload.cancelled as AppState["backgroundTasks"];
   };
 
   const buildDiscussionWorkbenchMarkdown = () => {
@@ -2091,7 +2277,48 @@ export function App() {
     rateLimitResumeTimerRef.current = null;
   }, []);
 
+  const clearRealtimeResponseRequest = useCallback(() => {
+    if (responseRequestTimerRef.current) window.clearTimeout(responseRequestTimerRef.current);
+    responseRequestTimerRef.current = null;
+  }, []);
+
+  const clearQueuedDiscussionFlush = useCallback(() => {
+    if (queuedDiscussionFlushTimerRef.current) window.clearTimeout(queuedDiscussionFlushTimerRef.current);
+    queuedDiscussionFlushTimerRef.current = null;
+  }, []);
+
+  const flushQueuedDiscussionInput = useCallback(() => {
+    if (queuedDiscussionFlushTimerRef.current) return;
+    const run = () => {
+      queuedDiscussionFlushTimerRef.current = null;
+      if (discussionTurnPendingRef.current || responseActiveRef.current || responsePendingRef.current || pendingTaskCountRef.current > 0) {
+        if (queuedDiscussionInputsRef.current.length) queuedDiscussionFlushTimerRef.current = window.setTimeout(run, 180);
+        return;
+      }
+      const nextText = queuedDiscussionInputsRef.current.shift();
+      if (!nextText) return;
+      const batch = [nextText, ...queuedDiscussionInputsRef.current.splice(0, 4)];
+      const session = realtimeSessionRef.current;
+      if (!session) {
+        queuedDiscussionInputsRef.current.unshift(...batch);
+        return;
+      }
+      awaitingAssistantReplyRef.current = true;
+      assistantResponseHadOutputRef.current = false;
+      discussionTurnPendingRef.current = true;
+      setStatusText(queuedDiscussionInputsRef.current.length ? `处理连续输入，剩余 ${queuedDiscussionInputsRef.current.length} 条` : "处理连续输入");
+      session.sendMessage(batch.length === 1
+        ? `用户连续文字输入：${compactText(nextText, 1200)}`
+        : [
+          `用户连续发来 ${batch.length} 条文字输入，请按顺序逐条处理；能合并回答的合并回答，但不要遗漏记录、文件或工具操作要求。`,
+          ...batch.map((item, index) => `${index + 1}. ${compactText(item, 500)}`)
+        ].join("\n"));
+    };
+    queuedDiscussionFlushTimerRef.current = window.setTimeout(run, 120);
+  }, []);
+
   const requestRealtimeResponse = useCallback(() => {
+    clearRealtimeResponseRequest();
     const session = realtimeSessionRef.current;
     if (!session || typeof session.transport.requestResponse !== "function") return false;
     if (Date.now() - lastAudibleResponseAtRef.current < 1200 && !awaitingAssistantReplyRef.current) {
@@ -2139,7 +2366,21 @@ export function App() {
     }
     scheduleResponseTask("AI处理中");
     return true;
-  }, [clearRateLimitResume, clearResponseWatchdog, finishResponseTask, scheduleResponseTask]);
+  }, [clearRateLimitResume, clearRealtimeResponseRequest, clearResponseWatchdog, finishResponseTask, scheduleResponseTask]);
+
+  const scheduleRealtimeResponseRequest = useCallback(() => {
+    if ((!responsePendingRef.current && !(discussionTurnPendingRef.current && awaitingAssistantReplyRef.current)) || responseRequestTimerRef.current) return;
+    const run = () => {
+      responseRequestTimerRef.current = null;
+      if (!responsePendingRef.current && !(discussionTurnPendingRef.current && awaitingAssistantReplyRef.current)) return;
+      if (pendingTaskCountRef.current > 0) {
+        responseRequestTimerRef.current = window.setTimeout(run, 120);
+        return;
+      }
+      requestRealtimeResponse();
+    };
+    responseRequestTimerRef.current = window.setTimeout(run, 80);
+  }, [requestRealtimeResponse]);
 
   const scheduleEmptyResponseRetry = useCallback((activeSessionId: number, errorMessage = "") => {
     if (!awaitingAssistantReplyRef.current || emptyResponseRetryCountRef.current >= 1) return false;
@@ -2404,18 +2645,20 @@ export function App() {
   const saveToolToGenerated = async (tool: ToolId) => {
     if (tool === "draft") {
       const text = draftText.trim() || "# 临时文档\n\n";
-      await createGeneratedFile(`临时文档-${shortTime(new Date().toISOString()).replace(":", "-")}.md`, text);
+      const file = await createGeneratedFile(`临时文档-${shortTime(new Date().toISOString()).replace(":", "-")}.md`, text);
       setDraftText("");
       setStatusText("临时文档已保存，已新建空白页");
-      return;
+      return file;
     }
     if (tool === "whiteboard") {
-      await createGeneratedFile(`白板记录-${shortTime(new Date().toISOString()).replace(":", "-")}.md`, boardToMarkdown());
+      const file = await createGeneratedFile(`白板记录-${shortTime(new Date().toISOString()).replace(":", "-")}.md`, boardToMarkdown());
       setBoardItems([]);
       setBoardLinks([]);
       setDrawPoints([]);
       setStatusText("白板已保存，已新建空白页");
+      return file;
     }
+    return null;
   };
 
   const clearToolContent = (tool: ToolId) => {
@@ -2431,11 +2674,24 @@ export function App() {
     await promoteFileToPrimary(file, true);
   };
 
-  const sendDiscussionInput = async () => {
-    const text = discussionText.trim();
+  const getOrStartTextRealtime = async () => {
+    const existing = realtimeSessionRef.current;
+    if (existing) return existing;
+    if (startTextRealtimePromiseRef.current) return startTextRealtimePromiseRef.current;
+    const promise = startTextRealtime();
+    startTextRealtimePromiseRef.current = promise;
+    try {
+      return await promise;
+    } finally {
+      if (startTextRealtimePromiseRef.current === promise) startTextRealtimePromiseRef.current = null;
+    }
+  };
+
+  const sendDiscussionInputText = async (rawText: string, options: { clearInput?: boolean } = {}) => {
+    const text = rawText.trim();
     if (!text) return;
     const finishTask = beginTask("发送讨论输入");
-    setDiscussionText("");
+    if (options.clearInput !== false) setDiscussionText("");
     try {
       const response = await fetch("/api/discussion-inputs", {
         method: "POST",
@@ -2449,16 +2705,31 @@ export function App() {
         discussionInputs: payload.discussionInputs ?? current.discussionInputs,
         activities: payload.activities ?? current.activities
       }));
-      saveMeetingMessage(text, "user").catch((err) => setError(err instanceof Error ? err.message : "Unable to save meeting record"));
+      await saveMeetingMessage(text, "user").catch((err) => setError(err instanceof Error ? err.message : "Unable to save meeting record"));
       if (await handleSpokenConfirmation(text)) return;
 
-      const session = realtimeSessionRef.current;
+      const session = await getOrStartTextRealtime();
       if (session) {
+        const shouldInterrupt = explicitInterruptPattern.test(text);
+        if ((discussionTurnPendingRef.current || responseActiveRef.current || responsePendingRef.current || pendingTaskCountRef.current > 0) && !shouldInterrupt) {
+          queuedDiscussionInputsRef.current.push(text);
+          flushQueuedDiscussionInput();
+          setStatusText(`已加入连续输入队列（${queuedDiscussionInputsRef.current.length}）`);
+          return;
+        }
+        if (shouldInterrupt) {
+          queuedDiscussionInputsRef.current = [];
+          clearQueuedDiscussionFlush();
+          discussionTurnPendingRef.current = false;
+        }
         if (responseActiveRef.current) {
           session.interrupt();
           responseActiveRef.current = false;
           clearResponseWatchdog();
         }
+        awaitingAssistantReplyRef.current = true;
+        assistantResponseHadOutputRef.current = false;
+        discussionTurnPendingRef.current = true;
         session.sendMessage(`用户文字输入：${compactText(text, 1200)}`);
       } else {
         setStatusText("Saved for next discussion");
@@ -2467,6 +2738,31 @@ export function App() {
       finishTask();
     }
   };
+
+  const sendDiscussionInput = async () => {
+    await sendDiscussionInputText(discussionText);
+  };
+
+  useEffect(() => {
+    if (!import.meta.env.DEV) return undefined;
+    const qaWindow = window as DiscuzDiagnosticWindow;
+    qaWindow.__discuzQaSendDiscussion = (text: string) => sendDiscussionInputText(String(text || ""), { clearInput: false });
+    return () => {
+      delete qaWindow.__discuzQaSendDiscussion;
+    };
+  });
+
+  useEffect(() => {
+    if (!isDiagnosticsEnabled()) return;
+    const url = new URL(window.location.href);
+    const qaInput = url.searchParams.get("discuzQaInput");
+    if (!qaInput) return;
+    url.searchParams.delete("discuzQaInput");
+    window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+    sendDiscussionInputText(qaInput, { clearInput: false }).catch((err) => {
+      setError(err instanceof Error ? err.message : "QA discussion input failed.");
+    });
+  });
 
   const confirmDiscussionTopic = async (title: string, options: { notifyRealtime?: boolean } = {}) => {
     const finishTask = options.notifyRealtime !== false ? beginUniqueTask("confirm-topic", "确认讨论主题") : null;
@@ -2752,12 +3048,28 @@ export function App() {
       if (name === "open_web_page") {
         const parsed = parseHttpUrl(String(args.url || ""));
         if (parsed) {
-          setWebPreview({ url: parsed.toString(), title: String(args.title || parsed.hostname || "网页").trim() });
-          setActiveTool(null);
-          setPreviewFileId(null);
-          setPreviewRecordId(null);
-          setGeneratedEditorId(null);
-          output = { ok: true, opened: parsed.toString() };
+          const title = String(args.title || parsed.hostname || "网页").trim();
+          const embedCheck = await checkWebEmbed(parsed.toString());
+          if (embedCheck.embeddable) {
+            setWebPreview({ url: embedCheck.url, title, embeddable: true });
+            setActiveTool(null);
+            setPreviewFileId(null);
+            setPreviewRecordId(null);
+            setGeneratedEditorId(null);
+            output = { ok: true, opened: embedCheck.url, mode: "embedded_preview", title };
+          } else {
+            setWebPreview(null);
+            output = {
+              ok: true,
+              opened: false,
+              mode: "external_link",
+              title,
+              externalLink: embedCheck.url,
+              markdownLink: `[${title}](${embedCheck.url})`,
+              reason: embedCheck.reason || "网站禁止被嵌入到其他页面。",
+              next: "请把 externalLink 作为可点击链接提供给用户，不要再次尝试打开嵌入预览。"
+            };
+          }
         } else {
           output = { ok: false, error: "Invalid web URL. Use an http or https URL." };
         }
@@ -2803,8 +3115,8 @@ export function App() {
       if (name === "save_discussion_tool") {
         const tool = (args.tool === "whiteboard" || args.tool === "draft" ? args.tool : activeTool) as ToolId | null;
         if (tool === "whiteboard" || tool === "draft") {
-          await saveToolToGenerated(tool);
-          output = { ok: true, saved: tool };
+          const file = await saveToolToGenerated(tool);
+          output = file ? { ok: true, saved: tool, generated: file.originalName } : { ok: true, saved: tool };
         } else {
           output = { ok: false, error: "No savable tool is open." };
         }
@@ -3059,6 +3371,17 @@ export function App() {
           next: postActions.includes("open_preview")
             ? "后台任务已排队。完成后会生成结果文件，并按要求打开。"
             : "后台任务已排队。完成后会在 AI 临时文件区生成结果文件。"
+        };
+      }
+      if (name === "cancel_background_task") {
+        const cancelled = await cancelBackgroundTask({
+          id: String(args.id || "").trim(),
+          query: String(args.query || "").trim()
+        });
+        output = {
+          ok: true,
+          cancelled: cancelled.length,
+          tasks: cancelled.map((task) => task.title).slice(0, 5)
         };
       }
       if (name === "start_break") {
@@ -3493,24 +3816,25 @@ export function App() {
       if (name === "update_generated_file") {
         const queryText = String(args.query || "").trim().toLowerCase();
         const text = compactText(String(args.text || "").trim(), 3000);
+        const mode = args.mode === "append" ? "append" : "replace";
         const candidate = state.files.find((file) => {
           const nameMatches = !queryText || file.originalName.toLowerCase().includes(queryText);
           return file.role === "generated" && nameMatches && (file.kind === "markdown" || file.kind === "text");
         });
         if (candidate && text) {
-          await updateGeneratedFile(candidate, text);
+          const nextText = mode === "append"
+            ? `${String(candidate.extractedText || "").replace(/\s+$/, "")}\n\n${text}`
+            : text;
+          await updateGeneratedFile(candidate, nextText);
           setGeneratedEditorId(candidate.id);
           setWebPreview(null);
-          output = { ok: true, updated: candidate.originalName };
+          output = { ok: true, updated: candidate.originalName, mode };
         } else {
-          output = { ok: false, error: "No editable generated text file or replacement text found." };
+          output = { ok: false, error: "No editable generated text file or update text found." };
         }
       }
       if (name === "propose_discussion_directions") {
-        const directions = (Array.isArray(args.directions) ? args.directions : [])
-          .map((item: unknown) => compactText(String(item || "").trim(), 120))
-          .filter(Boolean)
-          .slice(0, 3);
+        const directions = normalizeThemeDirections(Array.isArray(args.directions) ? args.directions : [], 3);
         if (directions.length) {
           const proposal = { directions, reason: String(args.reason || "").trim() };
           directionProposalRef.current = proposal;
@@ -3526,7 +3850,7 @@ export function App() {
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.error || "Unable to prepare discussion directions.");
         const proposal = payload.proposal as DirectionProposal | undefined;
-        const directions = (proposal?.directions ?? []).map((item) => String(item || "").trim()).filter(Boolean).slice(0, 3);
+        const directions = normalizeThemeDirections(proposal?.directions ?? [], 3);
         if (directions.length) {
           const nextProposal = { directions, reason: String(proposal?.reason || "后台已基于当前材料生成方向。").trim() };
           directionProposalRef.current = nextProposal;
@@ -3538,10 +3862,7 @@ export function App() {
         }
       }
       if (name === "update_discussion_directions") {
-        const directions = (Array.isArray(args.directions) ? args.directions : [])
-          .map((item: unknown) => compactText(String(item || "").trim(), 120))
-          .filter(Boolean)
-          .slice(0, 8);
+        const directions = normalizeThemeDirections(Array.isArray(args.directions) ? args.directions : [], 8);
         if (directions.length) {
           await confirmDirectionProposal(directions, { notifyRealtime: false });
           output = { ok: true, directions };
@@ -3550,10 +3871,7 @@ export function App() {
         }
       }
       if (name === "add_discussion_directions") {
-        const directions = (Array.isArray(args.directions) ? args.directions : [])
-          .map((item: unknown) => compactText(String(item || "").trim(), 120))
-          .filter(Boolean)
-          .slice(0, 3);
+        const directions = normalizeThemeDirections(Array.isArray(args.directions) ? args.directions : [], 3);
         if (directions.length) {
           await addDiscussionDirections(directions);
           output = { ok: true, added: directions };
@@ -3677,6 +3995,7 @@ export function App() {
       setError(messageText);
       output = { ok: false, error: messageText };
     } finally {
+      output = addToolUserNotice(name, output);
       const failed = Boolean((output as { error?: unknown; ok?: unknown }).error) || (output as { ok?: unknown }).ok === false;
       updateToolActivity(activityId, {
         status: failed ? "failed" : "done",
@@ -3915,13 +4234,19 @@ export function App() {
     clearResponseWatchdog();
     clearEmptyResponseRetry();
     clearRateLimitResume();
+    clearRealtimeResponseRequest();
+    clearQueuedDiscussionFlush();
+    queuedDiscussionInputsRef.current = [];
+    startTextRealtimePromiseRef.current = null;
     realtimeRateLimitRef.current = null;
     lastRealtimeCompactionAtRef.current = 0;
     pendingVoiceStopAfterResponseRef.current = "none";
     responseActiveRef.current = false;
     responsePendingRef.current = false;
+    discussionTurnPendingRef.current = false;
     awaitingAssistantReplyRef.current = false;
     assistantResponseHadOutputRef.current = false;
+    resetAssistantResponseCapture();
     emptyResponseRetryCountRef.current = 0;
     finishAllVisibleTasks();
     realtimeSessionRef.current?.close();
@@ -3929,9 +4254,10 @@ export function App() {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     stopVoiceMeter();
+    setRealtimeMode(null);
     setVoiceState("idle");
     setStatusText("Ready");
-  }, [clearEmptyResponseRetry, clearRateLimitResume, clearResponseWatchdog, finishAllVisibleTasks, stopVoiceMeter]);
+  }, [clearEmptyResponseRetry, clearQueuedDiscussionFlush, clearRateLimitResume, clearRealtimeResponseRequest, clearResponseWatchdog, finishAllVisibleTasks, stopVoiceMeter]);
 
   const stopVoice = useCallback(() => {
     disconnectVoice();
@@ -3944,6 +4270,12 @@ export function App() {
       pendingVoiceStopAfterResponseRef.current = "none";
       responseActiveRef.current = false;
       responsePendingRef.current = false;
+      discussionTurnPendingRef.current = false;
+      resetAssistantResponseCapture();
+      clearRealtimeResponseRequest();
+      clearQueuedDiscussionFlush();
+      queuedDiscussionInputsRef.current = [];
+      startTextRealtimePromiseRef.current = null;
       realtimeSessionRef.current?.close();
       realtimeSessionRef.current = null;
       streamRef.current?.getTracks().forEach((track) => track.stop());
@@ -3960,7 +4292,190 @@ export function App() {
       window.removeEventListener("pagehide", saveAndDisconnect);
       window.removeEventListener("beforeunload", saveAndDisconnect);
     };
-  }, []);
+  }, [clearQueuedDiscussionFlush, clearRealtimeResponseRequest]);
+
+  const startTextRealtime = async () => {
+    const existing = realtimeSessionRef.current;
+    if (existing) return existing;
+    setError("");
+    const sessionId = voiceSessionRef.current + 1;
+    voiceSessionRef.current = sessionId;
+    voiceSessionStartedAtRef.current = new Date().toISOString();
+    pendingVoiceStopAfterResponseRef.current = "none";
+    resetAssistantResponseCapture();
+    userTranscriptRef.current = "";
+    awaitingAssistantReplyRef.current = false;
+    assistantResponseHadOutputRef.current = false;
+    emptyResponseRetryCountRef.current = 0;
+    clearEmptyResponseRetry();
+    clearRateLimitResume();
+    realtimeRateLimitRef.current = null;
+    lastRealtimeCompactionAtRef.current = 0;
+    setRealtimeMode("text");
+    setVoiceState("connecting");
+    setStatusText("正在连接文字实时");
+    try {
+      const bootstrapResponse = await fetch("/api/realtime/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ transport: "websocket", sdk: "@openai/agents/realtime", mode: "text" })
+      });
+      const bootstrap = await bootstrapResponse.json() as RealtimeSessionBootstrap | { error?: string };
+      if (!bootstrapResponse.ok || !("clientSecret" in bootstrap)) {
+        const errorPayload = bootstrap as { error?: string };
+        throw new Error(errorPayload.error || "Unable to create realtime session");
+      }
+      if (sessionId !== voiceSessionRef.current) throw new Error("Realtime session was replaced.");
+
+      const realtimeTools = bootstrap.tools.map((definition) => tool({
+        name: definition.name,
+        description: definition.description,
+        parameters: definition.parameters as any,
+        execute: async (args) => {
+          const executor = executeRealtimeToolRef.current;
+          if (!executor) return { ok: false, error: "Realtime tool executor is not ready." };
+          return executor(definition.name, (args ?? {}) as Record<string, any>);
+        }
+      }));
+      const agent = new RealtimeAgent({
+        name: bootstrap.settings.assistantName || "Discuz",
+        instructions: bootstrap.instructions,
+        tools: realtimeTools
+      });
+      const maxOutputTokens = bootstrap.max_output_tokens
+        ?? bootstrap.maxOutputTokens
+        ?? bootstrap.max_response_output_tokens
+        ?? bootstrap.maxResponseOutputTokens;
+      const realtimeProviderData = {
+        ...(maxOutputTokens ? { max_output_tokens: maxOutputTokens } : {}),
+        ...(bootstrap.truncation ? { truncation: bootstrap.truncation } : {})
+      };
+      const session = new RealtimeSession(agent, {
+        model: bootstrap.model,
+        transport: new OpenAIRealtimeWebSocket(),
+        config: {
+          outputModalities: ["text"],
+          toolChoice: "auto",
+          parallelToolCalls: true,
+          ...(Object.keys(realtimeProviderData).length ? { providerData: realtimeProviderData } : {})
+        }
+      });
+      realtimeSessionRef.current = session;
+
+      session.on("agent_tool_start", (...values: unknown[]) => {
+        if (sessionId !== voiceSessionRef.current) return;
+        const name = realtimeEventToolName(...values);
+        recordConversationDiagnostic("agent_tool_start", { name, values });
+        finishUniqueTask(`approval-${name || "tool"}`);
+        finishResponseTask();
+      });
+      session.on("agent_tool_end", (...values: unknown[]) => {
+        if (sessionId !== voiceSessionRef.current) return;
+        recordConversationDiagnostic("agent_tool_end", { values });
+        if (responseActiveRef.current) scheduleResponseTask("AI整理结果");
+        scheduleRealtimeResponseRequest();
+      });
+      session.on("tool_approval_requested", (...values: unknown[]) => {
+        if (sessionId !== voiceSessionRef.current) return;
+        const name = realtimeEventToolName(...values);
+        recordConversationDiagnostic("tool_approval_requested", { name, values });
+        beginUniqueTask(`approval-${name || "tool"}`, `${toolCallLabel(name || "工具")}等待确认`);
+      });
+      session.on("transport_event", (message) => {
+        if (sessionId !== voiceSessionRef.current) return;
+        try {
+          if (!String(message.type || "").endsWith(".delta")) {
+            recordConversationDiagnostic("realtime_event", message);
+          }
+          if (message.type === "rate_limits.updated") {
+            const tokenLimit = extractRealtimeTokenLimit(message);
+            if (tokenLimit) realtimeRateLimitRef.current = tokenLimit;
+          }
+          if (message.type === "response.created") {
+            responseActiveRef.current = true;
+            assistantResponseHadOutputRef.current = false;
+            resetAssistantResponseCapture();
+            startResponseWatchdog();
+            scheduleResponseTask("AI处理中");
+            setVoiceState("thinking");
+          }
+          if (message.type === "response.output_item.added" || message.type === "response.content_part.added") {
+            assistantResponseHadOutputRef.current = true;
+          }
+          if (message.type === "response.output_text.delta") {
+            assistantResponseHadOutputRef.current = true;
+            assistantTranscriptRef.current += message.delta;
+            setTranscript(assistantTranscriptRef.current.slice(-220));
+          }
+          if (message.type === "response.output_text.done") {
+            const text = String(message.text || assistantTranscriptRef.current || "").trim();
+            if (text) {
+              assistantResponseHadOutputRef.current = true;
+              captureAssistantCompletedText(text);
+              recordConversationDiagnostic("assistant_text_buffered_until_response_done", { text, pendingTasks: pendingTaskCountRef.current });
+            }
+            assistantTranscriptRef.current = "";
+          }
+          if (message.type === "response.done") {
+            responseActiveRef.current = false;
+            discussionTurnPendingRef.current = false;
+            clearResponseWatchdog();
+            finishResponseTask();
+            setVoiceState("live");
+            maybeCompactRealtimeHistory(message.response);
+            if (pendingTaskCountRef.current === 0 && !backgroundParsingActiveRef.current) setStatusText("Text Live");
+            saveLastAssistantCompletedText();
+            window.setTimeout(() => flushRealtimeResponse(), 0);
+            flushQueuedDiscussionInput();
+          }
+          if (message.type === "response.cancelled" || message.type === "response.incomplete") {
+            responseActiveRef.current = false;
+            discussionTurnPendingRef.current = false;
+            resetAssistantResponseCapture();
+            clearResponseWatchdog();
+            finishResponseTask();
+            setVoiceState("live");
+            window.setTimeout(() => flushRealtimeResponse(), 0);
+            flushQueuedDiscussionInput();
+          }
+          if (message.type === "error") {
+            const messageText = message.error?.message || "Realtime error";
+            responseActiveRef.current = false;
+            discussionTurnPendingRef.current = false;
+            resetAssistantResponseCapture();
+            clearResponseWatchdog();
+            finishAllVisibleTasks();
+            setError(messageText);
+            setVoiceState("error");
+            flushQueuedDiscussionInput();
+          }
+        } catch {
+          setTranscript(JSON.stringify(message).slice(-220));
+        }
+      });
+      session.on("error", (sessionError) => {
+        if (sessionId !== voiceSessionRef.current) return;
+        responseActiveRef.current = false;
+        clearResponseWatchdog();
+        finishAllVisibleTasks();
+        setError(sessionError.error instanceof Error ? sessionError.error.message : "Realtime error");
+        setVoiceState("error");
+      });
+
+      await session.connect({ apiKey: bootstrap.clientSecret, model: bootstrap.model });
+      if (sessionId !== voiceSessionRef.current) throw new Error("Realtime session was replaced.");
+      setVoiceState("live");
+      setStatusText("Text Live");
+      return session;
+    } catch (err) {
+      if (sessionId !== voiceSessionRef.current) throw err;
+      disconnectVoice();
+      setVoiceState("error");
+      setStatusText("Error");
+      setError(voiceStartErrorMessage(err));
+      throw err;
+    }
+  };
 
   const startVoice = async () => {
     setError("");
@@ -3977,6 +4492,7 @@ export function App() {
     clearRateLimitResume();
     realtimeRateLimitRef.current = null;
     lastRealtimeCompactionAtRef.current = 0;
+    setRealtimeMode("voice");
     setVoiceState("connecting");
     setStatusText("Connecting");
     try {
@@ -4100,7 +4616,7 @@ export function App() {
         if (sessionId !== voiceSessionRef.current) return;
         recordConversationDiagnostic("agent_tool_end", { values });
         if (responseActiveRef.current) scheduleResponseTask("AI整理结果");
-        window.setTimeout(() => requestRealtimeResponse(), 0);
+        scheduleRealtimeResponseRequest();
       });
       session.on("tool_approval_requested", (...values: unknown[]) => {
         if (sessionId !== voiceSessionRef.current) return;
@@ -4146,6 +4662,7 @@ export function App() {
           if (message.type === "response.created") {
             responseActiveRef.current = true;
             assistantResponseHadOutputRef.current = false;
+            resetAssistantResponseCapture();
             startResponseWatchdog();
             scheduleResponseTask("AI处理中");
             if (pendingVoiceStopAfterResponseRef.current === "awaiting_closing") {
@@ -4162,11 +4679,13 @@ export function App() {
           }
           if (message.type === "response.done") {
             responseActiveRef.current = false;
+            discussionTurnPendingRef.current = false;
             clearResponseWatchdog();
             finishResponseTask();
             setVoiceState("live");
             maybeCompactRealtimeHistory(message.response);
             if (pendingTaskCountRef.current === 0 && !backgroundParsingActiveRef.current) setStatusText("Live");
+            saveLastAssistantCompletedText();
             const responseOutput = Array.isArray(message.response?.output) ? message.response.output : [];
             const responseStatus = String(message.response?.status || "");
             const responseError = message.response?.status_details?.error?.message || "";
@@ -4196,13 +4715,17 @@ export function App() {
             }
             if (requestDirectionsAfterConfirmedTopic()) return;
             window.setTimeout(() => flushRealtimeResponse(), 0);
+            flushQueuedDiscussionInput();
           }
           if (message.type === "response.cancelled" || message.type === "response.incomplete") {
             responseActiveRef.current = false;
+            discussionTurnPendingRef.current = false;
+            resetAssistantResponseCapture();
             clearResponseWatchdog();
             finishResponseTask();
             setVoiceState("live");
             window.setTimeout(() => flushRealtimeResponse(), 0);
+            flushQueuedDiscussionInput();
           }
           if (message.type === "response.output_audio_transcript.delta") {
             assistantResponseHadOutputRef.current = true;
@@ -4213,10 +4736,10 @@ export function App() {
             const text = String(message.transcript || assistantTranscriptRef.current || "").trim();
             if (text) {
               assistantResponseHadOutputRef.current = true;
-              awaitingAssistantReplyRef.current = false;
+              captureAssistantCompletedText(text);
               emptyResponseRetryCountRef.current = 0;
               clearEmptyResponseRetry();
-              saveMeetingMessage(text, "assistant").catch((err) => setError(err instanceof Error ? err.message : "Unable to save meeting record"));
+              recordConversationDiagnostic("assistant_audio_text_buffered_until_response_done", { text, pendingTasks: pendingTaskCountRef.current });
             }
             assistantTranscriptRef.current = "";
           }
@@ -4244,10 +4767,13 @@ export function App() {
               return;
             }
             responseActiveRef.current = false;
+            discussionTurnPendingRef.current = false;
+            resetAssistantResponseCapture();
             clearResponseWatchdog();
             finishAllVisibleTasks();
             setError(messageText);
             setVoiceState("error");
+            flushQueuedDiscussionInput();
           }
         } catch {
           setTranscript(JSON.stringify(message).slice(-220));
@@ -4525,7 +5051,7 @@ export function App() {
           </button>
         </form>
         <div className="voice-dock">
-          <VoiceButton state={voiceState} onStart={requestVoiceStart} onStop={stopVoice} />
+          <VoiceButton mode={realtimeMode} state={voiceState} onStart={requestVoiceStart} onStop={stopVoice} />
         </div>
         <VoiceLevelBars state={voiceState} inputLevel={voiceInputLevel} outputLevel={voiceOutputLevel} />
       </div>
@@ -5340,6 +5866,11 @@ function WebPreviewWindow({ page, onClose }: { page: WebPreview; onClose: () => 
     let cancelled = false;
     setEmbedState({ embeddable: page.embeddable ?? null, reason: page.embedReason || "" });
     setReaderState({ status: "idle", title: "", source: "", text: "", error: "" });
+    if (page.embeddable !== undefined && page.embeddable !== null) {
+      return () => {
+        cancelled = true;
+      };
+    }
     if (isLocalPreviewUrl(page.url)) {
       setEmbedState({ embeddable: true, reason: "" });
       return () => {
@@ -5715,10 +6246,12 @@ function ToolWindow({
 }
 
 function VoiceButton({
+  mode,
   state,
   onStart,
   onStop
 }: {
+  mode: RealtimeMode | null;
   state: VoiceState;
   onStart: () => void;
   onStop: () => void;
@@ -5726,7 +6259,11 @@ function VoiceButton({
   const connecting = state === "connecting";
   const live = state === "live" || state === "thinking";
   const active = connecting || live;
-  const label = live ? "断开语音" : connecting ? "正在连接，点击取消" : "开始语音";
+  const label = live
+    ? mode === "text" ? "断开文字实时" : "断开语音"
+    : connecting
+      ? mode === "text" ? "正在连接文字实时，点击取消" : "正在连接，点击取消"
+      : "开始语音";
   return (
     <button
       className={`voice-button ${connecting ? "connecting" : ""} ${live ? "live" : ""}`}

@@ -85,7 +85,7 @@ export type BackgroundTask = {
   prompt: string;
   targetFileIds: string[];
   outputMode: "summary" | "file" | "both";
-  status: "queued" | "running" | "done" | "error";
+  status: "queued" | "running" | "done" | "error" | "cancelled";
   resultSummary: string;
   resultFileId: string;
   resultFile?: {

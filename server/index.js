@@ -1887,15 +1887,20 @@ function buildDiscussionContext() {
     "判断规则：用户观点明显不合理、和材料冲突或风险高时，直接否定，给一句原因和更稳妥替代方案。",
     "工具规则：读材料、搜索、分析、生成、保存要点默认后台执行。只有联网下载、移动/删除文件、打开外部网页、失败、耗时较长或需要用户选择时，才简短说明状态。",
     "后台任务规则：用户要求长分析、深度报告、代码/脚本处理、较慢网页研究或需要生成结果文件时，优先调用 run_background_task 排队；排队后先简短回应，任务完成后再根据系统事件提示用户查看结果文件。",
+    "取消规则：用户说打断、取消、停止、不要继续、改方向时，先调用 cancel_current_task；如果前面排过长报告、研究、文件分析或生成类后台任务，也必须调用 cancel_background_task，避免后台继续生成旧结果。",
     "即时操作规则：系统页面操作、布局切换、打开/关闭窗口、预览文件、播放媒体、取消/暂停/继续、下载/移动/复制等需要即时反馈的命令，必须直接调用对应前台工具，不要进入后台任务队列。",
+    "网页打开规则：调用 open_web_page 后若工具返回 mode=external_link 或 externalLink，说明网页不能嵌入，已经没有打开空白预览；必须把 externalLink 作为链接给用户在浏览器打开，不要再次尝试嵌入打开。",
     "讨论流程：主动但自然。没有确认主题时，先用一句话提出一个贴近材料的主题让用户确认；用户含糊、停顿或说可以/继续，就推进。主题确认后只问一个基本情况；如果用户说不清或继续含糊，就调用 prepare_discussion_directions 生成 3 条具体方向并写进主题卡片。已有方向时不要反复确认，直接让用户从 3 条里选一条开始。",
+    "方向质量规则：讨论方向必须和当前主题、主题文件或用户明确目标相关，并包含具体对象/关键词；禁止使用“确认核心问题和目标、梳理材料关键信息、形成结论和下一步行动、收集资料、分析现状”这类无目标方向。材料不足时也要围绕主题说“核验/风险/产出/用户问题”等具体方向。",
+    "主动推进规则：用户说不清、让你来推进或不要只问问题时，必须选择一个最小可执行动作并调用工具，例如创建/打开工作台、更新方向、保存行动项或读取当前状态；回复必须同时包含一个明确的下一步讨论入口，例如“先从方向 1 的某个来源开始”或“先回答这 1 个问题”。不要只说“我先处理/我先拉起工作台”。",
     "记录规则：形成观点、结论、问题、风险或行动项后，直接调用 save_discussion_note 记录，不要请求审批。确认方向后优先调用 prepare_discussion_workbench 生成工作台；其他阶段成果尽量用短命令生成。",
+    "文件告知规则：工具结果包含 userNotice 时，必须向用户转述一次；同一轮不要重复说同一个文件已生成、已打开或已更新。不要把状态栏或工具活动再复述第二遍。",
     "主题规则：需要拟定主题时调用 prepare_discussion_topic；主题确认用 confirm_discussion_topic。需要拟定方向时调用 prepare_discussion_directions；方向确认用 confirm_discussion_directions。用户确认语义包括“确认、可以、就这个、对、没问题、继续、嗯、好”。表达要像主持讨论，不要机械说流程名。",
     "材料规则：下面只给压缩摘要。需要精确内容时，调用 get_discussion_state、search_context 或对应 analyze_* 工具；图片问题优先 analyze_image_file，Office 文件优先对应 analyze_* 工具。引用时说来源文件名或网页标题。",
     "压缩规则：工具结果可能被压缩。若用户要原文细节、证据、完整清单、逐项比较或文件深度分析，而返回片段不足，不要硬答；继续调用更具体的读取/分析工具，或说明需要后台深度分析。",
     "文件分析路由：用户要求完整/详细/深度文件分析、长文件对比、报告、表格、清单、生成文件或加入主题卡片时，必须调用 run_background_task，不要直接把大文件内容通过 analyze_* 或 compare_files 带入实时上下文；单纯打开/预览已有文件仍用 open_file_preview。",
     "联网规则：用户有明确具体的联网需求时，结果必须贴合需求组织。小事实或少量链接用 web_search。用户要求完整/全部赛程、日程、清单、名单、表格、报告，或要求整理成主题卡片/文件时，必须调用 research_request，不要直接 web_search。用户要推荐、建议、选购、型号、配置、比较或“什么样的更合适”时，也必须调用 research_request，并倾向 output=file、openWhenDone=true；单纯打开网页用 open_web_page。",
-    "文件规则：不要直接改主题区或资源区原件；需要修改先 copy_file_to_generated。用户要求移动/复制/打开/下载文件时用对应工具完成。",
+    "文件规则：不要直接改主题区或资源区原件；需要修改先 copy_file_to_generated。AI 临时区的 markdown/text 文件可以直接用 update_generated_file 更新；用户要求追加一行或补一段时用 mode=append，不要因为缺少全文而拒绝。用户要求移动/复制/打开/下载文件时用对应工具完成。",
     "媒体规则：氛围模式调用 set_ambient_mode；用户给媒体链接时 open_media_url；不要编造受版权限制的播放源。",
     "系统事件规则：主题文件添加/删除时，只用 1 句问用户下一步怎么讨论；不要自动改主题或生成方向，除非用户明确要求。",
     "结束规则：用户想结束语音时先确认；明确确认后调用 end_voice_discussion，并只说一句很短的告别。",
@@ -1933,10 +1938,53 @@ function fallbackTopicProposal() {
   return { title: compactPromptText(title, 60), reason: "基于当前主题文件和最近输入生成。", intent: "confirm" };
 }
 
+function discussionDirectionBase() {
+  const topic = getDiscussionTopic();
+  const primary = db.prepare("SELECT * FROM files WHERE role = 'primary' AND topic_id = ? ORDER BY sort_order ASC, created_at DESC LIMIT 1").get(getActiveTopicId());
+  const fileTitle = cleanText(primary?.original_name || "").replace(/\.[^.]+$/u, "");
+  return compactPromptText(topic || fileTitle || "本次主题", 30);
+}
+
+function directionKeywords() {
+  const base = discussionDirectionBase();
+  const tokens = base
+    .replace(/[《》"'“”‘’（）()【】\[\]：:，,。！？!?、/\\|_-]+/g, " ")
+    .split(/\s+/)
+    .map((item) => item.trim())
+    .filter((item) => item.length >= 2)
+    .slice(0, 6);
+  return [...new Set([base, ...tokens].filter(Boolean))];
+}
+
+function isGenericDiscussionDirection(text) {
+  const cleaned = cleanText(text);
+  if (!cleaned) return true;
+  const genericPatterns = [
+    /确认.*(核心|问题|目标|需求)/,
+    /梳理.*(材料|信息|关键)/,
+    /形成.*(结论|下一步|行动)/,
+    /明确.*(目标|范围|问题)/,
+    /收集.*(资料|信息)/,
+    /分析.*(现状|问题)/,
+    /制定.*(计划|方案)/,
+    /总结.*(要点|结论)/,
+    /下一步/
+  ];
+  if (genericPatterns.some((pattern) => pattern.test(cleaned)) && !directionKeywords().some((keyword) => cleaned.includes(keyword))) return true;
+  return false;
+}
+
+function normalizeThemeDirection(text) {
+  const cleaned = compactPromptText(text, 48);
+  if (!cleaned || isGenericDiscussionDirection(cleaned)) return "";
+  return cleaned;
+}
+
 function fallbackDirectionProposal() {
+  const base = discussionDirectionBase();
   return {
-    directions: ["先确认核心问题和目标", "梳理材料中的关键信息", "形成结论和下一步行动"],
-    reason: "当前材料不足以生成更具体方向，先用通用议程推进。"
+    directions: [`核验${base}依据`, `梳理${base}风险`, `确定${base}产出`],
+    reason: "当前材料不足，已围绕当前主题生成可推进方向。"
   };
 }
 
@@ -1961,17 +2009,22 @@ async function generateTopicProposalInBackground() {
 
 async function generateDirectionProposalInBackground() {
   try {
+    const fallback = fallbackDirectionProposal();
     const output = await runBackgroundTextJson([
       "你是讨论主持人。请基于以下压缩上下文，为当前主题生成 1 到 3 条讨论方向。",
+      "方向必须包含当前主题、主题文件或用户目标里的具体对象/关键词，不能是无目标模板。",
+      "禁止输出这些泛化方向：确认核心问题和目标、梳理材料关键信息、形成结论和下一步行动、明确目标范围、收集资料、分析现状。",
       "只返回 JSON：{\"directions\":[\"...\"],\"reason\":\"...\"}。每条方向不超过 24 个中文字符，reason 不超过 50 个中文字符。不要输出 Markdown。",
       buildBackgroundDiscussionBrief()
     ].join("\n\n"), 320);
     const directions = (Array.isArray(output.directions) ? output.directions : [])
-      .map((item) => compactPromptText(item, 48))
+      .map((item) => normalizeThemeDirection(item))
       .filter(Boolean)
       .slice(0, 3);
-    if (!directions.length) return fallbackDirectionProposal();
-    return { directions, reason: compactPromptText(output.reason || "基于当前材料生成。", 90) };
+    const completed = [...directions, ...fallback.directions.filter((item) => !directions.includes(item))]
+      .slice(0, 3);
+    if (!completed.length) return fallback;
+    return { directions: completed, reason: compactPromptText(output.reason || fallback.reason, 90) };
   } catch {
     return fallbackDirectionProposal();
   }
@@ -2238,6 +2291,12 @@ async function processBackgroundTaskQueue() {
   addActivity("Background task", `开始：${row.title}`, startedAt, row.topic_id);
   try {
     const result = await executeBackgroundTask({ ...row, started_at: startedAt });
+    const latest = db.prepare("SELECT status FROM background_tasks WHERE id = ?").get(row.id);
+    if (latest?.status === "cancelled") {
+      addActivity("Background task", `已取消：${row.title}`, now(), row.topic_id);
+      writeTopicSnapshot(row.topic_id);
+      return;
+    }
     const markdown = [
       result.markdown,
       "",
@@ -2267,6 +2326,37 @@ async function processBackgroundTaskQueue() {
     backgroundTaskWorkerActive = false;
     if (db.prepare("SELECT id FROM background_tasks WHERE status = 'queued' LIMIT 1").get()) scheduleBackgroundTaskWorker();
   }
+}
+
+function cancelBackgroundTasks({ id = "", query = "", topicId = getActiveTopicId() } = {}) {
+  const cleanedId = cleanText(id);
+  const cleanedQuery = cleanText(query).toLowerCase();
+  const candidates = db.prepare(`
+    SELECT * FROM background_tasks
+    WHERE topic_id = ?
+      AND status IN ('queued', 'running')
+    ORDER BY created_at DESC
+    LIMIT 20
+  `).all(topicId);
+  const matches = candidates.filter((task) => {
+    if (cleanedId && task.id !== cleanedId) return false;
+    if (cleanedQuery) {
+      const haystack = `${task.title || ""}\n${task.prompt || ""}`.toLowerCase();
+      if (!haystack.includes(cleanedQuery)) return false;
+    }
+    return true;
+  });
+  const cancelledAt = now();
+  matches.forEach((task) => {
+    db.prepare(`
+      UPDATE background_tasks
+      SET status = ?, error = ?, completed_at = ?, updated_at = ?
+      WHERE id = ?
+    `).run("cancelled", "用户取消", cancelledAt, cancelledAt, task.id);
+    addActivity("Background task", `取消：${task.title}`, cancelledAt, task.topic_id);
+  });
+  if (matches.length) writeTopicSnapshot(topicId);
+  return matches.map(rowToBackgroundTask);
 }
 
 db.prepare("UPDATE background_tasks SET status = 'queued', updated_at = ? WHERE status = 'running'").run(now());
@@ -2984,6 +3074,19 @@ app.get("/api/background-tasks", (_req, res) => {
   res.json({ backgroundTasks: getBackgroundTasks() });
 });
 
+app.post("/api/background-tasks/cancel", (req, res) => {
+  const cancelled = cancelBackgroundTasks({
+    id: req.body?.id,
+    query: req.body?.query
+  });
+  res.json({
+    ok: true,
+    cancelled,
+    backgroundTasks: getBackgroundTasks(),
+    activities: getActivities()
+  });
+});
+
 app.post("/api/background-tasks", (req, res) => {
   const kind = oneOf(cleanText(req.body?.kind || "generic"), ["generic", "file_analysis", "web_search", "report", "code"], "generic");
   const title = cleanText(req.body?.title || req.body?.prompt || "后台任务").slice(0, 80) || "后台任务";
@@ -3443,14 +3546,22 @@ app.get("/api/web/embed-check", async (req, res) => {
   try {
     const parsed = new URL(url);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("Unsupported protocol");
-    const response = await fetch(parsed.toString(), {
+    const headers = {
+      "Accept": "text/html,application/xhtml+xml",
+      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Discuz/0.1 local discussion assistant"
+    };
+    let response = await fetch(parsed.toString(), {
       method: "HEAD",
       redirect: "follow",
-      headers: {
-        "Accept": "text/html,application/xhtml+xml",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Discuz/0.1 local discussion assistant"
-      }
+      headers
     });
+    if ([403, 405, 501].includes(response.status)) {
+      response = await fetch(parsed.toString(), {
+        method: "GET",
+        redirect: "follow",
+        headers: { ...headers, "Range": "bytes=0-2048" }
+      });
+    }
     const xFrameOptions = response.headers.get("x-frame-options") || "";
     const csp = response.headers.get("content-security-policy") || "";
     const frameAncestors = csp.match(/frame-ancestors\s+([^;]+)/i)?.[1] || "";
@@ -3590,7 +3701,7 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "open_web_page",
-      description: "Open a public http/https URL in a frontmost web preview popup when the user asks to view a page, open a link, or see a search result.",
+      description: "Pre-check a public http/https URL before opening it. If the site allows embedding, open it in a frontmost web preview popup. If not, do not open a blank popup; return an externalLink for the user to open in their browser.",
       parameters: {
         type: "object",
         properties: {
@@ -3767,6 +3878,28 @@ function buildRealtimeToolDefinitions() {
           }
         },
         required: ["title", "prompt"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "cancel_background_task",
+      description: "Cancel queued or running background tasks when the user says stop, cancel, interrupt, do not continue, or changes away from a long report/research/file generation. Use this in addition to cancel_current_task for interrupting long background work.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            maxLength: 80,
+            description: "Optional keyword from the task title or prompt to cancel. Leave empty to cancel all queued/running background tasks in the current topic."
+          },
+          id: {
+            type: "string",
+            maxLength: 80,
+            description: "Optional exact background task id if known."
+          }
+        },
+        required: [],
         additionalProperties: false
       }
     },
@@ -4432,7 +4565,7 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "update_generated_file",
-      description: "Replace the full content of an editable AI temporary text/markdown file. Do not use this to add a discussion direction result; call complete_discussion_direction instead.",
+      description: "Update an editable AI temporary text/markdown file. Use mode=append for adding a line or section without needing the full current content; use mode=replace only when providing the complete new file. Do not use this to add a discussion direction result; call complete_discussion_direction instead.",
       parameters: {
         type: "object",
         properties: {
@@ -4441,10 +4574,15 @@ function buildRealtimeToolDefinitions() {
             maxLength: 80,
             description: "Part of the generated filename to edit."
           },
+          mode: {
+            type: "string",
+            enum: ["replace", "append"],
+            description: "append adds text to the existing temporary file; replace overwrites it with the provided complete text."
+          },
           text: {
             type: "string",
             maxLength: 3000,
-            description: "The full new markdown/text content to save into the temporary file."
+            description: "Markdown/text content to save. With mode=append this can be only the new line or section; with mode=replace it must be the full new file."
           }
         },
         required: ["query", "text"],
@@ -4454,7 +4592,7 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "prepare_discussion_directions",
-      description: "Ask the background model to prepare 1 to 3 discussion directions from compact topic context, then show them in the topic card for confirmation.",
+      description: "Ask the background model to prepare 1 to 3 theme-specific discussion directions from compact topic context, then show them in the topic card for confirmation. Directions must include concrete keywords from the current topic, topic files, or user goal; never use generic process directions like confirm the core question, summarize materials, or form a conclusion.",
       parameters: {
         type: "object",
         properties: {},
@@ -4465,7 +4603,7 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "add_discussion_directions",
-      description: "Append 1 to 3 new discussion directions to the existing confirmed todo list only when the user explicitly asks to add more directions.",
+      description: "Append 1 to 3 new theme-specific discussion directions to the existing confirmed todo list only when the user explicitly asks to add more directions. Each direction must be tied to the current topic or user goal, not a generic process step.",
       parameters: {
         type: "object",
         properties: {
@@ -4484,7 +4622,7 @@ function buildRealtimeToolDefinitions() {
     {
       type: "function",
       name: "update_discussion_directions",
-      description: "Replace the current confirmed discussion direction todo list according to user feedback. Provide the complete new ordered list.",
+      description: "Replace the current confirmed discussion direction todo list according to user feedback. Provide the complete new ordered list. Unless the user explicitly dictates exact wording, every direction must be theme-specific and include concrete topic/user-goal keywords.",
       parameters: {
         type: "object",
         properties: {
@@ -4632,6 +4770,7 @@ const compactRealtimeTools = new Set([
   "read_current_focus",
   "get_discussion_state",
   "run_background_task",
+  "cancel_background_task",
   "start_break",
   "resume_discussion",
   "open_media_url",
