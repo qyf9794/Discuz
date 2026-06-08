@@ -448,6 +448,7 @@ function toolCallLabel(name = "任务") {
     run_background_task: "加入后台任务",
     cancel_background_task: "取消后台任务",
     edit_spreadsheet_file: "编辑表格请求",
+    get_file_excerpt: "读取文件片段",
     create_outline: "生成大纲",
     compare_files: "比较文件",
     extract_action_items: "提取行动项",
@@ -600,6 +601,44 @@ function selectOfficeFile(files: DiscuzFile[], kind: OfficeAnalysisKind, role?: 
     const roleMatches = !role || file.role === role;
     return roleMatches && allowedKinds[kind].includes(file.kind);
   }) ?? null;
+}
+
+const SEARCH_CONTEXT_DEFAULT_CHARS = 1200;
+const SEARCH_CONTEXT_MIN_CHARS = 800;
+const SEARCH_CONTEXT_MAX_CHARS = 3000;
+const FILE_EXCERPT_DEFAULT_CHARS = 1200;
+const FILE_EXCERPT_MIN_CHARS = 800;
+const FILE_EXCERPT_MAX_CHARS = 3000;
+const GENERATED_FILE_PREFERRED_SEGMENT_CHARS = 1200;
+const GENERATED_FILE_MIN_SEGMENT_CHARS = 800;
+const GENERATED_FILE_MAX_SEGMENT_CHARS = 1500;
+const GENERATED_FILE_MAX_SEGMENTS = 6;
+
+function clampRangeInt(value: unknown, fallback: number, minValue: number, maxValue: number) {
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  if (parsed < minValue) return minValue;
+  if (parsed > maxValue) return maxValue;
+  return parsed;
+}
+
+function splitTextToSegments(text: string, preferredMax = GENERATED_FILE_PREFERRED_SEGMENT_CHARS, maxSegments = GENERATED_FILE_MAX_SEGMENTS) {
+  const normalized = text.trim();
+  if (!normalized) return [];
+  if (normalized.length <= preferredMax) return [normalized];
+  const segmentCount = Math.min(maxSegments, Math.max(1, Math.ceil(normalized.length / preferredMax)));
+  const baseSize = Math.ceil(normalized.length / segmentCount);
+  const safeSize = Math.min(GENERATED_FILE_MAX_SEGMENT_CHARS, Math.max(GENERATED_FILE_MIN_SEGMENT_CHARS, baseSize));
+  const chunks: string[] = [];
+  for (let start = 0; start < normalized.length && chunks.length < maxSegments; start += safeSize) {
+    chunks.push(normalized.slice(start, start + safeSize));
+  }
+  if (chunks.length > maxSegments) {
+    const head = chunks.slice(0, maxSegments - 1).join("");
+    const tail = chunks.slice(maxSegments - 1).join("");
+    return [head, tail].filter(Boolean);
+  }
+  return chunks;
 }
 
 function compactText(value: string, maxChars = 5000) {
@@ -978,6 +1017,7 @@ export function App() {
   const activeTaskLabelRef = useRef("");
   const backgroundParsingActiveRef = useRef(false);
   const backgroundParsingLabelRef = useRef("");
+  const toolAutoResponseSuppressionsRef = useRef<Record<string, number>>({});
   const lastStatusLogRef = useRef("Ready");
   const lastErrorLogRef = useRef("");
   const assistantTranscriptRef = useRef("");
@@ -1669,6 +1709,29 @@ export function App() {
     }, 650);
   }, [beginUniqueTask]);
 
+  const shouldAutoRespondAfterTool = useCallback((name: string, args: Record<string, any>) => {
+    if (name === "open_file_preview") return false;
+    if (name === "update_generated_file" && args.mode === "append") return false;
+    return true;
+  }, []);
+
+  const consumeToolAutoResponseSuppression = useCallback((name: string) => {
+    const key = name || "unknown";
+    const remaining = toolAutoResponseSuppressionsRef.current[key] ?? 0;
+    if (!remaining) return false;
+    toolAutoResponseSuppressionsRef.current[key] = remaining > 1 ? remaining - 1 : 0;
+    if (toolAutoResponseSuppressionsRef.current[key] === 0) {
+      delete toolAutoResponseSuppressionsRef.current[key];
+    }
+    return true;
+  }, []);
+
+  const registerToolAutoResponseSuppression = useCallback((name: string, args: Record<string, any>) => {
+    if (shouldAutoRespondAfterTool(name, args)) return;
+    const key = name || "unknown";
+    toolAutoResponseSuppressionsRef.current[key] = (toolAutoResponseSuppressionsRef.current[key] ?? 0) + 1;
+  }, [shouldAutoRespondAfterTool]);
+
   const finishResponseTask = useCallback(() => {
     if (responseTaskTimerRef.current) window.clearTimeout(responseTaskTimerRef.current);
     responseTaskTimerRef.current = null;
@@ -1769,6 +1832,17 @@ export function App() {
         content: compactText(String(result.content || result.firstContent || ""), 1800),
         secondContent: result.secondContent ? compactText(String(result.secondContent), 1800) : undefined
       };
+    }
+    if (name === "get_file_excerpt") {
+      return {
+        ok: true,
+        file: result.file,
+        query: compactText(String(result.query || ""), 120),
+        excerpt: compactText(String(result.excerpt || ""), 1400)
+      };
+    }
+    if (name === "open_file_preview" && typeof result.compactContext === "string") {
+      return { ok: true, opened: compactText(String(result.opened || ""), 120), compactContext: compactText(result.compactContext, 420) };
     }
     if (name === "get_discussion_state") {
       return result;
@@ -2118,13 +2192,13 @@ export function App() {
     }
   };
 
-  const updateGeneratedFile = async (file: DiscuzFile, text: string) => {
+  const updateGeneratedFile = async (file: DiscuzFile, text: string, mode: "replace" | "append" = "replace") => {
     const finishTask = beginTask("保存文件编辑");
     try {
       const response = await fetch(`/api/files/${encodeURIComponent(file.id)}/content`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text })
+        body: JSON.stringify({ text, mode })
       });
       if (!response.ok) throw new Error(await response.text());
       const payload = await response.json();
@@ -2554,15 +2628,34 @@ export function App() {
     sendRealtimeSystemEvent(`系统事件：用户打开了前台讨论窗口《${title}》。这个窗口现在是当前临时讨论对象。以下是压缩摘要，精确细节请调用分析或检索工具。\n\n${compactText(text, 1200)}`);
   };
 
-  const describeFileForDiscussion = (file: DiscuzFile) => {
+  const compactFileDiscussionContext = (file: DiscuzFile) => {
+    const status = file.extractionStatus && file.extractionStatus !== "complete" ? `｜${file.extractionStatus}` : "";
     return [
       `文件名：${file.originalName}`,
-      `区域：${file.role}`,
-      `类型：${file.kind}`,
-      file.summary ? `摘要：${compactText(file.summary, 260)}` : "",
-      file.extractedText ? `片段：\n${compactText(file.extractedText, 1200)}` : "",
-      file.previewUrl ? `预览地址：${file.previewUrl}` : ""
+      `类型：${file.kind}${status}`,
+      file.summary ? `摘要：${compactText(file.summary, 120)}` : "摘要：暂无可读摘要。",
+      file.extractedText ? `片段：${compactText(file.extractedText, 160)}` : "片段：无可读片段。",
     ].filter(Boolean).join("\n\n");
+  };
+
+  const openFileDiscussionWindow = (file: DiscuzFile, options: { emitNotice?: boolean } = {}) => {
+    const { emitNotice = false } = options;
+    setSelectedId(file.id);
+    setActiveTool(null);
+    setPreviewRecordId(null);
+    setWebPreview(null);
+    if (file.role === "generated" && (file.kind === "markdown" || file.kind === "text")) {
+      setPreviewFileId(null);
+      setGeneratedEditorId(file.id);
+    } else {
+      setGeneratedEditorId(null);
+      setPreviewFileId(file.id);
+    }
+    if (emitNotice) {
+      sendRealtimeSystemEvent(
+        `系统事件：已聚焦文件窗口《${file.originalName}》。默认不立即展开全文，精简摘要如下：\n\n${compactFileDiscussionContext(file)}`
+      );
+    }
   };
 
   const primaryFileChangeNames = (files: DiscuzFile[]) => files.map((file) => `《${file.originalName}》`).join("、");
@@ -2590,29 +2683,12 @@ export function App() {
     );
   };
 
-  const openFileDiscussionWindow = (file: DiscuzFile) => {
-    setSelectedId(file.id);
-    setActiveTool(null);
-    setPreviewRecordId(null);
-    setWebPreview(null);
-    if (file.role === "generated" && (file.kind === "markdown" || file.kind === "text")) {
-      setPreviewFileId(null);
-      setGeneratedEditorId(file.id);
-    } else {
-      setGeneratedEditorId(null);
-      setPreviewFileId(file.id);
-    }
-    notifyForegroundDiscussion(file.originalName, describeFileForDiscussion(file));
-  };
-
   const openToolDiscussionWindow = (tool: ToolId) => {
     setPreviewFileId(null);
     setPreviewRecordId(null);
     setGeneratedEditorId(null);
     setWebPreview(null);
     setActiveTool(tool);
-    if (tool === "draft") notifyForegroundDiscussion("临时文档", draftText || "当前临时文档为空。");
-    if (tool === "whiteboard") notifyForegroundDiscussion("无限白板", boardToMarkdown());
   };
 
   const boardToMarkdown = () => {
@@ -2962,10 +3038,48 @@ export function App() {
     const activityId = createToolActivity(label, name);
     const finishTask = beginTask(label);
     let output = {};
+    const shouldAutoRespond = shouldAutoRespondAfterTool(name, args);
+    registerToolAutoResponseSuppression(name, args);
     try {
       if (name === "search_context") {
-        const response = await fetch(`/api/context/search?q=${encodeURIComponent(args.query || "")}`);
+        const maxChars = clampRangeInt(args.maxChars, SEARCH_CONTEXT_DEFAULT_CHARS, SEARCH_CONTEXT_MIN_CHARS, SEARCH_CONTEXT_MAX_CHARS);
+        const limit = clampRangeInt(args.limit || args.maxResults, 6, 1, 8);
+        const response = await fetch(`/api/context/search?q=${encodeURIComponent(args.query || "")}&maxChars=${encodeURIComponent(maxChars)}&limit=${encodeURIComponent(limit)}`);
         output = await response.json();
+      }
+      if (name === "get_file_excerpt") {
+        const role = args.role === "primary" || args.role === "context" || args.role === "generated" ? args.role : undefined;
+        const queryText = String(args.fileQuery || "").trim().toLowerCase();
+        const keyword = String(args.query || "").trim();
+        const keywordLower = keyword.toLowerCase();
+        const candidate = state.files.find((file) => {
+          const roleMatches = !role || file.role === role;
+          const nameMatches = !queryText || file.originalName.toLowerCase().includes(queryText);
+          return roleMatches && nameMatches;
+        }) ?? state.files.find((file) => !role || file.role === role);
+        if (candidate) {
+          const text = String(candidate.extractedText || candidate.summary || "");
+          const maxChars = clampRangeInt(args.maxChars, FILE_EXCERPT_DEFAULT_CHARS, FILE_EXCERPT_MIN_CHARS, FILE_EXCERPT_MAX_CHARS);
+          const textLower = text.toLowerCase();
+          const hit = keywordLower ? textLower.indexOf(keywordLower) : 0;
+          const halfWindow = Math.floor(maxChars / 2);
+          const windowStart = hit >= 0
+            ? Math.max(0, Math.min(text.length - 1, hit) - Math.floor(halfWindow * 0.45))
+            : 0;
+          const excerptLength = Math.max(maxChars, Math.min(halfWindow, Math.max(1, text.length)));
+          output = {
+            ok: true,
+            file: {
+              originalName: candidate.originalName,
+              kind: candidate.kind,
+              role: candidate.role
+            },
+            query: keyword || "全文匹配",
+            excerpt: compactText(text.slice(windowStart, windowStart + excerptLength), maxChars)
+          };
+        } else {
+          output = { ok: false, error: "No matching file found." };
+        }
       }
       if (name === "web_search") {
         if (!webEnabled) output = { error: "Web search is disabled by the user." };
@@ -3150,8 +3264,12 @@ export function App() {
           return roleMatches && nameMatches;
         }) ?? state.files.find((file) => !role || file.role === role);
         if (candidate) {
-          openFileDiscussionWindow(candidate);
-          output = { ok: true, opened: candidate.originalName };
+          openFileDiscussionWindow(candidate, { emitNotice: false });
+          output = {
+            ok: true,
+            opened: candidate.originalName,
+            compactContext: compactFileDiscussionContext(candidate)
+          };
         } else {
           output = { ok: false, error: "No matching file found." };
         }
@@ -3733,10 +3851,34 @@ export function App() {
       }
       if (name === "create_generated_file") {
         const title = String(args.title || "AI临时文案.md").trim();
-        const text = compactText(String(args.text || "").trim(), 3000);
+        const text = String(args.text || "").trim();
         if (text) {
-          const file = await createGeneratedFile(title, text);
-          output = { ok: true, generated: file.originalName };
+          const segments = splitTextToSegments(text, GENERATED_FILE_PREFERRED_SEGMENT_CHARS, GENERATED_FILE_MAX_SEGMENTS);
+          const firstSegment = compactText(segments[0], GENERATED_FILE_MAX_SEGMENT_CHARS);
+          if (!segments.length) {
+            output = { ok: false, error: "No generated content found." };
+          } else {
+            const file = await createGeneratedFile(title, firstSegment);
+            let created = file;
+            for (let index = 1; index < segments.length; index++) {
+              const nextText = compactText(segments[index], GENERATED_FILE_MAX_SEGMENT_CHARS);
+              await updateGeneratedFile(
+                created,
+                nextText.trim() ? `\n\n${nextText}` : "",
+                "append"
+              );
+              created = {
+                ...created,
+                extractedText: `${created.extractedText || ""}${nextText.trim() ? `\n\n${nextText}` : ""}`.trim()
+              };
+            }
+            output = {
+              ok: true,
+              generated: created.originalName,
+              segments: segments.length,
+              mode: segments.length > 1 ? "segmented" : "single"
+            };
+          }
         } else {
           output = { ok: false, error: "Missing generated file text." };
         }
@@ -3822,10 +3964,8 @@ export function App() {
           return file.role === "generated" && nameMatches && (file.kind === "markdown" || file.kind === "text");
         });
         if (candidate && text) {
-          const nextText = mode === "append"
-            ? `${String(candidate.extractedText || "").replace(/\s+$/, "")}\n\n${text}`
-            : text;
-          await updateGeneratedFile(candidate, nextText);
+          const nextText = mode === "append" ? `\n\n${text}` : text;
+          await updateGeneratedFile(candidate, nextText, mode);
           setGeneratedEditorId(candidate.id);
           setWebPreview(null);
           output = { ok: true, updated: candidate.originalName, mode };
@@ -4003,7 +4143,9 @@ export function App() {
         result: summarizeToolResult(output)
       });
       finishTask(failed);
-      scheduleResponseTask("AI整理结果");
+      if (shouldAutoRespond && !consumeToolAutoResponseSuppression(name)) {
+        scheduleResponseTask("AI整理结果");
+      }
     }
     return compactToolOutputForRealtime(name, output);
   };
@@ -4372,7 +4514,8 @@ export function App() {
       session.on("agent_tool_end", (...values: unknown[]) => {
         if (sessionId !== voiceSessionRef.current) return;
         recordConversationDiagnostic("agent_tool_end", { values });
-        if (responseActiveRef.current) scheduleResponseTask("AI整理结果");
+        const name = realtimeEventToolName(...values);
+        if (name && consumeToolAutoResponseSuppression(name)) return;
         scheduleRealtimeResponseRequest();
       });
       session.on("tool_approval_requested", (...values: unknown[]) => {
@@ -4615,7 +4758,8 @@ export function App() {
       session.on("agent_tool_end", (...values: unknown[]) => {
         if (sessionId !== voiceSessionRef.current) return;
         recordConversationDiagnostic("agent_tool_end", { values });
-        if (responseActiveRef.current) scheduleResponseTask("AI整理结果");
+        const name = realtimeEventToolName(...values);
+        if (name && consumeToolAutoResponseSuppression(name)) return;
         scheduleRealtimeResponseRequest();
       });
       session.on("tool_approval_requested", (...values: unknown[]) => {

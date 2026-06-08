@@ -667,15 +667,20 @@ function compactPromptText(value, maxChars) {
   return `${cleaned.slice(0, maxChars).trimEnd()}...`;
 }
 
+function clampRange(value, minValue, maxValue, fallback) {
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  if (parsed < minValue) return minValue;
+  if (parsed > maxValue) return maxValue;
+  return parsed;
+}
+
 function compactFilePromptLine(file, maxChars = 900) {
   const status = file.extractionStatus && file.extractionStatus !== "complete" ? `｜${file.extractionStatus}` : "";
-  const promptLimit = file.kind === "image" ? Math.min(maxChars, 280) : maxChars;
-  const summary = compactPromptText(file.summary, file.kind === "image" ? 180 : 260);
-  const excerpt = compactPromptText(file.extractedText, promptLimit);
-  const text = summary && excerpt && !excerpt.startsWith(summary)
-    ? `${summary} 片段：${excerpt}`
-    : summary || excerpt || "暂无可读摘要。";
-  return `- ${file.originalName}｜${file.kind}${status}: ${compactPromptText(text, promptLimit)}`;
+  const summary = compactPromptText(file.summary, Math.min(180, maxChars));
+  const preview = compactPromptText(file.extractedText, Math.min(file.kind === "image" ? 140 : 200, maxChars));
+  const previewText = preview ? `\n  预览：${preview}` : "";
+  return `- 文件名：${file.originalName}｜${file.kind}${status}\n  摘要：${summary || "暂无可读摘要。"}${previewText}`;
 }
 
 function rowToCompactFile(row) {
@@ -1855,18 +1860,18 @@ refreshStoredFiles().catch((error) => {
 function buildDiscussionContext() {
   const aiSettings = getAiSettingsState();
   const topicId = getActiveTopicId();
-  const primaryFiles = db.prepare("SELECT * FROM files WHERE role = 'primary' AND topic_id = ? ORDER BY created_at DESC LIMIT 4").all(topicId).map(rowToFile);
-  const contextFiles = db.prepare("SELECT * FROM files WHERE role = 'context' AND topic_id = ? ORDER BY created_at DESC LIMIT 6").all(topicId).map(rowToFile);
+  const primaryFiles = db.prepare("SELECT * FROM files WHERE role = 'primary' AND topic_id = ? ORDER BY created_at DESC LIMIT 3").all(topicId).map(rowToFile);
+  const contextFiles = db.prepare("SELECT * FROM files WHERE role = 'context' AND topic_id = ? ORDER BY created_at DESC LIMIT 4").all(topicId).map(rowToFile);
   const memoryNotes = getNotes().slice(0, 10).reverse();
   const discussionInputs = getDiscussionInputs(8).reverse();
   const directions = getDirections(topicId);
   const discussionTopic = getDiscussionTopic();
   const recentActivities = getActivities().slice(0, 5).reverse();
   const primaryText = primaryFiles
-    .map((file) => compactFilePromptLine(file, 900))
+    .map((file) => compactFilePromptLine(file, 220))
     .join("\n\n");
   const context = contextFiles
-    .map((file) => compactFilePromptLine(file, 360))
+    .map((file) => compactFilePromptLine(file, 180))
     .join("\n");
   const memory = memoryNotes
     .map((note) => `- ${shortLocalTime(note.createdAt)}｜${memoryLabel(note.kind)}：${compactPromptText(note.text, 180)}`)
@@ -1907,8 +1912,8 @@ function buildDiscussionContext() {
     discussionTopic ? `已确认讨论主题：${discussionTopic}` : "当前还没有用户确认的讨论主题。",
     directionMemory ? `讨论方向 todo：\n${directionMemory}` : "当前还没有已确认的讨论方向 todo。",
     typedContext ? `最近用户输入：\n${typedContext}` : "最近没有用户文字输入。",
-    primaryFiles.length ? `主讨论文件摘要（最多 4 个，细节用工具读取）：\n${primaryText}` : "当前还没有主讨论文件。",
-    context ? `背景材料摘要（最多 6 个）：\n${context}` : "当前还没有背景材料。",
+    primaryFiles.length ? `主讨论文件（最多 3 个）：\n${primaryText}` : "当前还没有主讨论文件。",
+    context ? `背景材料（最多 4 个）：\n${context}` : "当前还没有背景材料。",
     memory ? `最近讨论要点（最多 10 条）：\n${memory}` : "当前还没有已保存的讨论记忆。",
     activityMemory ? `最近工作状态：\n${activityMemory}` : "当前还没有最近工作状态。"
   ].join("\n\n");
@@ -3374,7 +3379,10 @@ app.post("/api/files/:id/content", (req, res) => {
   if (!["generated", "primary"].includes(row.role) || !["markdown", "text"].includes(row.kind)) {
     return res.status(400).json({ error: "Only editable generated or primary text files can be updated" });
   }
-  const text = cleanText(req.body?.text || "");
+  const mode = req.body?.mode === "append" ? "append" : "replace";
+  const incoming = cleanText(req.body?.text || "");
+  const existingText = String(row.extracted_text || "");
+  const text = mode === "append" ? `${existingText}${existingText && incoming ? "\n\n" : ""}${incoming}` : incoming;
   const filePath = filePathForRow(row);
   fs.writeFileSync(filePath, text, "utf8");
   const updatedAt = now();
@@ -3459,6 +3467,8 @@ app.get("/api/files/:id/preview", (req, res) => {
 
 app.get("/api/context/search", (req, res) => {
   const query = cleanText(req.query.q || "").toLowerCase();
+  const maxChars = clampRange(req.query.maxChars, 800, 3000, 1200);
+  const maxResults = clampRange(req.query.limit, 1, 8, 6);
   const rows = db.prepare("SELECT * FROM files WHERE role = 'context' AND topic_id = ?").all(getActiveTopicId());
   const terms = query.split(/\s+/).filter(Boolean);
   const results = rows
@@ -3467,12 +3477,14 @@ app.get("/api/context/search", (req, res) => {
       const lower = text.toLowerCase();
       const score = terms.reduce((sum, term) => sum + (lower.includes(term) ? 1 : 0), 0);
       const firstHit = terms.map((term) => lower.indexOf(term)).filter((index) => index >= 0).sort((a, b) => a - b)[0] ?? 0;
-      const snippet = compactPromptText(text.slice(Math.max(0, firstHit - 120), firstHit + 360), 480);
+      const windowStart = Math.max(0, firstHit - 140);
+      const windowEnd = Math.min(text.length, firstHit + Math.max(660, Math.min(maxChars, 1500)));
+      const snippet = compactPromptText(text.slice(windowStart, windowEnd), maxChars);
       return { file: rowToCompactFile(row), score, snippet };
     })
     .filter((item) => !terms.length || item.score > 0)
     .sort((a, b) => b.score - a.score)
-    .slice(0, 6);
+    .slice(0, maxResults);
   res.json({ query, results });
 });
 
@@ -3645,7 +3657,14 @@ function buildRealtimeToolDefinitions() {
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "A focused search query about the current topic." }
+          query: { type: "string", description: "A focused search query about the current topic." },
+          maxChars: {
+            type: "number",
+            minimum: 800,
+            maximum: 3000,
+            description: "Preferred maximum excerpt length (default 1200), clamped to 800-3000."
+          },
+          limit: { type: "number", description: "Optional max number of results to return (1-8)." }
         },
         required: ["query"],
         additionalProperties: false
@@ -3804,6 +3823,37 @@ function buildRealtimeToolDefinitions() {
           query: { type: "string", description: "Optional part of the filename to open. Leave empty to open the first matching file." }
         },
         required: ["role"],
+        additionalProperties: false
+      }
+    },
+    {
+      type: "function",
+      name: "get_file_excerpt",
+      description: "Read a compact excerpt from a local file for exact quotation, citation, or targeted checking. Use this before asking for precise wording or specific arguments.",
+      parameters: {
+        type: "object",
+        properties: {
+          fileQuery: {
+            type: "string",
+            description: "Part of the filename to match."
+          },
+          role: {
+            type: "string",
+            enum: ["primary", "context", "generated"],
+            description: "Optional role filter when multiple filenames match."
+          },
+          query: {
+            type: "string",
+            description: "Optional keyword used to locate the most relevant excerpt."
+          },
+          maxChars: {
+            type: "number",
+            minimum: 800,
+            maximum: 3000,
+            description: "Approximate output length of excerpt text."
+          }
+        },
+        required: ["fileQuery"],
         additionalProperties: false
       }
     },
@@ -4767,6 +4817,7 @@ const compactRealtimeTools = new Set([
   "open_discussion_tool",
   "close_foreground_window",
   "open_file_preview",
+  "get_file_excerpt",
   "read_current_focus",
   "get_discussion_state",
   "run_background_task",
